@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
+#![cfg(unix)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

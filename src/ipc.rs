@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
@@ -73,6 +74,7 @@ impl IpcServer {
     ///
     /// # Errors
     /// Returns error if socket cannot be created or bound.
+    #[cfg(unix)]
     pub async fn run(
         &self,
         mut shutdown_rx: broadcast::Receiver<()>,
@@ -136,8 +138,21 @@ impl IpcServer {
 
         Ok(())
     }
+
+    /// Run the IPC server accept loop (fallback on non-unix).
+    ///
+    /// # Errors
+    /// Returns unsupported error.
+    #[cfg(not(unix))]
+    pub async fn run(&self, _shutdown_rx: broadcast::Receiver<()>) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "daemon IPC requires a Unix platform",
+        ))
+    }
 }
 
+#[cfg(unix)]
 async fn handle_client_connection(
     stream: UnixStream,
     engine: CommandEngine,
@@ -218,16 +233,24 @@ impl IpcClient {
 
     /// Check if the daemon is currently running and responding to pings.
     pub async fn is_alive(&self) -> bool {
-        matches!(
-            self.send(RequestPayload::Ping).await,
-            Ok(ResponsePayload::Pong)
-        )
+        #[cfg(unix)]
+        {
+            matches!(
+                self.send(RequestPayload::Ping).await,
+                Ok(ResponsePayload::Pong)
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Send a request payload to the daemon and receive the response.
     ///
     /// # Errors
     /// Returns error if communication fails or daemon returns an error.
+    #[cfg(unix)]
     pub async fn send(&self, payload: RequestPayload) -> Result<ResponsePayload, String> {
         let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
             format!(
@@ -269,10 +292,20 @@ impl IpcClient {
         resp.result
     }
 
+    /// Send a request payload to the daemon (fallback on non-unix).
+    ///
+    /// # Errors
+    /// Returns error on non-unix.
+    #[cfg(not(unix))]
+    pub async fn send(&self, _payload: RequestPayload) -> Result<ResponsePayload, String> {
+        Err("daemon IPC requires a Unix platform".to_string())
+    }
+
     /// Ensure the daemon is running, auto-spawning it in background if necessary.
     ///
     /// # Errors
     /// Returns error if daemon cannot be spawned or fails to become ready within timeout.
+    #[cfg(unix)]
     pub async fn ensure_daemon(&self) -> Result<(), String> {
         if self.is_alive().await {
             return Ok(());
@@ -283,31 +316,15 @@ impl IpcClient {
 
         tracing::info!(socket = %self.socket_path.display(), "auto-spawning devserial daemon...");
 
-        #[cfg(target_os = "windows")]
-        {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("daemon")
-                .arg("--socket")
-                .arg(&self.socket_path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            cmd.spawn()
-                .map_err(|e| format!("failed to spawn daemon: {e}"))?;
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("daemon")
-                .arg("--socket")
-                .arg(&self.socket_path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            cmd.spawn()
-                .map_err(|e| format!("failed to spawn daemon: {e}"))?;
-        }
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("daemon")
+            .arg("--socket")
+            .arg(&self.socket_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn()
+            .map_err(|e| format!("failed to spawn daemon: {e}"))?;
 
         // Wait with backoff up to 2.5s
         for _ in 0..100 {
@@ -320,9 +337,18 @@ impl IpcClient {
 
         Err("daemon auto-spawn timed out after 2.5s".to_string())
     }
+
+    /// Ensure the daemon is running (fallback on non-unix).
+    ///
+    /// # Errors
+    /// Returns error on non-unix.
+    #[cfg(not(unix))]
+    pub async fn ensure_daemon(&self) -> Result<(), String> {
+        Err("daemon IPC requires a Unix platform".to_string())
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::config::Config;
