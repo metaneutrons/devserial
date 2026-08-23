@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           case "${{ matrix.target }}" in
-            *musl*)
+            *musl*|aarch64-unknown-linux*)
               cargo build --release --features esp,tui --target ${{ matrix.target }}
               ;;
             *)
