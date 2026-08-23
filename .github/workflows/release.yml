@@ -41,6 +41,7 @@ jobs:
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -65,6 +66,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl'
