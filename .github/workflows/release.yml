@@ -77,7 +77,15 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cargo build --release --all-features --target ${{ matrix.target }}
+        run: |
+          case "${{ matrix.target }}" in
+            *musl*)
+              cargo build --release --features esp,tui --target ${{ matrix.target }}
+              ;;
+            *)
+              cargo build --release --all-features --target ${{ matrix.target }}
+              ;;
+          esac
 
       - name: Create archive
         shell: bash
