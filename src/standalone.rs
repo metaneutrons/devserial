@@ -58,6 +58,7 @@ pub fn run_monitor_standalone(port: &str, baud: u32) -> Result<(), Box<dyn std::
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let _guard = rt.enter();
 
     let storage_arc = std::sync::Arc::new(std::sync::Mutex::new(storage));
     let storage_clone = std::sync::Arc::clone(&storage_arc);
@@ -122,6 +123,7 @@ pub fn run_tui_standalone(port: &str, baud: u32) -> Result<(), Box<dyn std::erro
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let _guard = rt.enter();
 
     // Open port exactly once and share between reader and writer
     let serial_port = crate::port_manager::open_serial_port_raw(port, &config)?;
