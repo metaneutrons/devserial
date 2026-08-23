@@ -158,6 +158,7 @@ jobs:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           VERSION=${{ needs.release-please.outputs.version }}
+          TAG=${{ needs.release-please.outputs.tag_name }}
 
           X64_FILE=$(find artifacts -name "devserial-${VERSION}-x86_64-apple-darwin.tar.gz")
           ARM64_FILE=$(find artifacts -name "devserial-${VERSION}-aarch64-apple-darwin.tar.gz")
@@ -178,10 +179,10 @@ jobs:
 
             on_macos do
               if Hardware::CPU.intel?
-                url "https://github.com/metaneutrons/devserial-mcp/releases/download/v${VERSION}/devserial-${VERSION}-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/metaneutrons/devserial-mcp/releases/download/${TAG}/devserial-${VERSION}-x86_64-apple-darwin.tar.gz"
                 sha256 "${X64_SHA}"
               else
-                url "https://github.com/metaneutrons/devserial-mcp/releases/download/v${VERSION}/devserial-${VERSION}-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/metaneutrons/devserial-mcp/releases/download/${TAG}/devserial-${VERSION}-aarch64-apple-darwin.tar.gz"
                 sha256 "${ARM64_SHA}"
               end
             end
