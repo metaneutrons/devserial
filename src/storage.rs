@@ -4,12 +4,13 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 
 /// Maximum send history entries kept per port.
 const SEND_HISTORY_CAP: u32 = 1000;
 
 /// A single stored line from the serial buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredLine {
     /// Monotonically increasing line ID (1-based).
     pub id: i64,
@@ -20,7 +21,7 @@ pub struct StoredLine {
 }
 
 /// Buffer statistics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BufferStats {
     pub total_lines: u64,
     pub total_bytes: u64,
@@ -46,9 +47,16 @@ pub enum StorageError {
     InvalidRegex(#[from] regex::Error),
 }
 
+/// Static counter for generating unique in-memory database URIs.
+static NEXT_MEM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// SQLite-backed storage for a single port's serial data.
+///
+/// Maintains separate connections for writing and reading to maximize concurrency
+/// under `SQLite` WAL mode, preventing long reads from blocking high-rate ingestion.
 pub struct SqliteStorage {
-    conn: Connection,
+    write_conn: std::sync::Mutex<Connection>,
+    read_conn: std::sync::Mutex<Connection>,
     db_path: PathBuf,
 }
 
@@ -62,13 +70,13 @@ impl SqliteStorage {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
+        let write_conn = Connection::open(path)?;
+        write_conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;",
         )?;
-        conn.execute_batch(
+        write_conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_ns INTEGER NOT NULL,
@@ -82,20 +90,38 @@ impl SqliteStorage {
             );",
         )?;
 
+        let read_conn = Connection::open(path)?;
+        read_conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+
         Ok(Self {
-            conn,
+            write_conn: std::sync::Mutex::new(write_conn),
+            read_conn: std::sync::Mutex::new(read_conn),
             db_path: path.to_path_buf(),
         })
     }
 
     /// Open an in-memory database (for testing).
     ///
+    /// Uses `SQLite` shared in-memory URI to allow distinct read and write connections
+    /// to operate on the same in-memory database.
+    ///
     /// # Errors
     /// Returns error if the database cannot be created.
     pub fn open_memory() -> Result<Self, StorageError> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE lines (
+        use rusqlite::OpenFlags;
+
+        let mem_id = NEXT_MEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let uri = format!("file:devserial_mem_{mem_id}?mode=memory&cache=shared");
+
+        let write_conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        write_conn.execute_batch(
+            "PRAGMA busy_timeout=5000;
+             CREATE TABLE lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_ns INTEGER NOT NULL,
                 payload TEXT NOT NULL
@@ -108,8 +134,15 @@ impl SqliteStorage {
             );",
         )?;
 
+        let read_conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        read_conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+
         Ok(Self {
-            conn,
+            write_conn: std::sync::Mutex::new(write_conn),
+            read_conn: std::sync::Mutex::new(read_conn),
             db_path: PathBuf::from(":memory:"),
         })
     }
@@ -119,7 +152,11 @@ impl SqliteStorage {
     /// # Errors
     /// Returns error on `SQLite` failure.
     pub fn insert_lines(&self, lines: &[(i64, &str)]) -> Result<(), StorageError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self
+            .write_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = conn.unchecked_transaction()?;
         {
             let mut stmt =
                 tx.prepare_cached("INSERT INTO lines (timestamp_ns, payload) VALUES (?1, ?2)")?;
@@ -128,6 +165,7 @@ impl SqliteStorage {
             }
         }
         tx.commit()?;
+        drop(conn);
         Ok(())
     }
 
@@ -136,7 +174,11 @@ impl SqliteStorage {
     /// # Errors
     /// Returns error on `SQLite` failure.
     pub fn read_lines(&self, start_id: i64, count: u32) -> Result<Vec<StoredLine>, StorageError> {
-        let mut stmt = self.conn.prepare_cached(
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = conn.prepare_cached(
             "SELECT id, timestamp_ns, payload FROM lines WHERE id >= ?1 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![start_id, count], |row| {
@@ -146,7 +188,10 @@ impl SqliteStorage {
                 payload: row.get(2)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+        drop(stmt);
+        drop(conn);
+        res
     }
 
     /// Get buffer statistics.
@@ -154,17 +199,23 @@ impl SqliteStorage {
     /// # Errors
     /// Returns error on `SQLite` failure.
     pub fn get_stats(&self) -> Result<BufferStats, StorageError> {
-        let total_lines: u64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM lines", [], |r| r.get(0))?;
-        let total_bytes: u64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM lines",
-            [],
-            |r| r.get(0),
-        )?;
-        let last_timestamp_ns: Option<i64> =
-            self.conn
-                .query_row("SELECT MAX(timestamp_ns) FROM lines", [], |r| r.get(0))?;
+        let (total_lines, total_bytes, last_timestamp_ns) = {
+            let conn = self
+                .read_conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let total_lines: u64 =
+                conn.query_row("SELECT COUNT(*) FROM lines", [], |r| r.get(0))?;
+            let total_bytes: u64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM lines",
+                [],
+                |r| r.get(0),
+            )?;
+            let last_timestamp_ns: Option<i64> =
+                conn.query_row("SELECT MAX(timestamp_ns) FROM lines", [], |r| r.get(0))?;
+            drop(conn);
+            (total_lines, total_bytes, last_timestamp_ns)
+        };
 
         let db_size_bytes = std::fs::metadata(&self.db_path).map_or(0, |m| m.len());
 
@@ -187,9 +238,13 @@ impl SqliteStorage {
         limit: u32,
     ) -> Result<Vec<StoredLine>, StorageError> {
         let pattern = format!("%{query}%");
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if let Some(tr) = time_range {
-            let mut stmt = self.conn.prepare_cached(
+        let res = if let Some(tr) = time_range {
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, timestamp_ns, payload FROM lines \
                  WHERE payload LIKE ?1 AND timestamp_ns >= ?2 AND timestamp_ns <= ?3 \
                  ORDER BY id LIMIT ?4",
@@ -201,9 +256,11 @@ impl SqliteStorage {
                     payload: row.get(2)?,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            let r = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+            drop(stmt);
+            r
         } else {
-            let mut stmt = self.conn.prepare_cached(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, timestamp_ns, payload FROM lines \
                  WHERE payload LIKE ?1 ORDER BY id LIMIT ?2",
             )?;
@@ -214,8 +271,12 @@ impl SqliteStorage {
                     payload: row.get(2)?,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        }
+            let r = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+            drop(stmt);
+            r
+        };
+        drop(conn);
+        res
     }
 
     /// Search for lines within a time range.
@@ -228,7 +289,11 @@ impl SqliteStorage {
         end_ns: i64,
         limit: u32,
     ) -> Result<Vec<StoredLine>, StorageError> {
-        let mut stmt = self.conn.prepare_cached(
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = conn.prepare_cached(
             "SELECT id, timestamp_ns, payload FROM lines \
              WHERE timestamp_ns >= ?1 AND timestamp_ns <= ?2 ORDER BY id LIMIT ?3",
         )?;
@@ -239,7 +304,10 @@ impl SqliteStorage {
                 payload: row.get(2)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+        drop(stmt);
+        drop(conn);
+        res
     }
 
     /// Clear all lines. If `archive_path` is provided, copy the DB there first.
@@ -255,7 +323,12 @@ impl SqliteStorage {
                 std::fs::copy(&self.db_path, archive)?;
             }
         }
-        self.conn.execute_batch("DELETE FROM lines; VACUUM;")?;
+        let conn = self
+            .write_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        conn.execute_batch("DELETE FROM lines; VACUUM;")?;
+        drop(conn);
         Ok(())
     }
 
@@ -268,7 +341,11 @@ impl SqliteStorage {
         start_id: i64,
         end_id: i64,
     ) -> Result<Vec<StoredLine>, StorageError> {
-        let mut stmt = self.conn.prepare_cached(
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = conn.prepare_cached(
             "SELECT id, timestamp_ns, payload FROM lines \
              WHERE id >= ?1 AND id <= ?2 ORDER BY id",
         )?;
@@ -279,7 +356,10 @@ impl SqliteStorage {
                 payload: row.get(2)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+        drop(stmt);
+        drop(conn);
+        res
     }
 
     /// Append a command to send history (caps at 1000 entries).
@@ -288,15 +368,20 @@ impl SqliteStorage {
     /// Returns error on `SQLite` failure.
     pub fn append_send_history(&self, command: &str) -> Result<(), StorageError> {
         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.conn.execute(
+        let conn = self
+            .write_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        conn.execute(
             "INSERT INTO send_history (timestamp_ns, command) VALUES (?1, ?2)",
             params![ts, command],
         )?;
         // Trim to cap
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM send_history WHERE id NOT IN (SELECT id FROM send_history ORDER BY id DESC LIMIT ?1)",
             params![SEND_HISTORY_CAP],
         )?;
+        drop(conn);
         Ok(())
     }
 
@@ -305,11 +390,16 @@ impl SqliteStorage {
     /// # Errors
     /// Returns error on `SQLite` failure.
     pub fn load_send_history(&self, limit: u32) -> Result<Vec<String>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT command FROM send_history ORDER BY id DESC LIMIT ?1")?;
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt =
+            conn.prepare_cached("SELECT command FROM send_history ORDER BY id DESC LIMIT ?1")?;
         let rows = stmt.query_map(params![limit], |row| row.get::<_, String>(0))?;
         let mut history: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
         history.reverse(); // oldest first
         Ok(history)
     }
@@ -322,10 +412,15 @@ impl SqliteStorage {
         if max_lines == 0 {
             return Ok(());
         }
-        self.conn.execute(
+        let conn = self
+            .write_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        conn.execute(
             "DELETE FROM lines WHERE id NOT IN (SELECT id FROM lines ORDER BY id DESC LIMIT ?1)",
             params![max_lines],
         )?;
+        drop(conn);
         Ok(())
     }
 
@@ -339,6 +434,7 @@ impl SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn make_storage() -> SqliteStorage {
         SqliteStorage::open_memory().unwrap()
@@ -539,5 +635,47 @@ mod tests {
         let stats = s.get_stats().unwrap();
         assert_eq!(stats.total_lines, 1);
         assert!(stats.db_size_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("concurrent.db");
+        let storage = Arc::new(SqliteStorage::open(&db_path).unwrap());
+
+        let storage_writer = Arc::clone(&storage);
+        let write_handle = tokio::spawn(async move {
+            for chunk in 0..50 {
+                let lines: Vec<(i64, &str)> = (0..10)
+                    .map(|i| ((chunk * 10 + i) * 1000, "concurrent_line"))
+                    .collect();
+                storage_writer.insert_lines(&lines).unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        let storage_reader = Arc::clone(&storage);
+        let read_handle = tokio::spawn(async move {
+            let mut read_count = 0;
+            for _ in 0..25 {
+                let stats = storage_reader.get_stats().unwrap();
+                let results = storage_reader
+                    .search_substring("concurrent", None, 100)
+                    .unwrap();
+                if !results.is_empty() {
+                    read_count += 1;
+                }
+                assert!(stats.total_lines <= 500);
+                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            }
+            read_count
+        });
+
+        write_handle.await.unwrap();
+        let read_count = read_handle.await.unwrap();
+        assert!(read_count > 0);
+
+        let final_stats = storage.get_stats().unwrap();
+        assert_eq!(final_stats.total_lines, 500);
     }
 }

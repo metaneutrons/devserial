@@ -152,6 +152,10 @@ fn run_monitor_inner(
         history_draft: String::new(),
         connected: true,
         direct_port,
+        show_transfer_dialog: false,
+        transfer_path: String::new(),
+        transfer_proto: crate::modem::FileTransferProtocol::Zmodem,
+        transfer_status: None,
     };
 
     let options = eframe::NativeOptions {
@@ -290,6 +294,10 @@ struct MonitorApp {
     connected: bool,
     /// Direct write handle for standalone mode (None = use stdout pipe for MCP mode)
     direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+    show_transfer_dialog: bool,
+    transfer_path: String,
+    transfer_proto: crate::modem::FileTransferProtocol,
+    transfer_status: Option<String>,
 }
 
 // --- eframe::App ---
@@ -361,6 +369,10 @@ impl eframe::App for MonitorApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.render_buffer(ui);
         });
+
+        if self.show_transfer_dialog {
+            self.render_transfer_dialog(ui.ctx());
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {}
@@ -369,6 +381,123 @@ impl eframe::App for MonitorApp {
 // --- Rendering ---
 
 impl MonitorApp {
+    #[allow(clippy::too_many_lines)]
+    fn render_transfer_dialog(&mut self, ctx: &egui::Context) {
+        let mut is_open = self.show_transfer_dialog;
+        let mut close_requested = false;
+
+        egui::Window::new("File Transfer (X/Y/Z-Modem)")
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Transfer files directly over the serial port using standard modem protocols.",
+                );
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Protocol:");
+                    egui::ComboBox::from_id_salt("transfer_proto_combo")
+                        .selected_text(format!("{:?}", self.transfer_proto))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.transfer_proto,
+                                crate::modem::FileTransferProtocol::Zmodem,
+                                "ZMODEM (Streaming, 32-bit CRC)",
+                            );
+                            ui.selectable_value(
+                                &mut self.transfer_proto,
+                                crate::modem::FileTransferProtocol::Ymodem,
+                                "YMODEM (Batch, 1K CRC)",
+                            );
+                            ui.selectable_value(
+                                &mut self.transfer_proto,
+                                crate::modem::FileTransferProtocol::Xmodem1k,
+                                "XMODEM-1K (1024-byte blocks)",
+                            );
+                            ui.selectable_value(
+                                &mut self.transfer_proto,
+                                crate::modem::FileTransferProtocol::XmodemCrc,
+                                "XMODEM-CRC (128-byte blocks)",
+                            );
+                            ui.selectable_value(
+                                &mut self.transfer_proto,
+                                crate::modem::FileTransferProtocol::Xmodem,
+                                "XMODEM (Standard Checksum)",
+                            );
+                        });
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.transfer_path)
+                            .desired_width(280.0)
+                            .hint_text("/path/to/firmware.bin or ./downloads"),
+                    );
+                });
+
+                if let Some(status) = &self.transfer_status {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(100, 200, 255), status);
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Send File")
+                        .on_hover_text("Transmit file via selected protocol")
+                        .clicked()
+                    {
+                        let path = self.transfer_path.trim().to_string();
+                        if path.is_empty() {
+                            self.transfer_status =
+                                Some("Error: please specify file path".to_string());
+                        } else {
+                            self.transfer_status = Some(format!(
+                                "Initiating {:?} send for '{}'...",
+                                self.transfer_proto, path
+                            ));
+                            Self::send_command(&format!(
+                                "__transfer:send:{:?}:{path}",
+                                self.transfer_proto
+                            ));
+                        }
+                    }
+
+                    if ui
+                        .button("Receive File")
+                        .on_hover_text("Receive file into directory")
+                        .clicked()
+                    {
+                        let dir = if self.transfer_path.trim().is_empty() {
+                            ".".to_string()
+                        } else {
+                            self.transfer_path.trim().to_string()
+                        };
+                        self.transfer_status = Some(format!(
+                            "Waiting to receive via {:?} into '{dir}'...",
+                            self.transfer_proto
+                        ));
+                        Self::send_command(&format!(
+                            "__transfer:recv:{:?}:{dir}",
+                            self.transfer_proto
+                        ));
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
+            });
+
+        self.show_transfer_dialog = is_open && !close_requested;
+    }
     fn render_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // Connection indicator
@@ -394,6 +523,13 @@ impl MonitorApp {
                 .clicked()
             {
                 Self::send_command("__macro:enter_bootloader");
+            }
+            if ui
+                .button("Break")
+                .on_hover_text("Send RS-232 serial BREAK pulse (250ms)")
+                .clicked()
+            {
+                Self::send_command("__signal:break");
             }
             ui.separator();
 
@@ -429,6 +565,16 @@ impl MonitorApp {
             let pause_label = if self.paused { "Resume" } else { "Pause" };
             if ui.button(pause_label).clicked() {
                 self.paused = !self.paused;
+            }
+            ui.separator();
+
+            // Transfer dialog button
+            if ui
+                .button("Transfer ▾")
+                .on_hover_text("File transfer (ZMODEM / YMODEM / XMODEM)")
+                .clicked()
+            {
+                self.show_transfer_dialog = !self.show_transfer_dialog;
             }
             ui.separator();
 

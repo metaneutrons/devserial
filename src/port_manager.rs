@@ -289,19 +289,68 @@ impl Default for PortManagerHandle {
     }
 }
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::ReadBuf;
+
+/// Thread-safe duplex wrapper around a single `serial2_tokio::SerialPort`.
+///
+/// Allows concurrent reading (via `AsyncRead`) and writing/signaling
+/// without opening multiple OS file descriptors or holding locks during I/O waits.
+#[derive(Clone)]
+pub struct SharedSerialPort {
+    inner: Arc<tokio::sync::Mutex<serial2_tokio::SerialPort>>,
+}
+
+impl SharedSerialPort {
+    /// Create a new shared serial port from an open port.
+    #[must_use]
+    pub fn new(port: serial2_tokio::SerialPort) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(port)),
+        }
+    }
+
+    /// Get the shared handle for write/signal operations.
+    #[must_use]
+    pub fn handle(&self) -> SerialPortHandle {
+        Arc::clone(&self.inner)
+    }
+}
+
+impl AsyncRead for SharedSerialPort {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let Ok(mut guard) = self.inner.try_lock() else {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        };
+        Pin::new(&mut *guard).poll_read(cx, buf)
+    }
+}
+
 /// Factory that reconnects to a real serial port.
 struct SerialReconnectFactory {
     path: String,
     config: PortConfig,
+    port_handle: SerialPortHandle,
 }
 
 impl ReaderFactory for SerialReconnectFactory {
     fn try_connect(&self) -> crate::reader::ReconnectFuture<'_> {
         Box::pin(async {
             match open_serial_port_raw(&self.path, &self.config) {
-                Ok(port) => {
-                    let (read_half, _) = tokio::io::split(port);
-                    Some(Box::new(read_half) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)
+                Ok(new_port) => {
+                    let mut guard = self.port_handle.lock().await;
+                    *guard = new_port;
+                    drop(guard);
+                    let shared = SharedSerialPort {
+                        inner: Arc::clone(&self.port_handle),
+                    };
+                    Some(Box::new(shared) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)
                 }
                 Err(e) => {
                     tracing::debug!(path = %self.path, error = %e, "reconnect failed");
@@ -379,26 +428,17 @@ async fn port_manager_loop(mut rx: mpsc::Receiver<PortCommand>) {
                             }
                         };
 
-                        let port_handle = Arc::new(tokio::sync::Mutex::new(port));
-
-                        // Create a second connection for reading
-                        let read_port = match open_serial_port_raw(&name, &config) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                reply
-                                    .send(Err(PortManagerError::Serial(e.to_string())))
-                                    .ok();
-                                continue;
-                            }
-                        };
+                        let shared = SharedSerialPort::new(port);
+                        let port_handle = shared.handle();
 
                         let factory = SerialReconnectFactory {
                             path: name.clone(),
                             config: config.clone(),
+                            port_handle: Arc::clone(&port_handle),
                         };
 
                         let reader_handle =
-                            spawn_reader_with_reconnect(read_port, &storage, &config, factory);
+                            spawn_reader_with_reconnect(shared, &storage, &config, factory);
 
                         ports.insert(
                             name,
