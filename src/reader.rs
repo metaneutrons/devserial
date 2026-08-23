@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 
@@ -14,7 +15,7 @@ use crate::storage::SqliteStorage;
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Connection state of a port.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionState {
     Connected,
     Disconnected { since_ms: u64, attempts: u32 },

@@ -68,3 +68,73 @@ fn test_flash_help() {
         .success()
         .stdout(predicate::str::contains("firmware"));
 }
+
+#[test]
+fn test_break_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["break", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("duration-ms"));
+}
+
+#[test]
+fn test_send_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["send", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("protocol"));
+}
+
+#[test]
+fn test_recv_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["recv", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("output"));
+}
+
+#[test]
+fn test_signal_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["signal", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dtr"));
+}
+
+#[test]
+fn test_macro_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["macro", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("name"));
+}
+
+#[test]
+fn test_search_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("QUERY"));
+}
+
+#[test]
+fn test_export_help() {
+    Command::cargo_bin("devserial")
+        .unwrap()
+        .args(["export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("format"));
+}

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
+#![allow(unknown_lints)]
+#![allow(clippy::unused_async_trait_impl)]
+
 use std::sync::Arc;
 
 use rmcp::{
@@ -242,6 +245,58 @@ pub struct SetControlLinesParams {
     /// RTS line state.
     #[schemars(description = "Set RTS line (true=high, false=low)")]
     pub rts: Option<bool>,
+}
+
+/// Parameters for `serial_break`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(
+    description = "Send an RS-232 serial BREAK signal (holding TX low for a specified duration)"
+)]
+pub struct SerialBreakParams {
+    /// Serial port name.
+    #[schemars(description = "Serial port name")]
+    pub port_name: String,
+    /// Duration in milliseconds (default: 250ms).
+    #[schemars(description = "Break signal duration in milliseconds (default: 250)")]
+    pub duration_ms: Option<u64>,
+}
+
+/// Parameters for `serial_send_file`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(
+    description = "Send a file over serial port using modem transfer protocols (XMODEM, YMODEM, ZMODEM)"
+)]
+pub struct SerialSendFileParams {
+    /// Serial port name.
+    #[schemars(description = "Serial port name")]
+    pub port_name: String,
+    /// Absolute path to the file to send.
+    #[schemars(description = "Path to file to send")]
+    pub file_path: String,
+    /// Transfer protocol ('zmodem', 'ymodem', 'xmodem-1k', 'xmodem-crc', 'xmodem'). Default: 'zmodem'.
+    #[schemars(
+        description = "Transfer protocol (zmodem, ymodem, xmodem-1k, xmodem-crc, xmodem). Default: zmodem"
+    )]
+    pub protocol: Option<String>,
+}
+
+/// Parameters for `serial_receive_file`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(
+    description = "Receive a file over serial port using modem transfer protocols (XMODEM, YMODEM, ZMODEM)"
+)]
+pub struct SerialReceiveFileParams {
+    /// Serial port name.
+    #[schemars(description = "Serial port name")]
+    pub port_name: String,
+    /// Output directory where received file will be stored. Default: current directory.
+    #[schemars(description = "Output directory for received file (default: .)")]
+    pub output_dir: Option<String>,
+    /// Transfer protocol ('zmodem', 'ymodem', 'xmodem-1k', 'xmodem-crc', 'xmodem'). Default: 'zmodem'.
+    #[schemars(
+        description = "Transfer protocol (zmodem, ymodem, xmodem-1k, xmodem-crc, xmodem). Default: zmodem"
+    )]
+    pub protocol: Option<String>,
 }
 
 /// Parameters for `serial_macro`.
@@ -625,7 +680,10 @@ impl DevSerialServer {
         let output_path = std::path::PathBuf::from(&params.output_path);
 
         // Validate output path
-        if output_path.to_str().is_none_or(|s| s.contains("..")) {
+        if output_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(rmcp::ErrorData::internal_error(
                 "invalid output path: path traversal not allowed".to_string(),
                 None,
@@ -945,6 +1003,218 @@ impl DevSerialServer {
             "Set {} on {}",
             actions.join(", "),
             params.port_name
+        ))
+    }
+
+    /// Send an RS-232 serial BREAK pulse.
+    #[tool(
+        description = "Send an RS-232 serial BREAK pulse (TX low) for a duration in milliseconds (default: 250ms)."
+    )]
+    async fn serial_break(
+        &self,
+        Parameters(params): Parameters<SerialBreakParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let port = self
+            .port_manager
+            .get_serial_port(&params.port_name)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let duration_ms = params.duration_ms.unwrap_or(250);
+        let duration = std::time::Duration::from_millis(duration_ms);
+
+        let guard = port.lock().await;
+        guard.set_break(true).map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("failed to set break: {e}"), None)
+        })?;
+        tokio::time::sleep(duration).await;
+        guard.set_break(false).map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("failed to clear break: {e}"), None)
+        })?;
+        drop(guard);
+
+        self.log_to_buffer(
+            &params.port_name,
+            &format!("━━━ SERIAL BREAK ({duration_ms}ms) SENT ━━━"),
+        )
+        .await;
+
+        Ok(format!(
+            "Sent serial BREAK pulse ({duration_ms}ms) on {}",
+            params.port_name
+        ))
+    }
+
+    /// Send a file over serial using XMODEM, YMODEM, or ZMODEM.
+    #[tool(
+        description = "Send a file over serial port using modem transfer protocols (ZMODEM, YMODEM, XMODEM-1K, XMODEM-CRC, XMODEM)."
+    )]
+    async fn serial_send_file(
+        &self,
+        Parameters(params): Parameters<SerialSendFileParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let proto = match params
+            .protocol
+            .as_deref()
+            .unwrap_or("zmodem")
+            .to_lowercase()
+            .as_str()
+        {
+            "xmodem" => crate::modem::FileTransferProtocol::Xmodem,
+            "xmodem-crc" => crate::modem::FileTransferProtocol::XmodemCrc,
+            "xmodem-1k" | "xmodem1k" => crate::modem::FileTransferProtocol::Xmodem1k,
+            "ymodem" => crate::modem::FileTransferProtocol::Ymodem,
+            _ => crate::modem::FileTransferProtocol::Zmodem,
+        };
+
+        let path = std::path::Path::new(&params.file_path);
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.bin")
+            .to_string();
+
+        let data = tokio::fs::read(&params.file_path)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("read file error: {e}"), None))?;
+
+        let port = self
+            .port_manager
+            .get_serial_port(&params.port_name)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let mut guard = port.lock().await;
+        let bytes_sent = match proto {
+            crate::modem::FileTransferProtocol::Xmodem => {
+                crate::modem::xmodem::send(&mut *guard, &data, false, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+            crate::modem::FileTransferProtocol::XmodemCrc => {
+                crate::modem::xmodem::send(&mut *guard, &data, false, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+            crate::modem::FileTransferProtocol::Xmodem1k => {
+                crate::modem::xmodem::send(&mut *guard, &data, true, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+            crate::modem::FileTransferProtocol::Ymodem => {
+                crate::modem::ymodem::send_file(&mut *guard, &filename, &data, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+            crate::modem::FileTransferProtocol::Zmodem => {
+                crate::modem::zmodem::send_file(&mut *guard, &filename, &data, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+        };
+        drop(guard);
+
+        self.log_to_buffer(
+            &params.port_name,
+            &format!("━━━ TRANSFER SEND {proto:?} '{filename}' ({bytes_sent} bytes) → OK ━━━"),
+        )
+        .await;
+
+        Ok(format!(
+            "Successfully sent {} bytes ('{}') to {} via {:?}",
+            bytes_sent, filename, params.port_name, proto
+        ))
+    }
+
+    /// Receive a file over serial using XMODEM, YMODEM, or ZMODEM.
+    #[tool(
+        description = "Receive a file over serial port using modem transfer protocols (ZMODEM, YMODEM, XMODEM-1K, XMODEM-CRC, XMODEM)."
+    )]
+    async fn serial_receive_file(
+        &self,
+        Parameters(params): Parameters<SerialReceiveFileParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let proto = match params
+            .protocol
+            .as_deref()
+            .unwrap_or("zmodem")
+            .to_lowercase()
+            .as_str()
+        {
+            "xmodem" => crate::modem::FileTransferProtocol::Xmodem,
+            "xmodem-crc" => crate::modem::FileTransferProtocol::XmodemCrc,
+            "xmodem-1k" | "xmodem1k" => crate::modem::FileTransferProtocol::Xmodem1k,
+            "ymodem" => crate::modem::FileTransferProtocol::Ymodem,
+            _ => crate::modem::FileTransferProtocol::Zmodem,
+        };
+
+        let port = self
+            .port_manager
+            .get_serial_port(&params.port_name)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let mut guard = port.lock().await;
+        let (filename, data) = match proto {
+            crate::modem::FileTransferProtocol::Xmodem => {
+                let bytes = crate::modem::xmodem::receive(&mut *guard, false, |_| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
+                ("xmodem_recv.bin".to_string(), bytes)
+            }
+            crate::modem::FileTransferProtocol::XmodemCrc => {
+                let bytes = crate::modem::xmodem::receive(&mut *guard, true, |_| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
+                ("xmodem_recv.bin".to_string(), bytes)
+            }
+            crate::modem::FileTransferProtocol::Xmodem1k => {
+                let bytes = crate::modem::xmodem::receive(&mut *guard, true, |_| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
+                ("xmodem1k_recv.bin".to_string(), bytes)
+            }
+            crate::modem::FileTransferProtocol::Ymodem => {
+                crate::modem::ymodem::receive_file(&mut *guard, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+            crate::modem::FileTransferProtocol::Zmodem => {
+                crate::modem::zmodem::receive_file(&mut *guard, |_, _| {})
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
+            }
+        };
+        drop(guard);
+
+        let out_dir_str = params.output_dir.as_deref().unwrap_or(".");
+        let out_dir = std::path::Path::new(out_dir_str);
+        if !out_dir.exists() {
+            tokio::fs::create_dir_all(out_dir).await.map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("create dir error: {e}"), None)
+            })?;
+        }
+
+        let out_path = out_dir.join(&filename);
+        tokio::fs::write(&out_path, &data)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("write file error: {e}"), None))?;
+
+        self.log_to_buffer(
+            &params.port_name,
+            &format!(
+                "━━━ TRANSFER RECV {proto:?} '{filename}' ({} bytes) → OK ━━━",
+                data.len()
+            ),
+        )
+        .await;
+
+        Ok(format!(
+            "Successfully received {} bytes ('{}') from {} saved to '{}'",
+            data.len(),
+            filename,
+            params.port_name,
+            out_path.display()
         ))
     }
 
@@ -1451,9 +1721,9 @@ impl DevSerialServer {
 }
 
 #[cfg(not(feature = "monitor"))]
-#[allow(clippy::unused_async)]
 impl DevSerialServer {
     async fn monitor_open_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
+        tokio::task::yield_now().await;
         Err(rmcp::ErrorData::internal_error(
             "monitor feature not enabled (rebuild with --features monitor)".to_string(),
             None,
@@ -1461,6 +1731,7 @@ impl DevSerialServer {
     }
 
     async fn monitor_close_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
+        tokio::task::yield_now().await;
         Err(rmcp::ErrorData::internal_error(
             "monitor feature not enabled (rebuild with --features monitor)".to_string(),
             None,
@@ -1469,6 +1740,7 @@ impl DevSerialServer {
 }
 
 #[tool_handler]
+#[allow(clippy::manual_async_fn)]
 impl ServerHandler for DevSerialServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -1964,6 +2236,47 @@ mod tests {
         };
 
         let result = server.serial_signal(Parameters(params)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_serial_break_nonexistent() {
+        let mgr = PortManagerHandle::new();
+        let server = DevSerialServer::with_port_manager(mgr);
+        let params = SerialBreakParams {
+            port_name: "nonexistent".into(),
+            duration_ms: Some(100),
+        };
+
+        let result = server.serial_break(Parameters(params)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_serial_send_file_nonexistent() {
+        let mgr = PortManagerHandle::new();
+        let server = DevSerialServer::with_port_manager(mgr);
+        let params = SerialSendFileParams {
+            port_name: "nonexistent".into(),
+            file_path: "/nonexistent/test.bin".into(),
+            protocol: Some("zmodem".into()),
+        };
+
+        let result = server.serial_send_file(Parameters(params)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_serial_receive_file_nonexistent() {
+        let mgr = PortManagerHandle::new();
+        let server = DevSerialServer::with_port_manager(mgr);
+        let params = SerialReceiveFileParams {
+            port_name: "nonexistent".into(),
+            output_dir: Some("/tmp".into()),
+            protocol: Some("zmodem".into()),
+        };
+
+        let result = server.serial_receive_file(Parameters(params)).await;
         assert!(result.is_err());
     }
 }

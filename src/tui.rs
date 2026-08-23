@@ -5,7 +5,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -41,16 +41,32 @@ pub fn run_tui(
     result
 }
 
+#[derive(PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    SendFile,
+    RecvFile,
+}
+
 struct AppState {
     lines: Vec<(String, String)>, // (timestamp, payload)
     last_id: i64,
     scroll_offset: usize,
     auto_follow: bool,
     input: String,
+    input_mode: InputMode,
+    status_msg: Option<(String, Instant)>,
     port_name: String,
     baud: u32,
 }
 
+impl AppState {
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some((msg.into(), Instant::now()));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     port_name: &str,
@@ -65,6 +81,8 @@ fn run_app(
         scroll_offset: 0,
         auto_follow: true,
         input: String::new(),
+        input_mode: InputMode::Normal,
+        status_msg: None,
         port_name: port_name.to_string(),
         baud,
     };
@@ -95,24 +113,149 @@ fn run_app(
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                // Global hotkeys
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('c') => break,
+                        KeyCode::Char('b') => {
+                            // Send BREAK
+                            let wp = Arc::clone(write_port);
+                            rt.block_on(async {
+                                let guard = wp.lock().await;
+                                guard.set_break(true).ok();
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                guard.set_break(false).ok();
+                            });
+                            state.set_status("SERIAL BREAK (250ms) SENT");
+                            continue;
+                        }
+                        KeyCode::Char('s') if state.input_mode == InputMode::Normal => {
+                            state.input_mode = InputMode::SendFile;
+                            state.input.clear();
+                            state.set_status("Enter file path to send (ZMODEM)");
+                            continue;
+                        }
+                        KeyCode::Char('r') if state.input_mode == InputMode::Normal => {
+                            state.input_mode = InputMode::RecvFile;
+                            state.input.clear();
+                            state.set_status("Enter directory to receive file (ZMODEM)");
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if key.code == KeyCode::F(4) {
+                    let wp = Arc::clone(write_port);
+                    rt.block_on(async {
+                        let guard = wp.lock().await;
+                        guard.set_break(true).ok();
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        guard.set_break(false).ok();
+                    });
+                    state.set_status("SERIAL BREAK (250ms) SENT");
+                    continue;
+                }
+
+                if key.code == KeyCode::Esc {
+                    state.input_mode = InputMode::Normal;
+                    state.input.clear();
+                    state.set_status("Ready");
+                    continue;
+                }
+
                 match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char('q')
+                        if state.input_mode == InputMode::Normal && state.input.is_empty() =>
+                    {
                         break;
                     }
-                    KeyCode::Char('q') if state.input.is_empty() => break,
                     KeyCode::Char(c) => state.input.push(c),
                     KeyCode::Backspace => {
                         state.input.pop();
                     }
-                    KeyCode::Enter if !state.input.is_empty() => {
-                        let mut data = state.input.as_bytes().to_vec();
-                        data.extend_from_slice(b"\r\n");
-                        let wp = Arc::clone(write_port);
-                        rt.block_on(async {
-                            wp.lock().await.write_all(&data).await.ok();
-                        });
-                        state.input.clear();
-                    }
+                    KeyCode::Enter => match state.input_mode {
+                        InputMode::Normal if !state.input.is_empty() => {
+                            let mut data = state.input.as_bytes().to_vec();
+                            data.extend_from_slice(b"\r\n");
+                            let wp = Arc::clone(write_port);
+                            rt.block_on(async {
+                                wp.lock().await.write_all(&data).await.ok();
+                            });
+                            state.input.clear();
+                        }
+                        InputMode::SendFile if !state.input.is_empty() => {
+                            let file_path = state.input.clone();
+                            state.input.clear();
+                            state.input_mode = InputMode::Normal;
+                            state.set_status(format!("Sending '{file_path}' via ZMODEM..."));
+
+                            let wp = Arc::clone(write_port);
+                            let (file_bytes, filename) = match std::fs::read(&file_path) {
+                                Ok(b) => {
+                                    let name = std::path::Path::new(&file_path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("file.bin")
+                                        .to_string();
+                                    (b, name)
+                                }
+                                Err(e) => {
+                                    state.set_status(format!("Read error: {e}"));
+                                    continue;
+                                }
+                            };
+
+                            let res = rt.block_on(async move {
+                                let mut guard = wp.lock().await;
+                                crate::modem::zmodem::send_file(
+                                    &mut *guard,
+                                    &filename,
+                                    &file_bytes,
+                                    |_, _| {},
+                                )
+                                .await
+                            });
+
+                            match res {
+                                Ok(n) => {
+                                    state
+                                        .set_status(format!("ZMODEM: Sent {n} bytes successfully"));
+                                }
+                                Err(e) => state.set_status(format!("ZMODEM Error: {e}")),
+                            }
+                        }
+                        InputMode::RecvFile => {
+                            let out_dir = if state.input.is_empty() {
+                                ".".to_string()
+                            } else {
+                                state.input.clone()
+                            };
+                            state.input.clear();
+                            state.input_mode = InputMode::Normal;
+                            state.set_status(format!("Receiving into '{out_dir}' via ZMODEM..."));
+
+                            let wp = Arc::clone(write_port);
+                            let res = rt.block_on(async move {
+                                let mut guard = wp.lock().await;
+                                crate::modem::zmodem::receive_file(&mut *guard, |_, _| {}).await
+                            });
+
+                            match res {
+                                Ok((name, data)) => {
+                                    let target = std::path::Path::new(&out_dir).join(&name);
+                                    let _ = std::fs::write(&target, &data);
+                                    state.set_status(format!(
+                                        "ZMODEM: Received {} ({} bytes)",
+                                        name,
+                                        data.len()
+                                    ));
+                                }
+                                Err(e) => state.set_status(format!("ZMODEM Recv Error: {e}")),
+                            }
+                        }
+                        _ => {}
+                    },
                     KeyCode::Up => {
                         state.auto_follow = false;
                         state.scroll_offset = state.scroll_offset.saturating_sub(1);
@@ -171,12 +314,23 @@ fn render(frame: &mut Frame, state: &AppState) {
     } else {
         "PAUSED"
     };
+
+    let status_text = if let Some((msg, created)) = &state.status_msg {
+        if created.elapsed() < Duration::from_secs(5) {
+            format!(" [{msg}] | ")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let status = format!(
-        " {} | {} {} | Lines: {} | {}",
+        " {} | {} 8N1 | Lines: {} | {}{} | Ctrl+B Break | Ctrl+S Send | Ctrl+R Recv",
         state.port_name,
         state.baud,
-        "8N1",
         state.lines.len(),
+        status_text,
         follow_indicator
     );
     let status_widget = Paragraph::new(status).style(Style::default().bg(Color::DarkGray));
@@ -194,6 +348,8 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Color::Yellow
             } else if payload.contains("[DEBUG]") {
                 Color::DarkGray
+            } else if payload.contains("TRANSFER") || payload.contains("BREAK") {
+                Color::Cyan
             } else {
                 Color::White
             };
@@ -218,11 +374,23 @@ fn render(frame: &mut Frame, state: &AppState) {
         &mut scrollbar_state,
     );
 
-    // Input
-    let input_widget = Paragraph::new(format!("> {}", state.input)).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .title(" Send (Enter) | Ctrl+C quit "),
-    );
+    // Input title & prompt based on mode
+    let (prompt, title) = match state.input_mode {
+        InputMode::Normal => (
+            "> ",
+            " Send (Enter) | Ctrl+B Break | Ctrl+S Send File | Ctrl+R Recv File | Ctrl+C quit ",
+        ),
+        InputMode::SendFile => (
+            "Send File Path: ",
+            " Enter file path to transmit (Esc to cancel) ",
+        ),
+        InputMode::RecvFile => (
+            "Recv Output Dir: ",
+            " Enter directory to save received file (Esc to cancel) ",
+        ),
+    };
+
+    let input_widget = Paragraph::new(format!("{prompt}{}", state.input))
+        .block(Block::default().borders(Borders::TOP).title(title));
     frame.render_widget(input_widget, chunks[2]);
 }

@@ -6,6 +6,35 @@
 #[cfg(any(feature = "monitor", feature = "tui"))]
 use crate::config::PortConfig;
 
+#[cfg(feature = "monitor")]
+struct TokioSerialWriter {
+    handle: crate::port_manager::SerialPortHandle,
+    rt: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "monitor")]
+impl std::io::Write for TokioSerialWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let handle = std::sync::Arc::clone(&self.handle);
+        let data = buf.to_vec();
+        self.rt.block_on(async move {
+            let guard = handle.lock().await;
+            guard.write_all(&data).await?;
+            drop(guard);
+            Ok(data.len())
+        })
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let handle = std::sync::Arc::clone(&self.handle);
+        self.rt.block_on(async move {
+            let mut guard = handle.lock().await;
+            guard.flush().await
+        })
+    }
+}
+
 /// Open a serial port directly and launch the GUI monitor.
 ///
 /// # Errors
@@ -31,19 +60,18 @@ pub fn run_monitor_standalone(port: &str, baud: u32) -> Result<(), Box<dyn std::
         .build()?;
 
     let storage_arc = std::sync::Arc::new(std::sync::Mutex::new(storage));
-    let port_name = port.to_string();
-    let config_clone = config;
     let storage_clone = std::sync::Arc::clone(&storage_arc);
 
+    // Open port exactly once
+    let serial_port = crate::port_manager::open_serial_port_raw(port, &config)?;
+    let shared = crate::port_manager::SharedSerialPort::new(serial_port);
+    let write_handle = shared.handle();
+
+    let shared_reader = shared;
+    let config_clone = config;
+
     rt.spawn(async move {
-        match crate::port_manager::open_serial_port_raw(&port_name, &config_clone) {
-            Ok(serial_port) => {
-                crate::reader::spawn_reader(serial_port, &storage_clone, &config_clone);
-            }
-            Err(e) => {
-                eprintln!("Failed to open {port_name}: {e}");
-            }
-        }
+        crate::reader::spawn_reader(shared_reader, &storage_clone, &config_clone);
         // Keep runtime alive
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -52,28 +80,18 @@ pub fn run_monitor_standalone(port: &str, baud: u32) -> Result<(), Box<dyn std::
 
     let info = format!("{baud} 8N1");
 
-    // Open a sync serial port for direct writes from the monitor GUI
-    let write_port = serial2::SerialPort::open(port, |mut settings: serial2::Settings| {
-        settings.set_baud_rate(baud)?;
-        Ok(settings)
-    })?;
+    let writer = TokioSerialWriter {
+        handle: std::sync::Arc::clone(&write_handle),
+        rt: rt.handle().clone(),
+    };
 
     // Try GUI first, fall back to TUI if no display available
-    match crate::monitor::run_monitor_with_port(port, &db_path, &info, Box::new(write_port)) {
+    match crate::monitor::run_monitor_with_port(port, &db_path, &info, Box::new(writer)) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("GUI failed ({e}), falling back to TUI...");
             #[cfg(feature = "tui")]
             {
-                let write_handle = std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::port_manager::open_serial_port_raw(
-                        port,
-                        &PortConfig {
-                            baudrate: baud,
-                            ..PortConfig::default()
-                        },
-                    )?,
-                ));
                 crate::tui::run_tui(port, baud, &storage_arc, &write_handle, &rt)
             }
             #[cfg(not(feature = "tui"))]
@@ -105,15 +123,15 @@ pub fn run_tui_standalone(port: &str, baud: u32) -> Result<(), Box<dyn std::erro
         .enable_all()
         .build()?;
 
-    // Open port and spawn reader
+    // Open port exactly once and share between reader and writer
     let serial_port = crate::port_manager::open_serial_port_raw(port, &config)?;
-    let write_port = crate::port_manager::open_serial_port_raw(port, &config)?;
-    let write_handle = std::sync::Arc::new(tokio::sync::Mutex::new(write_port));
+    let shared = crate::port_manager::SharedSerialPort::new(serial_port);
+    let write_handle = shared.handle();
 
     rt.spawn({
         let storage_clone = std::sync::Arc::clone(&storage_arc);
         async move {
-            crate::reader::spawn_reader(serial_port, &storage_clone, &config);
+            crate::reader::spawn_reader(shared, &storage_clone, &config);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }

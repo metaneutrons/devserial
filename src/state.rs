@@ -5,7 +5,6 @@
 //!
 //! Stores:
 //! - Active port configurations (for auto-reopen on restart)
-//! - Send history (per port)
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +30,7 @@ pub struct PortEntry {
     pub config: PortConfig,
 }
 
-/// Unified state database.
+/// Unified state database for tracking active port configurations.
 pub struct StateDb {
     conn: Connection,
 }
@@ -53,15 +52,7 @@ impl StateDb {
                  name TEXT PRIMARY KEY,
                  config_json TEXT NOT NULL,
                  opened_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS send_history (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 port_name TEXT NOT NULL,
-                 timestamp_ns INTEGER NOT NULL,
-                 command TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_send_history_port
-                 ON send_history(port_name, id);",
+             );",
         )?;
         Ok(Self { conn })
     }
@@ -77,14 +68,7 @@ impl StateDb {
                  name TEXT PRIMARY KEY,
                  config_json TEXT NOT NULL,
                  opened_at INTEGER NOT NULL
-             );
-             CREATE TABLE send_history (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 port_name TEXT NOT NULL,
-                 timestamp_ns INTEGER NOT NULL,
-                 command TEXT NOT NULL
-             );
-             CREATE INDEX idx_send_history_port ON send_history(port_name, id);",
+             );",
         )?;
         Ok(Self { conn })
     }
@@ -134,43 +118,6 @@ impl StateDb {
         Ok(entries)
     }
 
-    /// Append a command to send history for a port.
-    ///
-    /// # Errors
-    /// Returns error on database failure.
-    pub fn append_send_history(&self, port_name: &str, command: &str) -> Result<(), StateError> {
-        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.conn.execute(
-            "INSERT INTO send_history (port_name, timestamp_ns, command) VALUES (?1, ?2, ?3)",
-            params![port_name, ts, command],
-        )?;
-        // Trim to 1000 per port
-        self.conn.execute(
-            "DELETE FROM send_history WHERE port_name = ?1 AND id NOT IN \
-             (SELECT id FROM send_history WHERE port_name = ?1 ORDER BY id DESC LIMIT 1000)",
-            params![port_name],
-        )?;
-        Ok(())
-    }
-
-    /// Load send history for a port.
-    ///
-    /// # Errors
-    /// Returns error on database failure.
-    pub fn load_send_history(
-        &self,
-        port_name: &str,
-        limit: u32,
-    ) -> Result<Vec<String>, StateError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT command FROM send_history WHERE port_name = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![port_name, limit], |row| row.get::<_, String>(0))?;
-        let mut history: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
-        history.reverse();
-        Ok(history)
-    }
-
     /// Get the path to the data directory (for constructing port DB paths).
     #[must_use]
     pub fn port_db_path(data_dir: &Path, port_name: &str) -> PathBuf {
@@ -197,21 +144,6 @@ mod tests {
         db.port_closed("/dev/ttyUSB0").unwrap();
         let ports = db.active_ports().unwrap();
         assert!(ports.is_empty());
-    }
-
-    #[test]
-    fn test_send_history() {
-        let db = StateDb::open_memory().unwrap();
-
-        db.append_send_history("/dev/ttyUSB0", "help").unwrap();
-        db.append_send_history("/dev/ttyUSB0", "version").unwrap();
-        db.append_send_history("/dev/ttyUSB1", "other").unwrap();
-
-        let history = db.load_send_history("/dev/ttyUSB0", 10).unwrap();
-        assert_eq!(history, vec!["help", "version"]);
-
-        let history = db.load_send_history("/dev/ttyUSB1", 10).unwrap();
-        assert_eq!(history, vec!["other"]);
     }
 
     #[test]
