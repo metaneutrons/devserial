@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
+#![allow(unknown_lints)]
+#![allow(clippy::unused_async_trait_impl)]
+
 use std::sync::Arc;
 
 use rmcp::{
