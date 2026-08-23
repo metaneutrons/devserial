@@ -1718,9 +1718,9 @@ impl DevSerialServer {
 }
 
 #[cfg(not(feature = "monitor"))]
-#[allow(clippy::unused_async)]
 impl DevSerialServer {
     async fn monitor_open_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
+        tokio::task::yield_now().await;
         Err(rmcp::ErrorData::internal_error(
             "monitor feature not enabled (rebuild with --features monitor)".to_string(),
             None,
@@ -1728,6 +1728,7 @@ impl DevSerialServer {
     }
 
     async fn monitor_close_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
+        tokio::task::yield_now().await;
         Err(rmcp::ErrorData::internal_error(
             "monitor feature not enabled (rebuild with --features monitor)".to_string(),
             None,
@@ -1736,6 +1737,7 @@ impl DevSerialServer {
 }
 
 #[tool_handler]
+#[allow(clippy::manual_async_fn)]
 impl ServerHandler for DevSerialServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
