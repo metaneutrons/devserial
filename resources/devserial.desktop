@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=devserial
+GenericName=Serial Monitor
+Comment=Capture, inspect and drive serial ports
+Exec=devserial gui
+Icon=devserial
+Terminal=false
+Categories=Development;Electronics;
+Keywords=serial;uart;rs232;tty;embedded;mcp;
+StartupWMClass=devserial

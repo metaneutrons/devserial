@@ -1,0 +1,28 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: devserial
+Upstream-Contact: metaneutrons <metaneutrons@users.noreply.github.com>
+Source: https://github.com/metaneutrons/devserial
+
+Files: *
+Copyright: 2026 Fabian Schmieder
+License: GPL-3.0-only
+
+Files: resources/fonts/JetBrainsMono-Regular.ttf
+Copyright: 2020 The JetBrains Mono Project Authors
+License: OFL-1.1
+
+License: GPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License version 3 as published by the Free
+ Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License version
+ 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: OFL-1.1
+ This Font Software is licensed under the SIL Open Font License, Version 1.1.
+ The full text is available at https://openfontlicense.org
