@@ -6,39 +6,85 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. devserial-v0.1.3)"
-        required: false
-        default: "devserial-v0.1.3"
+        description: "Release tag to publish, for example devserial-v1.2.3"
+        required: true
+        type: string
       version:
-        description: "Release version (e.g. 0.1.3)"
-        required: false
-        default: "0.1.3"
+        description: "Release version without the tag prefix, for example 1.2.3"
+        required: true
+        type: string
 
+# Least privilege by default. A job that needs to write says so itself.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   release-please:
+    name: Determine the release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
+      # An unset output is falsy, the literal string 'false' is compared
+      # explicitly below, so a run without a release skips everything.
       release_created: ${{ steps.release.outputs.release_created || github.event_name == 'workflow_dispatch' }}
-      tag_name: ${{ steps.release.outputs.tag_name || inputs.tag || 'devserial-v0.1.3' }}
-      version: ${{ steps.release.outputs.version || inputs.version || '0.1.3' }}
+      tag_name: ${{ steps.release.outputs.tag_name || inputs.tag }}
+      version: ${{ steps.release.outputs.version || inputs.version }}
     steps:
-      - uses: googleapis/release-please-action@v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  identity:
+    name: Verify release identity
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: The tag, the manifest and the workflow must agree
+        shell: bash
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          manifest_version=$(python3 - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as source:
+              print(tomllib.load(source)['package']['version'])
+          PY
+          )
+          if [[ "$manifest_version" != "$VERSION" ]]; then
+            echo "::error::Cargo.toml says $manifest_version but the release is $VERSION"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag $TAG does not exist in this repository"
+            exit 1
+          fi
+          if [[ "$TAG" != *"$VERSION" ]]; then
+            echo "::error::tag $TAG does not end in version $VERSION"
+            exit 1
+          fi
+          echo "release $VERSION from tag $TAG"
+
   build:
     name: Build ${{ matrix.target }}
-    needs: [release-please]
-    if: ${{ needs.release-please.outputs.release_created }}
+    needs: [release-please, identity]
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -61,169 +107,644 @@ jobs:
           - os: windows-latest
             target: aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        continue-on-error: true
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl'
+      # The aarch64 Linux targets build natively on the ARM runner, so only the
+      # musl targets need an extra toolchain.
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          case "${{ matrix.target }}" in
-            *musl*) sudo apt-get install -y musl-tools ;;
-          esac
+          sudo apt-get install -y --no-install-recommends musl-tools
 
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
-
-      - name: Install GUI dependencies (Linux)
+      - name: Install GUI build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
       - name: Build
         shell: bash
+        # Every published binary carries every feature, so a downloaded archive
+        # is never missing a subcommand. --locked keeps the build reproducible
+        # from the committed Cargo.lock.
+        run: cargo build --release --locked --all-features --target ${{ matrix.target }}
+
+      - name: Audit dynamic linkage
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          case "${{ matrix.target }}" in
-            *musl*|aarch64-unknown-linux*)
-              cargo build --release --features esp,tui --target ${{ matrix.target }}
-              ;;
-            *)
-              cargo build --release --all-features --target ${{ matrix.target }}
-              ;;
-          esac
+          set -euo pipefail
+          binary="target/${TARGET}/release/devserial"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            otool -L "$binary" | tee linkage.txt
+            # A path into a package manager prefix would break on every machine
+            # that does not have that prefix.
+            if grep -Eq '/(opt/homebrew|usr/local|Users|Volumes)/' linkage.txt; then
+              echo "::error::the binary links against a non-system library path"
+              exit 1
+            fi
+          elif [[ "$TARGET" == *musl* ]]; then
+            file "$binary" | tee linkage.txt
+            if ! grep -q 'statically linked' linkage.txt; then
+              echo "::error::the musl build is not statically linked"
+              exit 1
+            fi
+          else
+            ldd "$binary" | tee linkage.txt
+            if grep -Fq 'not found' linkage.txt; then
+              echo "::error::the binary has an unresolved dynamic dependency"
+              exit 1
+            fi
+          fi
 
       - name: Create archive
         shell: bash
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
-          VERSION=${{ needs.release-please.outputs.version }}
-          BIN_NAME=devserial
-
-          case "${{ matrix.target }}" in
+          set -euo pipefail
+          mkdir dist
+          case "$TARGET" in
             *windows*)
-              ARCHIVE="${BIN_NAME}-${VERSION}-${{ matrix.target }}.zip"
-              cp target/${{ matrix.target }}/release/${BIN_NAME}.exe .
-              7z a "$ARCHIVE" "${BIN_NAME}.exe" README.md LICENSE
+              archive="devserial-${VERSION}-${TARGET}.zip"
+              cp "target/${TARGET}/release/devserial.exe" .
+              7z a "dist/${archive}" devserial.exe README.md LICENSE
               ;;
             *)
-              ARCHIVE="${BIN_NAME}-${VERSION}-${{ matrix.target }}.tar.gz"
-              cp target/${{ matrix.target }}/release/${BIN_NAME} .
-              chmod +x "${BIN_NAME}"
-              tar czf "$ARCHIVE" "${BIN_NAME}" README.md LICENSE
+              archive="devserial-${VERSION}-${TARGET}.tar.gz"
+              cp "target/${TARGET}/release/devserial" .
+              chmod +x devserial
+              tar czf "dist/${archive}" devserial README.md LICENSE
               ;;
           esac
-          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          echo "ARCHIVE=dist/${archive}" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v5
+      # Unpack what will actually be published and run that copy, rather than
+      # the build tree. A broken archive is caught here instead of by the first
+      # person who downloads it.
+      - name: Clean-room test of the archive
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          room="$RUNNER_TEMP/clean-room"
+          mkdir -p "$room"
+          case "$TARGET" in
+            *windows*) 7z x -o"$room" "$ARCHIVE" >/dev/null; binary="$room/devserial.exe" ;;
+            *) tar xzf "$ARCHIVE" -C "$room"; binary="$room/devserial" ;;
+          esac
+          test -f "$room/README.md" && test -f "$room/LICENSE"
+          "$binary" --version
+          # A full-feature build has to offer every subcommand.
+          for subcommand in mcp daemon list open close read write break send recv \
+              signal macro search export clear stats flash gui monitor tui about; do
+            "$binary" help "$subcommand" >/dev/null
+          done
+          echo "archive is complete and runnable"
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: ${{ matrix.target }}
-          path: ${{ env.ARCHIVE }}
+          name: archive-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
-  upload-assets:
-    name: Upload release assets
-    needs: [release-please, build]
-    if: ${{ needs.release-please.outputs.release_created }}
+  deb:
+    name: Debian package (${{ matrix.arch }})
+    needs: [release-please, identity]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ${{ matrix.os }}
+    # Built on bookworm so the package installs on Debian 12 and everything
+    # newer. Building on the runner image would raise the glibc floor to 24.04.
+    container: debian:bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl pkg-config \
+            dpkg-dev lintian help2man \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+      - name: Install the Rust toolchain
+        run: |
+          set -euo pipefail
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: deb-${{ matrix.arch }}
+      - name: Build the binary
+        run: cargo build --release --locked --all-features
+      - name: Build the package
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo install cargo-deb --version '^3' --locked
+          scripts/release/build-deb.sh --version "$VERSION" --output-dir deb
+          dpkg-deb --info deb/*.deb
+          dpkg-deb --contents deb/*.deb
+      - name: Lint the package
+        run: |
+          set -euo pipefail
+          lintian deb/*.deb | tee lintian.txt || true
+          # Warnings are advisory, this is not a Debian archive upload. An
+          # error means the package breaks a rule that matters to users.
+          if grep -q '^E:' lintian.txt; then
+            echo "::error::lintian reported an error"
+            exit 1
+          fi
+      - name: Install the package and run what it installed
+        run: |
+          set -euo pipefail
+          apt-get install -y ./deb/*.deb
+          devserial --version
+          devserial list >/dev/null
+          test -f /usr/share/applications/devserial.desktop
+          test -f /usr/share/icons/hicolor/512x512/apps/devserial.png
+          test -f /usr/share/man/man1/devserial.1.gz
+          test -f /usr/share/doc/devserial/changelog.Debian.gz
+          dpkg --verify devserial
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: deb-${{ matrix.arch }}
+          path: deb/*.deb
+          if-no-files-found: error
+
+  package:
+    name: Generate checksums and package metadata
+    needs: [release-please, build, deb]
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          path: artifacts
+          pattern: archive-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p packaging
+          # An explicit pattern, so the checksum file can never list itself.
+          (cd dist && sha256sum -- devserial-* devserial_*) > packaging/SHA256SUMS
+          cat packaging/SHA256SUMS
+      - name: Generate the PKGBUILD and the Homebrew formula
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          scripts/release/package-metadata.sh \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --artifact-dir dist \
+            --output-dir packaging
+          find packaging -type f | sort
+          cat packaging/devserial-bin/PKGBUILD
+          cat packaging/devserial/PKGBUILD
+          cat packaging/devserial.rb
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: packaging
+          path: packaging/*
+          if-no-files-found: error
 
-      - name: Upload assets to GitHub release
+  verify-aur:
+    name: Build the AUR package
+    needs: [release-please, package]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: archive-x86_64-unknown-linux-gnu
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: packaging
+          path: packaging
+      - name: makepkg, then install and run what it produced
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="devserial-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          work=/home/builder/package
+          useradd --create-home builder
+          install -d -o builder -g builder "$work"
+          cp "dist/${archive}" "$work/${archive}"
+
+          # Point the recipe at the local archive. The checksums stay untouched,
+          # so a wrong checksum still fails the build.
+          sed -E "s#https://[^']*/${archive}#${archive}#" \
+            packaging/devserial-bin/PKGBUILD > "$work/PKGBUILD"
+          grep -Fq "source_x86_64=('${archive}')" "$work/PKGBUILD"
+          chown -R builder:builder "$work"
+
+          su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
+          package=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+
+          # The packaged binary has to be the released one, byte for byte.
+          mkdir /tmp/from-archive /tmp/from-package
+          tar xzf "dist/${archive}" -C /tmp/from-archive
+          bsdtar -xf "$package" -C /tmp/from-package
+          cmp /tmp/from-archive/devserial /tmp/from-package/usr/bin/devserial
+
+          pacman -U --noconfirm "$package"
+          /usr/bin/devserial --version
+          /usr/bin/devserial list >/dev/null
+          echo "AUR package builds, installs and runs"
+
+  verify-aur-source:
+    name: Build the AUR source package
+    needs: [release-please, package]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: packaging
+          path: packaging
+      - name: Install the toolchain the recipe declares
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            base-devel git rust namcap \
+            libxcb libxkbcommon libx11 wayland libgl
+      - name: makepkg from the tagged sources, then install and run the result
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=/home/builder/package
+          useradd --create-home builder
+          install -d -o builder -g builder "$work"
+          install -o builder -g builder -m 0644 packaging/devserial/PKGBUILD "$work/PKGBUILD"
+
+          # The dependencies are already installed above, so makepkg does not
+          # need to reach for pacman as a non-root user.
+          su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
+
+          package=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+
+          # namcap warnings are advisory, an error is not.
+          namcap "$work/PKGBUILD" "$package" | tee namcap.txt || true
+          if grep -q ' E: ' namcap.txt; then
+            echo "::error::namcap reported an error"
+            exit 1
+          fi
+
+          pacman -U --noconfirm "$package"
+          /usr/bin/devserial --version
+          /usr/bin/devserial list >/dev/null
+          echo "source package builds, installs and runs"
+
+  verify-homebrew:
+    name: Install the Homebrew formula (${{ matrix.os }})
+    needs: [release-please, package]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: candidate
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: packaging
+          path: packaging
+      - uses: Homebrew/actions/setup-homebrew@3cdb78d0f62ad29dd32de765782654f4eedea607
+        with:
+          core: false
+          cask: false
+      - name: Audit, install and test the formula against the candidate
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          set -euo pipefail
+          port=38080
+          tap=devserial/qualification
+          python3 -m http.server "$port" --bind 127.0.0.1 --directory candidate \
+            >"$RUNNER_TEMP/http.log" 2>&1 &
+          server=$!
+          cleanup() {
+            brew uninstall devserial >/dev/null 2>&1 || true
+            brew untap "$tap" >/dev/null 2>&1 || true
+            kill "$server" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for _ in {1..20}; do
+            curl --fail --silent "http://127.0.0.1:${port}/" >/dev/null && break
+            sleep 1
+          done
+
+          brew tap-new --no-git "$tap"
+          formula="$(brew --repository "$tap")/Formula/devserial.rb"
+          # Serve the very archives that will be published, from a local URL.
+          # The recorded checksums are not touched, so a wrong one still fails.
+          sed -E "s#https://github.com/[^\"]*/download/[^/\"]+#http://127.0.0.1:${port}#g" \
+            packaging/devserial.rb > "$formula"
+          test "$(grep -c "url \"http://127.0.0.1:${port}/" "$formula")" -eq 4
+
+          ruby -c "$formula"
+          brew audit --strict "$tap/devserial"
+          brew install "$tap/devserial"
+          brew test "$tap/devserial"
+          echo "formula audits, installs and passes its own test"
+
+  upload-assets:
+    name: Publish the GitHub release assets
+    needs: [release-please, package, verify-aur, verify-aur-source, verify-homebrew]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: packaging
+          path: packaging
+      - name: Upload and read back
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          TAG=${{ needs.release-please.outputs.tag_name }}
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec gh release upload "$TAG" {} \;
+          set -euo pipefail
+          # Two files named PKGBUILD cannot both be release assets, so they are
+          # published under their package names.
+          cp packaging/devserial/PKGBUILD dist/devserial.PKGBUILD
+          cp packaging/devserial-bin/PKGBUILD dist/devserial-bin.PKGBUILD
+          cp packaging/devserial.rb dist/devserial.rb
+          gh release upload "$TAG" dist/* packaging/SHA256SUMS --clobber
 
-  update-homebrew:
-    name: Update Homebrew tap
+          # Download the published assets again and verify them against the
+          # checksum file, so a truncated upload cannot go unnoticed.
+          mkdir verify
+          gh release download "$TAG" --dir verify --pattern '*'
+          (cd verify && sha256sum --check --ignore-missing SHA256SUMS)
+          test -f verify/devserial.PKGBUILD
+          test -f verify/devserial-bin.PKGBUILD
+          test -f verify/devserial.rb
+          echo "published assets match their checksums"
+
+  publish-apt:
+    name: Publish the APT repository
     needs: [release-please, upload-assets]
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.release-please.outputs.version }}
+      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+      APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+      APT_GPG_FINGERPRINT: ${{ vars.APT_GPG_FINGERPRINT }}
+      APT_BASE_URL: ${{ vars.APT_BASE_URL }}
+      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REGION: auto
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: 'true'
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          path: artifacts
-
-      - name: Calculate checksums and update tap
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          pattern: deb-*
+          merge-multiple: true
+          path: debs
+      - name: Install repository tooling
         run: |
-          VERSION=${{ needs.release-please.outputs.version }}
-          TAG=${{ needs.release-please.outputs.tag_name }}
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
 
-          X64_FILE=$(find artifacts -name "devserial-${VERSION}-x86_64-apple-darwin.tar.gz")
-          ARM64_FILE=$(find artifacts -name "devserial-${VERSION}-aarch64-apple-darwin.tar.gz")
+      # A previously published pool has to survive, otherwise every earlier
+      # version disappears from the repository the moment a new one lands.
+      - name: Fetch the current pool
+        run: |
+          set -euo pipefail
+          mkdir -p pool
+          aws s3 sync "s3://${R2_BUCKET}/pool" pool \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" || true
+          find pool -name '*.deb' -exec cp {} debs/ \; 2>/dev/null || true
+          ls -la debs/
 
-          X64_SHA=$(sha256sum "$X64_FILE" | cut -d' ' -f1)
-          ARM64_SHA=$(sha256sum "$ARM64_FILE" | cut -d' ' -f1)
+      - name: Build the signed repository
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" > "$RUNNER_TEMP/apt-key.asc"
+          printf '%s' "$APT_GPG_PASSPHRASE" > "$RUNNER_TEMP/apt-pass"
+          chmod 0600 "$RUNNER_TEMP/apt-key.asc" "$RUNNER_TEMP/apt-pass"
+          scripts/release/build-apt-repository.sh \
+            --deb-dir debs \
+            --output-dir repository \
+            --private-key "$RUNNER_TEMP/apt-key.asc" \
+            --passphrase-file "$RUNNER_TEMP/apt-pass" \
+            --fingerprint "$APT_GPG_FINGERPRINT"
+          shred -u "$RUNNER_TEMP/apt-key.asc" "$RUNNER_TEMP/apt-pass"
 
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/metaneutrons/homebrew-tap.git"
-          cd homebrew-tap
+      # Packages first, indices afterwards. A client refreshing in between then
+      # sees the old index, never an index that promises a missing file.
+      - name: Upload to R2
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 sync repository/pool "s3://${R2_BUCKET}/pool" \
+            --endpoint-url "$endpoint" \
+            --content-type application/vnd.debian.binary-package \
+            --cache-control 'public, max-age=31536000, immutable'
+          aws s3 cp repository/devserial-archive-keyring.gpg "s3://${R2_BUCKET}/" \
+            --endpoint-url "$endpoint" \
+            --content-type application/pgp-keys \
+            --cache-control 'public, max-age=3600'
+          aws s3 sync repository/dists "s3://${R2_BUCKET}/dists" \
+            --endpoint-url "$endpoint" \
+            --cache-control 'public, max-age=300' \
+            --delete
+
+      # Install from the public URL, in a clean Debian, the way a user would.
+      - name: Install from the published repository
+        run: |
+          set -euo pipefail
+          cat > verify.sh <<'VERIFY'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL "${APT_BASE_URL}/devserial-archive-keyring.gpg"             -o /usr/share/keyrings/devserial-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/devserial-archive-keyring.gpg] ${APT_BASE_URL} stable main"             > /etc/apt/sources.list.d/devserial.list
+          apt-get update
+          apt-get install -y devserial
+          devserial --version | grep -F "${VERSION}"
+          devserial list >/dev/null
+          VERIFY
+          docker run --rm -e APT_BASE_URL -e VERSION -v "$PWD/verify.sh:/verify.sh:ro" \
+            debian:bookworm bash /verify.sh
+          echo "the published repository installs and runs"
+
+  publish-homebrew:
+    name: Publish the Homebrew formula
+    needs: [release-please, upload-assets]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: packaging
+          path: packaging
+      - name: Update the tap, then read the result back
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          gh repo clone metaneutrons/homebrew-tap tap -- --depth 1
+          cd tap
           mkdir -p Formula
-
-          cat > Formula/devserial.rb << EOF
-          class Devserial < Formula
-            desc "MCP server bridging serial hardware to LLMs"
-            homepage "https://github.com/metaneutrons/devserial-mcp"
-            version "${VERSION}"
-            license "GPL-3.0"
-
-            on_macos do
-              if Hardware::CPU.intel?
-                url "https://github.com/metaneutrons/devserial-mcp/releases/download/${TAG}/devserial-${VERSION}-x86_64-apple-darwin.tar.gz"
-                sha256 "${X64_SHA}"
-              else
-                url "https://github.com/metaneutrons/devserial-mcp/releases/download/${TAG}/devserial-${VERSION}-aarch64-apple-darwin.tar.gz"
-                sha256 "${ARM64_SHA}"
-              end
-            end
-
-            def install
-              bin.install "devserial"
-            end
-
-            test do
-              assert_match version.to_s, shell_output("#{bin}/devserial --version")
-            end
-          end
-          EOF
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if cmp -s ../packaging/devserial.rb Formula/devserial.rb; then
+            echo "formula is already current, nothing to push"
+            exit 0
+          fi
+          install -m 0644 ../packaging/devserial.rb Formula/devserial.rb
+          git config user.name 'devserial release automation'
+          git config user.email 'devserial-release@users.noreply.github.com'
           git add Formula/devserial.rb
-          git commit -m "Update devserial to ${VERSION}"
+          git commit -m "devserial ${VERSION}"
           git push
 
+          published=$(gh api "repos/metaneutrons/homebrew-tap/contents/Formula/devserial.rb" \
+            --jq .content | base64 --decode)
+          if ! diff <(printf '%s' "$published") ../packaging/devserial.rb >/dev/null; then
+            echo "::error::the formula in the tap differs from the one that was verified"
+            exit 1
+          fi
+          echo "tap updated and verified"
+
   publish-aur:
-    name: Publish to AUR
+    name: Publish ${{ matrix.package }} to the AUR
     needs: [release-please, upload-assets]
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
+    environment: release
+    strategy:
+      fail-fast: false
+      # The source package and the binary package are separate AUR repositories
+      # generated from the same script.
+      matrix:
+        package: [devserial, devserial-bin]
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Update PKGBUILD version
-        run: |
-          VERSION=${{ needs.release-please.outputs.version }}
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" aur/PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
-
-      - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          pkgname: devserial
-          pkgbuild: ./aur/PKGBUILD
-          commit_username: metaneutrons
-          commit_email: aur@metaneutrons.github.io
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update to ${{ needs.release-please.outputs.version }}"
-          ssh_keyscan_types: rsa,ecdsa,ed25519
+          name: packaging
+          path: packaging
+      - name: Push PKGBUILD and .SRCINFO, then wait for the AUR to agree
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_SSH_KNOWN_HOSTS: ${{ vars.AUR_SSH_KNOWN_HOSTS }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/key"
+
+          # A pinned host key is preferred. Without one the key is learned on
+          # first use, which is what the previous third-party action did too.
+          if [[ -n "${AUR_SSH_KNOWN_HOSTS:-}" ]]; then
+            printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+            checking=yes
+          else
+            ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org \
+              > "$RUNNER_TEMP/ssh/known_hosts" 2>/dev/null
+            checking=accept-new
+            echo "::warning::set the AUR_SSH_KNOWN_HOSTS variable to pin the AUR host key"
+          fi
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/ssh/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=$checking -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts"
+
+          git -c init.defaultBranch=master clone \
+            "ssh://aur@aur.archlinux.org/${PACKAGE}.git" aur
+          cd aur
+          install -m 0644 "../packaging/${PACKAGE}/PKGBUILD" PKGBUILD
+          docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --volume "$PWD:/pkg" --workdir /pkg archlinux:base-devel \
+            makepkg --printsrcinfo > .SRCINFO
+
+          if [[ -z $(git status --short) ]]; then
+            echo "AUR package is already current, nothing to push"
+            exit 0
+          fi
+          git config user.name 'devserial release automation'
+          git config user.email 'devserial-release@users.noreply.github.com'
+          git add PKGBUILD .SRCINFO
+          git commit -m "${PACKAGE} ${VERSION}-1"
+          git push origin HEAD:master
+
+          for attempt in {1..20}; do
+            if curl --fail --silent --get \
+              --data-urlencode 'v=5' --data-urlencode 'type=info' \
+              --data-urlencode "arg[]=${PACKAGE}" https://aur.archlinux.org/rpc |
+              jq -e --arg v "${VERSION}-1" '.resultcount == 1 and .results[0].Version == $v' >/dev/null; then
+              echo "the AUR reports ${PACKAGE} ${VERSION}-1"
+              exit 0
+            fi
+            [[ "$attempt" == 20 ]] && { echo "::error::the AUR did not converge to ${PACKAGE} ${VERSION}-1"; exit 1; }
+            sleep 15
+          done
