@@ -1,474 +1,252 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
-//! Handlers for individual CLI subcommands communicating with daemon via IPC.
+//! Command line handlers.
+//!
+//! Every handler builds a [`RequestPayload`], sends it through one shared
+//! session and renders the response. The previous version repeated the runtime
+//! setup, the daemon handshake and an `eprintln!` plus `process::exit` block in
+//! each of sixteen functions.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::cli::output::{print_line, print_port_list, print_stats};
+use crate::cli::output;
+use crate::cli::{CliError, Command};
 use crate::ipc::IpcClient;
-use crate::modem::FileTransferProtocol;
-use crate::protocol::{RequestPayload, ResponsePayload};
+use crate::paths;
+use crate::protocol::{
+    LinesPage, ReadWindow, RequestPayload, ResponsePayload, SearchMode, SearchOutcome,
+};
 
-/// Handle daemon control flags (--status, --stop).
-///
-/// # Errors
-/// Returns error on communication failure.
-pub fn handle_daemon_control(
-    client: &IpcClient,
-    socket_path: &Path,
-    status: bool,
-    stop: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+/// Polling interval while following a port.
+const FOLLOW_INTERVAL: Duration = Duration::from_millis(50);
+/// Lines requested per poll while following.
+const FOLLOW_BATCH: u32 = 500;
 
-    if status {
-        let alive = rt.block_on(client.is_alive());
-        if alive {
-            println!("Daemon is RUNNING (socket: {})", socket_path.display());
-        } else {
-            println!("Daemon is STOPPED (socket: {})", socket_path.display());
-        }
-        return Ok(());
-    }
-
-    if stop {
-        let res = rt.block_on(client.send(RequestPayload::Shutdown));
-        match res {
-            Ok(_) => println!("Daemon shutdown command sent."),
-            Err(e) => eprintln!("Failed to stop daemon: {e}"),
-        }
-    }
-    Ok(())
+/// A CLI session: one runtime, one client.
+pub struct Session {
+    client: IpcClient,
+    runtime: tokio::runtime::Runtime,
 }
 
-/// Handle `list` subcommand.
-///
-/// # Errors
-/// Returns error on communication or formatting failure.
-pub fn handle_list(client: &IpcClient, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let _ = rt.block_on(client.ensure_daemon());
+impl Session {
+    /// Create a session for the given endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the Tokio runtime cannot be created.
+    pub fn new(socket: Option<PathBuf>, config: Option<PathBuf>) -> Result<Self, CliError> {
+        let endpoint = socket.unwrap_or_else(paths::default_socket_path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            client: IpcClient::new(endpoint).with_config_path(config),
+            runtime,
+        })
+    }
 
-    let managed = rt.block_on(client.send(RequestPayload::ListPorts)).ok();
-    let hw_ports = serial2_tokio::SerialPort::available_ports().unwrap_or_default();
-    print_port_list(managed, &hw_ports, json)
-}
+    /// The endpoint this session talks to.
+    #[must_use]
+    pub fn endpoint(&self) -> &std::path::Path {
+        self.client.endpoint()
+    }
 
-/// Handle `open` subcommand.
-///
-/// # Errors
-/// Returns error on connection or daemon failure.
-#[allow(clippy::too_many_arguments)]
-pub fn handle_open(
-    client: &IpcClient,
-    port: &str,
-    baud: u32,
-    data_bits: u8,
-    parity: &str,
-    stop_bits: u8,
-    flow_control: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
+    /// Send a request, starting the daemon first if it is not running.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon cannot be reached or reports a failure.
+    pub fn request(&self, payload: RequestPayload) -> Result<ResponsePayload, CliError> {
+        self.runtime.block_on(async {
+            self.client.ensure_daemon().await?;
+            Ok(self.client.send(payload).await?)
+        })
+    }
 
-    let req = RequestPayload::OpenPort {
-        name: port.to_string(),
-        baudrate: Some(baud),
-        data_bits: Some(data_bits),
-        parity: Some(parity.to_string()),
-        stop_bits: Some(stop_bits),
-        flow_control: Some(flow_control.to_string()),
-    };
+    /// Send a request without starting a daemon.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon is not reachable.
+    pub fn request_existing(&self, payload: RequestPayload) -> Result<ResponsePayload, CliError> {
+        self.runtime
+            .block_on(async { Ok(self.client.send(payload).await?) })
+    }
 
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::PortOpened {
-            name,
-            config_summary,
-        }) => {
-            println!("Opened {name} ({config_summary})");
-            Ok(())
-        }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error opening port: {e}");
-            std::process::exit(1);
-        }
+    fn is_alive(&self) -> bool {
+        self.runtime.block_on(self.client.is_alive())
     }
 }
 
-/// Handle `close` subcommand.
+/// Response of an unexpected shape, which would be an engine bug.
+fn unexpected(payload: &ResponsePayload) -> CliError {
+    CliError::msg(format!("unexpected response from daemon: {payload:?}"))
+}
+
+/// Route a remote command to its handler.
 ///
 /// # Errors
-/// Returns error on connection or daemon failure.
-pub fn handle_close(client: &IpcClient, port: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
+/// Returns the handler's error.
+#[allow(clippy::too_many_lines)]
+pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
+    match command {
+        Command::List { json } => list(session, json),
 
-    match rt.block_on(client.send(RequestPayload::ClosePort {
-        name: port.to_string(),
-    })) {
-        Ok(ResponsePayload::PortClosed { name }) => {
+        Command::Open { port, line } => {
+            let response = session.request(RequestPayload::OpenPort {
+                name: port,
+                settings: line.to_settings()?,
+            })?;
+            match response {
+                ResponsePayload::PortOpened {
+                    name,
+                    config_summary,
+                } => {
+                    println!("Opened {name} ({config_summary})");
+                    Ok(())
+                }
+                ResponsePayload::PortReconfigured {
+                    name,
+                    config_summary,
+                } => {
+                    println!("Reconfigured {name} ({config_summary})");
+                    Ok(())
+                }
+                other => Err(unexpected(&other)),
+            }
+        }
+
+        Command::Close { port } => {
+            let response = session.request(RequestPayload::ClosePort { name: port })?;
+            let ResponsePayload::PortClosed { name } = response else {
+                return Err(unexpected(&response));
+            };
             println!("Closed {name}");
             Ok(())
         }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error closing port: {e}");
-            std::process::exit(1);
-        }
-    }
-}
 
-/// Handle `read` subcommand.
-///
-/// # Errors
-/// Returns error on connection or daemon failure.
-#[allow(clippy::too_many_arguments)]
-pub fn handle_read(
-    client: &IpcClient,
-    port: &str,
-    tail: Option<u32>,
-    from: Option<i64>,
-    limit: u32,
-    follow: bool,
-    timestamps: bool,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    if follow {
-        let mut last_id = from.unwrap_or(0);
-        if last_id == 0 {
-            let req = RequestPayload::ReadLines {
-                port: port.to_string(),
-                start_id: None,
-                count: None,
-                tail: Some(tail.unwrap_or(20)),
-            };
-            if let Ok(ResponsePayload::Lines(lines)) = rt.block_on(client.send(req)) {
-                for l in lines {
-                    print_line(&l, timestamps, json);
-                    last_id = last_id.max(l.id);
-                }
-            }
-        }
-
-        loop {
-            std::thread::sleep(Duration::from_millis(50));
-            let req = RequestPayload::ReadLines {
-                port: port.to_string(),
-                start_id: Some(last_id + 1),
-                count: Some(500),
-                tail: None,
-            };
-            if let Ok(ResponsePayload::Lines(lines)) = rt.block_on(client.send(req)) {
-                for l in lines {
-                    print_line(&l, timestamps, json);
-                    last_id = last_id.max(l.id);
-                }
-            }
-        }
-    } else {
-        let req = RequestPayload::ReadLines {
-            port: port.to_string(),
-            start_id: from,
-            count: Some(limit),
+        Command::Read {
+            port,
             tail,
-        };
-        match rt.block_on(client.send(req)) {
-            Ok(ResponsePayload::Lines(lines)) => {
-                for l in lines {
-                    print_line(&l, timestamps, json);
+            from,
+            after,
+            since,
+            limit,
+            wait_ms,
+            follow,
+            timestamps,
+            json,
+        } => {
+            let window = ReadWindow {
+                start_id: from,
+                after_id: after,
+                tail,
+                since_ns: parse_time(since.as_deref())?,
+                limit: Some(limit),
+                wait_ms: Some(wait_ms),
+            };
+            if follow {
+                follow_port(session, &port, window, timestamps, json)
+            } else {
+                let page = read_page(session, &port, window)?;
+                for line in &page.lines {
+                    output::print_line(line, timestamps, json);
                 }
                 Ok(())
             }
-            Ok(other) => {
-                println!("{other:?}");
-                Ok(())
-            }
-            Err(e) => {
-                eprintln!("Error reading port: {e}");
-                std::process::exit(1);
-            }
         }
-    }
-}
 
-/// Handle `write` subcommand.
-///
-/// # Errors
-/// Returns error on reading input or communication failure.
-pub fn handle_write(
-    client: &IpcClient,
-    port: &str,
-    data: Option<String>,
-    hex: bool,
-    newline: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut payload = match data {
-        Some(d) if d == "-" => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        }
-        Some(d) => d,
-        None => {
-            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                eprintln!("Error: no data provided to write. Pass as argument or pipe via stdin.");
-                std::process::exit(1);
-            }
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        }
-    };
+        Command::Write {
+            port,
+            data,
+            hex,
+            newline,
+        } => write(session, &port, data, hex, newline),
 
-    if newline && !hex {
-        payload.push_str("\r\n");
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::WriteData {
-        port: port.to_string(),
-        data: payload,
-        is_hex: hex,
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::WriteSuccess { bytes_written }) => {
-            println!("Wrote {bytes_written} bytes to {port}");
+        Command::Break { port, duration_ms } => {
+            let response = session.request(RequestPayload::SendBreak {
+                port: port.clone(),
+                duration_ms: Some(duration_ms),
+            })?;
+            let ResponsePayload::BreakSuccess { duration_ms } = response else {
+                return Err(unexpected(&response));
+            };
+            println!("Sent serial BREAK pulse ({duration_ms}ms) on {port}");
             Ok(())
         }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error writing to port: {e}");
-            std::process::exit(1);
-        }
-    }
-}
 
-/// Handle `break` subcommand.
-///
-/// # Errors
-/// Returns error on communication failure.
-pub fn handle_break(
-    client: &IpcClient,
-    port: &str,
-    duration_ms: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::SendBreak {
-        port: port.to_string(),
-        duration_ms,
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::BreakSuccess) => {
-            println!(
-                "Sent serial BREAK pulse ({}ms) on {port}",
-                duration_ms.unwrap_or(250)
-            );
-            Ok(())
-        }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error sending serial break: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Handle `send` subcommand (X/Y/ZMODEM).
-///
-/// # Errors
-/// Returns error on transmission failure.
-pub fn handle_send_file(
-    client: &IpcClient,
-    port: &str,
-    file_path: &str,
-    protocol: Option<FileTransferProtocol>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let proto = protocol.unwrap_or(FileTransferProtocol::Zmodem);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    println!("Sending '{file_path}' to {port} using {proto:?}...");
-
-    let req = RequestPayload::SendFile {
-        port: port.to_string(),
-        file_path: file_path.to_string(),
-        protocol: proto,
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::TransferSuccess {
-            bytes_transferred,
-            file_name,
+        Command::Send {
+            port,
+            file,
             protocol,
-        }) => {
-            println!("Successfully sent {bytes_transferred} bytes ({file_name}) via {protocol:?}");
+        } => {
+            println!("Sending '{file}' to {port} using {protocol:?}...");
+            let response = session.request(RequestPayload::SendFile {
+                port,
+                file_path: file,
+                protocol,
+            })?;
+            let ResponsePayload::TransferSuccess {
+                bytes_transferred,
+                file_name,
+                protocol,
+                ..
+            } = response
+            else {
+                return Err(unexpected(&response));
+            };
+            println!("Sent {bytes_transferred} bytes ({file_name}) via {protocol:?}");
             Ok(())
         }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error sending file: {e}");
-            std::process::exit(1);
-        }
-    }
-}
 
-/// Handle `recv` subcommand (X/Y/ZMODEM).
-///
-/// # Errors
-/// Returns error on transmission failure.
-pub fn handle_recv_file(
-    client: &IpcClient,
-    port: &str,
-    output_dir: &str,
-    protocol: Option<FileTransferProtocol>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let proto = protocol.unwrap_or(FileTransferProtocol::Zmodem);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    println!("Waiting to receive file from {port} into '{output_dir}' using {proto:?}...");
-
-    let req = RequestPayload::ReceiveFile {
-        port: port.to_string(),
-        output_dir: output_dir.to_string(),
-        protocol: proto,
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::TransferSuccess {
-            bytes_transferred,
-            file_name,
+        Command::Recv {
+            port,
+            output: out_dir,
             protocol,
-        }) => {
+        } => {
             println!(
-                "Successfully received {bytes_transferred} bytes as '{file_name}' via {protocol:?}"
+                "Waiting to receive a file from {port} into '{out_dir}' using {protocol:?}..."
             );
+            let response = session.request(RequestPayload::ReceiveFile {
+                port,
+                output_dir: out_dir,
+                protocol,
+            })?;
+            let ResponsePayload::TransferSuccess {
+                bytes_transferred,
+                file_name,
+                path,
+                ..
+            } = response
+            else {
+                return Err(unexpected(&response));
+            };
+            let location = path.unwrap_or(file_name);
+            println!("Received {bytes_transferred} bytes into '{location}'");
             Ok(())
         }
-        Ok(other) => {
-            println!("{other:?}");
+
+        Command::Signal { port, dtr, rts } => {
+            let response = session.request(RequestPayload::SetSignal {
+                port: port.clone(),
+                dtr,
+                rts,
+            })?;
+            let ResponsePayload::SignalSuccess { applied } = response else {
+                return Err(unexpected(&response));
+            };
+            println!("Set {} on {port}", applied.join(", "));
             Ok(())
         }
-        Err(e) => {
-            eprintln!("Error receiving file: {e}");
-            std::process::exit(1);
-        }
-    }
-}
 
-/// Handle `signal` subcommand.
-///
-/// # Errors
-/// Returns error on communication failure.
-pub fn handle_signal(
-    client: &IpcClient,
-    port: &str,
-    dtr: Option<bool>,
-    rts: Option<bool>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::SetSignal {
-        port: port.to_string(),
-        dtr,
-        rts,
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::SignalSuccess) => {
-            println!("Signal updated on {port}");
-            Ok(())
-        }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error setting signals: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Handle `macro` subcommand.
-///
-/// # Errors
-/// Returns error on communication failure.
-pub fn handle_macro(
-    client: &IpcClient,
-    port: &str,
-    name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::ExecuteMacro {
-        port: port.to_string(),
-        macro_name: name.to_string(),
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::MacroSuccess { executed_steps }) => {
+        Command::Macro { port, name } => {
+            let response = session.request(RequestPayload::ExecuteMacro {
+                port: port.clone(),
+                macro_name: name.clone(),
+            })?;
+            let ResponsePayload::MacroSuccess { executed_steps } = response else {
+                return Err(unexpected(&response));
+            };
             println!(
                 "Executed macro '{name}' on {port} ({} steps: {})",
                 executed_steps.len(),
@@ -476,242 +254,360 @@ pub fn handle_macro(
             );
             Ok(())
         }
-        Ok(other) => {
-            println!("{other:?}");
+
+        Command::Search {
+            port,
+            query,
+            mode,
+            start,
+            end,
+            limit,
+            json,
+        } => search(
+            session,
+            &port,
+            &query,
+            mode,
+            parse_time(start.as_deref())?,
+            parse_time(end.as_deref())?,
+            limit,
+            json,
+        ),
+
+        Command::Export {
+            port,
+            output: out_path,
+            format,
+            start,
+            end,
+        } => {
+            let response = session.request(RequestPayload::Export {
+                port,
+                output_path: out_path,
+                file_format: Some(format),
+                start_line: start,
+                end_line: end,
+            })?;
+            let ResponsePayload::ExportSuccess {
+                lines_exported,
+                path,
+                file_format,
+            } = response
+            else {
+                return Err(unexpected(&response));
+            };
+            println!("Exported {lines_exported} lines to {path} (format: {file_format})");
             Ok(())
         }
-        Err(e) => {
-            eprintln!("Error executing macro: {e}");
-            std::process::exit(1);
+
+        Command::Clear { port, archive } => {
+            let response = session.request(RequestPayload::Clear {
+                port: port.clone(),
+                archive_current: Some(archive),
+            })?;
+            let ResponsePayload::ClearSuccess {
+                lines_cleared,
+                archive_path,
+            } = response
+            else {
+                return Err(unexpected(&response));
+            };
+            match archive_path {
+                Some(path) => {
+                    println!("Cleared buffer on {port} ({lines_cleared} lines archived to {path})");
+                }
+                None => println!("Cleared buffer on {port} ({lines_cleared} lines removed)"),
+            }
+            Ok(())
         }
+
+        Command::Stats { port, json } => {
+            let response = session.request(RequestPayload::GetStatus { port })?;
+            let ResponsePayload::Status { name, state, stats } = response else {
+                return Err(unexpected(&response));
+            };
+            output::print_status(&name, &state, &stats, json)
+        }
+
+        #[cfg(feature = "esp")]
+        Command::Flash {
+            port,
+            firmware,
+            baud,
+            monitor,
+        } => flash(session, &port, &firmware, baud, monitor),
+
+        // Handled before reaching this router.
+        Command::Mcp | Command::Daemon { .. } | Command::About => {
+            Err(CliError::msg("command is not a remote operation"))
+        }
+
+        #[cfg(feature = "monitor")]
+        Command::Gui | Command::Monitor { .. } | Command::MonitorSubprocess { .. } => {
+            Err(CliError::msg("command is not a remote operation"))
+        }
+
+        #[cfg(feature = "tui")]
+        Command::Tui { .. } => Err(CliError::msg("command is not a remote operation")),
     }
 }
 
-/// Handle `search` subcommand.
+/// Handle `daemon --status` and `daemon --stop`.
 ///
 /// # Errors
-/// Returns error on search or formatting failure.
-pub fn handle_search(
-    client: &IpcClient,
-    port: &str,
-    query: &str,
-    regex: bool,
-    limit: u32,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
+/// Returns an error if the daemon cannot be reached while stopping it.
+pub fn daemon_control(session: &Session, status: bool, stop: bool) -> Result<(), CliError> {
+    if status {
+        let state = if session.is_alive() {
+            "RUNNING"
+        } else {
+            "STOPPED"
+        };
+        println!(
+            "Daemon is {state} (endpoint: {})",
+            session.endpoint().display()
+        );
+        return Ok(());
+    }
 
-    let req = RequestPayload::Search {
-        port: port.to_string(),
-        query: query.to_string(),
-        is_regex: regex,
-        start_ns: None,
-        end_ns: None,
-        limit: Some(limit),
+    if stop {
+        match session.request_existing(RequestPayload::Shutdown) {
+            Ok(_) => println!("Daemon shutdown requested."),
+            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
+                println!("Daemon is not running.");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn list(session: &Session, json: bool) -> Result<(), CliError> {
+    // Hardware enumeration must work even without a daemon.
+    let hardware = crate::engine::hardware_ports();
+    let managed = match session.request_existing(RequestPayload::ListPorts) {
+        Ok(ResponsePayload::PortList(ports)) => Some(ports),
+        Ok(other) => return Err(unexpected(&other)),
+        Err(_) => None,
     };
+    output::print_port_list(managed.as_deref(), &hardware, json)
+}
 
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::SearchResults(results)) => {
-            if json {
-                println!("{}", serde_json::to_string_pretty(&results)?);
-            } else {
-                println!("Found {} matching lines:", results.len());
-                for r in results {
-                    println!("  [{}] {}", r.id, r.payload);
+fn read_page(session: &Session, port: &str, window: ReadWindow) -> Result<LinesPage, CliError> {
+    let response = session.request(RequestPayload::ReadLines {
+        port: port.to_string(),
+        window,
+    })?;
+    match response {
+        ResponsePayload::Lines(page) => Ok(page),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Stream new lines until interrupted.
+fn follow_port(
+    session: &Session,
+    port: &str,
+    window: ReadWindow,
+    timestamps: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    // Seed from the requested window, then continue by id.
+    let initial = ReadWindow {
+        tail: window.tail.or(Some(20)),
+        limit: window.limit,
+        ..ReadWindow::default()
+    };
+    let mut page = read_page(session, port, initial)?;
+    for line in &page.lines {
+        output::print_line(line, timestamps, json);
+    }
+    let mut last_id = page.next_after_id;
+
+    session.runtime.block_on(async {
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    return Ok(());
+                }
+                () = tokio::time::sleep(FOLLOW_INTERVAL) => {
+                    let response = session
+                        .client
+                        .send(RequestPayload::ReadLines {
+                            port: port.to_string(),
+                            window: ReadWindow {
+                                after_id: Some(last_id),
+                                limit: Some(FOLLOW_BATCH),
+                                ..ReadWindow::default()
+                            },
+                        })
+                        .await?;
+                    let ResponsePayload::Lines(next) = response else {
+                        return Err(unexpected(&response));
+                    };
+                    for line in &next.lines {
+                        output::print_line(line, timestamps, json);
+                    }
+                    if !next.lines.is_empty() {
+                        last_id = next.next_after_id;
+                    }
+                    page = next;
                 }
             }
-            Ok(())
         }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error searching: {e}");
-            std::process::exit(1);
-        }
-    }
+    })?;
+    let _ = page;
+    Ok(())
 }
 
-/// Handle `export` subcommand.
-///
-/// # Errors
-/// Returns error on export execution.
-pub fn handle_export(
-    client: &IpcClient,
+fn write(
+    session: &Session,
     port: &str,
-    output: &str,
-    format: &str,
-    start: Option<i64>,
-    end: Option<i64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::Export {
-        port: port.to_string(),
-        output_path: output.to_string(),
-        file_format: Some(format.to_string()),
-        start_line: start,
-        end_line: end,
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::ExportSuccess {
-            lines_exported,
-            path,
-        }) => {
-            println!("Exported {lines_exported} lines to {path}");
-            Ok(())
-        }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error exporting: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Handle `clear` subcommand.
-///
-/// # Errors
-/// Returns error on clear execution.
-pub fn handle_clear(
-    client: &IpcClient,
-    port: &str,
-    archive: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::Clear {
-        port: port.to_string(),
-        archive_current: Some(archive),
-    };
-
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::ClearSuccess {
-            lines_cleared,
-            archive_path,
-        }) => {
-            if let Some(arch) = archive_path {
-                println!("Cleared buffer on {port} ({lines_cleared} lines archived to {arch})");
-            } else {
-                println!("Cleared buffer on {port} ({lines_cleared} lines removed)");
+    data: Option<String>,
+    hex: bool,
+    newline: bool,
+) -> Result<(), CliError> {
+    let mut payload = match data {
+        Some(value) if value == "-" => read_stdin()?,
+        Some(value) => value,
+        None => {
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                return Err(CliError::msg(
+                    "no data to write: pass it as an argument or pipe it via stdin",
+                ));
             }
-            Ok(())
+            read_stdin()?
         }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error clearing buffer: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Handle `stats` subcommand.
-///
-/// # Errors
-/// Returns error on statistics retrieval or formatting.
-pub fn handle_stats(
-    client: &IpcClient,
-    port: &str,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(client.ensure_daemon())
-        .map_err(|e| format!("daemon start error: {e}"))?;
-
-    let req = RequestPayload::GetStats {
-        port: port.to_string(),
     };
 
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::Stats(stats)) => print_stats(port, &stats, json),
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
+    if newline {
+        if hex {
+            return Err(CliError::msg(
+                "--newline cannot be combined with --hex; include 0D0A in the hex data instead",
+            ));
         }
-        Err(e) => {
-            eprintln!("Error getting stats: {e}");
-            std::process::exit(1);
-        }
+        payload.push_str("\r\n");
     }
+
+    let response = session.request(RequestPayload::WriteData {
+        port: port.to_string(),
+        data: payload,
+        is_hex: hex,
+    })?;
+    let ResponsePayload::WriteSuccess { bytes_written } = response else {
+        return Err(unexpected(&response));
+    };
+    println!("Wrote {bytes_written} bytes to {port}");
+    Ok(())
 }
 
-/// Handle `flash` subcommand.
-///
-/// # Errors
-/// Returns error on flashing failure.
+fn read_stdin() -> Result<String, CliError> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search(
+    session: &Session,
+    port: &str,
+    query: &str,
+    mode: SearchMode,
+    start_ns: Option<i64>,
+    end_ns: Option<i64>,
+    limit: u32,
+    json: bool,
+) -> Result<(), CliError> {
+    let response = session.request(RequestPayload::Search {
+        port: port.to_string(),
+        query: query.to_string(),
+        mode,
+        start_ns,
+        end_ns,
+        limit: Some(limit),
+    })?;
+    let ResponsePayload::SearchResults(outcome) = response else {
+        return Err(unexpected(&response));
+    };
+    print_search(&outcome, json)
+}
+
+fn print_search(outcome: &SearchOutcome, json: bool) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(outcome)?);
+        return Ok(());
+    }
+    println!("Found {} matching lines:", outcome.results.len());
+    for line in &outcome.results {
+        println!("  [{}] {}", line.id, line.payload);
+    }
+    if outcome.truncated {
+        println!("(scan limit reached; later lines were not examined)");
+    }
+    Ok(())
+}
+
 #[cfg(feature = "esp")]
-pub fn handle_flash(
-    client: &IpcClient,
+fn flash(
+    session: &Session,
     port: &str,
     firmware: &str,
     baud: Option<u32>,
     monitor: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let _ = rt.block_on(client.ensure_daemon());
-
+) -> Result<(), CliError> {
     println!("Flashing firmware {firmware} to {port}...");
-    let req = RequestPayload::EspFlash {
+    let response = session.request(RequestPayload::EspFlash {
         port: port.to_string(),
         firmware_path: firmware.to_string(),
         baud,
+    })?;
+    let ResponsePayload::EspSuccess(output) = response else {
+        return Err(unexpected(&response));
     };
+    print!("{output}");
 
-    match rt.block_on(client.send(req)) {
-        Ok(ResponsePayload::EspSuccess(output)) => {
-            print!("{output}");
-            if monitor {
-                println!("\n━━━ Switching to live monitor (Ctrl+C to exit) ━━━\n");
-                let mut last_id = 0;
-                loop {
-                    std::thread::sleep(Duration::from_millis(50));
-                    let read_req = RequestPayload::ReadLines {
-                        port: port.to_string(),
-                        start_id: Some(last_id + 1),
-                        count: Some(500),
-                        tail: None,
-                    };
-                    if let Ok(ResponsePayload::Lines(lines)) = rt.block_on(client.send(read_req)) {
-                        for l in lines {
-                            println!("{}", l.payload);
-                            last_id = last_id.max(l.id);
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-        Ok(other) => {
-            println!("{other:?}");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Flash Error: {e}");
-            std::process::exit(1);
-        }
+    if monitor {
+        println!("\n━━━ Following serial output (Ctrl+C to exit) ━━━\n");
+        return follow_port(session, port, ReadWindow::default(), false, false);
+    }
+    Ok(())
+}
+
+fn parse_time(value: Option<&str>) -> Result<Option<i64>, CliError> {
+    value
+        .map(|text| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
+                .map_err(|e| CliError::msg(format!("invalid timestamp '{text}': {e}")))
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_must_be_rfc3339() {
+        assert!(parse_time(Some("2026-01-15T10:00:00Z")).unwrap().is_some());
+        assert!(parse_time(None).unwrap().is_none());
+        assert!(parse_time(Some("yesterday")).is_err());
+    }
+
+    #[test]
+    fn newline_and_hex_are_mutually_exclusive() {
+        let session = Session::new(
+            Some(std::path::PathBuf::from("/nonexistent/devserial.sock")),
+            None,
+        )
+        .unwrap();
+        let err = write(&session, "/dev/x", Some("41".into()), true, true).unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn session_reports_its_endpoint() {
+        let session = Session::new(Some(std::path::PathBuf::from("/tmp/x.sock")), None).unwrap();
+        assert_eq!(session.endpoint(), std::path::Path::new("/tmp/x.sock"));
     }
 }

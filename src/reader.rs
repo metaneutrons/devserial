@@ -8,11 +8,41 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 
-use crate::config::PortConfig;
+use crate::config::{GlobalConfig, PortConfig};
 use crate::storage::SqliteStorage;
 
-/// Maximum reconnect backoff duration.
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Number of write batches between buffer trims.
+///
+/// Trimming is a delete over the whole table, so it runs periodically rather
+/// than after every batch.
+const BATCHES_PER_TRIM: u32 = 100;
+
+/// How captured lines are batched before they reach storage.
+#[derive(Debug, Clone, Copy)]
+pub struct FlushSettings {
+    /// Maximum time a partially filled batch waits before it is written.
+    pub interval: Duration,
+    /// Number of lines that forces an immediate write.
+    pub batch_size: usize,
+}
+
+impl Default for FlushSettings {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(100),
+            batch_size: 1000,
+        }
+    }
+}
+
+impl From<&GlobalConfig> for FlushSettings {
+    fn from(global: &GlobalConfig) -> Self {
+        Self {
+            interval: global.flush_interval(),
+            batch_size: global.flush_batch_size.max(1),
+        }
+    }
+}
 
 /// Connection state of a port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,7 +112,13 @@ pub fn spawn_reader<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    spawn_reader_with_reconnect(reader, storage, config, NoReconnect)
+    spawn_reader_with_reconnect(
+        reader,
+        storage,
+        config,
+        FlushSettings::default(),
+        NoReconnect,
+    )
 }
 
 /// Spawn a reader with reconnect support.
@@ -90,6 +126,7 @@ pub fn spawn_reader_with_reconnect<R, F>(
     reader: R,
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
     config: &PortConfig,
+    flush: FlushSettings,
     factory: F,
 ) -> PortReaderHandle
 where
@@ -102,6 +139,7 @@ where
     let delimiter = config.delimiter;
     let auto_reconnect = config.auto_reconnect;
     let base_interval_ms = config.reconnect_interval_ms;
+    let max_backoff = config.reconnect_max_backoff();
     let max_buffer_lines = config.max_buffer_lines;
 
     // Writer task: receives batches and writes to storage
@@ -111,9 +149,8 @@ where
         while let Some(batch) = line_rx.recv().await {
             let storage = Arc::clone(&writer_storage);
             let trim = if max_buffer_lines > 0 {
-                batches_since_trim += 1;
-                // Trim every 100 batches (~10k lines at batch size 100)
-                batches_since_trim % 100 == 0
+                batches_since_trim = batches_since_trim.wrapping_add(1);
+                batches_since_trim % BATCHES_PER_TRIM == 0
             } else {
                 false
             };
@@ -142,9 +179,13 @@ where
         let boxed: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(reader);
         reader_with_reconnect(
             boxed,
-            delimiter,
-            auto_reconnect,
-            base_interval_ms,
+            ReconnectParams {
+                delimiter,
+                auto_reconnect,
+                base_interval_ms,
+                max_backoff,
+                flush,
+            },
             line_tx,
             state_tx,
             shutdown_rx,
@@ -159,12 +200,18 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn reader_with_reconnect<F: ReaderFactory>(
-    initial_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+/// Parameters that stay constant for the lifetime of a reader task.
+struct ReconnectParams {
     delimiter: u8,
     auto_reconnect: bool,
     base_interval_ms: u64,
+    max_backoff: Duration,
+    flush: FlushSettings,
+}
+
+async fn reader_with_reconnect<F: ReaderFactory>(
+    initial_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    params: ReconnectParams,
     line_tx: mpsc::Sender<Vec<IngestedLine>>,
     state_tx: watch::Sender<ConnectionState>,
     mut shutdown_rx: mpsc::Receiver<()>,
@@ -176,14 +223,15 @@ async fn reader_with_reconnect<F: ReaderFactory>(
         // Read until disconnect or shutdown
         let disconnected = reader_loop(
             &mut reader,
-            delimiter,
+            params.delimiter,
+            params.flush,
             &line_tx,
             &state_tx,
             &mut shutdown_rx,
         )
         .await;
 
-        if !disconnected || !auto_reconnect {
+        if !disconnected || !params.auto_reconnect {
             break;
         }
 
@@ -197,9 +245,12 @@ async fn reader_with_reconnect<F: ReaderFactory>(
                 u64::try_from(disconnect_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             state_tx.send_replace(ConnectionState::Disconnected { since_ms, attempts });
 
-            let backoff =
-                Duration::from_millis(base_interval_ms.saturating_mul(u64::from(attempts.min(15))))
-                    .min(MAX_RECONNECT_BACKOFF);
+            let backoff = Duration::from_millis(
+                params
+                    .base_interval_ms
+                    .saturating_mul(u64::from(attempts.min(15))),
+            )
+            .min(params.max_backoff);
 
             tokio::select! {
                 biased;
@@ -224,6 +275,7 @@ async fn reader_with_reconnect<F: ReaderFactory>(
 async fn reader_loop(
     reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     delimiter: u8,
+    flush: FlushSettings,
     line_tx: &mpsc::Sender<Vec<IngestedLine>>,
     state_tx: &watch::Sender<ConnectionState>,
     shutdown_rx: &mut mpsc::Receiver<()>,
@@ -231,7 +283,7 @@ async fn reader_loop(
     let mut buf = vec![0u8; 4096];
     let mut partial = Vec::new();
     let mut batch = Vec::new();
-    let flush_interval = Duration::from_millis(100);
+    let flush_interval = flush.interval;
 
     loop {
         tokio::select! {
@@ -250,7 +302,7 @@ async fn reader_loop(
                         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                         process_bytes(&buf[..n], delimiter, now_ns, &mut partial, &mut batch);
 
-                        if batch.len() >= 1000
+                        if batch.len() >= flush.batch_size
                             && line_tx.send(std::mem::take(&mut batch)).await.is_err()
                         {
                             return false;
@@ -474,7 +526,8 @@ mod tests {
             ctrl: ctrl_clone,
         };
 
-        let handle = spawn_reader_with_reconnect(mock, &storage, &config, factory);
+        let handle =
+            spawn_reader_with_reconnect(mock, &storage, &config, FlushSettings::default(), factory);
 
         // Trigger disconnect
         ctrl.simulate_disconnect();

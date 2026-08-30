@@ -10,7 +10,7 @@ use devserial::config::{Config, PortConfig};
 use devserial::engine::CommandEngine;
 use devserial::ipc::{IpcClient, IpcServer};
 use devserial::port_manager::PortManagerHandle;
-use devserial::protocol::{RequestPayload, ResponsePayload};
+use devserial::protocol::{ReadWindow, RequestPayload, ResponsePayload, SearchMode};
 use devserial::state::StateDb;
 use devserial::storage::SqliteStorage;
 use devserial::testutil::mock_serial::mock_serial;
@@ -25,8 +25,10 @@ async fn test_daemon_full_rpc_lifecycle() {
 
     let pm = PortManagerHandle::new();
     let state_db = Arc::new(Mutex::new(StateDb::open_memory().unwrap()));
-    let config = Arc::new(Config::default());
-    let engine = CommandEngine::new(pm.clone(), state_db, config, dir.path().to_path_buf());
+    let mut config = Config::default();
+    config.global.data_dir = dir.path().to_path_buf();
+    config.global.archive_dir = dir.path().join("archive");
+    let engine = CommandEngine::new(pm.clone(), state_db, Arc::new(config));
 
     let server = IpcServer::new(engine, socket_path.clone(), pid_path.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -79,17 +81,20 @@ async fn test_daemon_full_rpc_lifecycle() {
     let read_resp = client
         .send(RequestPayload::ReadLines {
             port: "mock_daemon_port".into(),
-            start_id: Some(1),
-            count: Some(10),
-            tail: None,
+            window: ReadWindow {
+                start_id: Some(1),
+                limit: Some(10),
+                ..ReadWindow::default()
+            },
         })
         .await
         .unwrap();
 
-    if let ResponsePayload::Lines(lines) = read_resp {
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].payload, "[INIT] system ready");
-        assert_eq!(lines[2].payload, "[ERROR] packet drop");
+    if let ResponsePayload::Lines(page) = read_resp {
+        assert_eq!(page.lines.len(), 3);
+        assert_eq!(page.total_lines, 3);
+        assert_eq!(page.lines[0].payload, "[INIT] system ready");
+        assert_eq!(page.lines[2].payload, "[ERROR] packet drop");
     } else {
         panic!("expected Lines");
     }
@@ -99,7 +104,7 @@ async fn test_daemon_full_rpc_lifecycle() {
         .send(RequestPayload::Search {
             port: "mock_daemon_port".into(),
             query: "ERROR".into(),
-            is_regex: false,
+            mode: SearchMode::Substring,
             start_ns: None,
             end_ns: None,
             limit: Some(10),
@@ -107,9 +112,10 @@ async fn test_daemon_full_rpc_lifecycle() {
         .await
         .unwrap();
 
-    if let ResponsePayload::SearchResults(results) = search_resp {
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].payload, "[ERROR] packet drop");
+    if let ResponsePayload::SearchResults(outcome) = search_resp {
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].payload, "[ERROR] packet drop");
+        assert!(!outcome.truncated);
     } else {
         panic!("expected SearchResults");
     }

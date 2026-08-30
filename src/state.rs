@@ -6,11 +6,24 @@
 //! Stores:
 //! - Active port configurations (for auto-reopen on restart)
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::{Connection, params};
 
 use crate::config::PortConfig;
+use crate::paths;
+
+/// State schema, defined once for file-backed and in-memory databases.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ports (
+         name TEXT PRIMARY KEY,
+         config_json TEXT NOT NULL,
+         opened_at INTEGER NOT NULL
+     );";
+
+/// Pragmas for the file-backed state database.
+const PRAGMAS: &str = "PRAGMA journal_mode=WAL;
+     PRAGMA synchronous=NORMAL;
+     PRAGMA busy_timeout=5000;";
 
 /// Errors from the state store.
 #[derive(Debug, thiserror::Error)]
@@ -42,18 +55,9 @@ impl StateDb {
     /// Returns error if the database cannot be opened.
     pub fn open(data_dir: &Path) -> Result<Self, StateError> {
         std::fs::create_dir_all(data_dir)?;
-        let db_path = data_dir.join("config.db");
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;
-             CREATE TABLE IF NOT EXISTS ports (
-                 name TEXT PRIMARY KEY,
-                 config_json TEXT NOT NULL,
-                 opened_at INTEGER NOT NULL
-             );",
-        )?;
+        let conn = Connection::open(paths::state_db_path(data_dir))?;
+        conn.execute_batch(PRAGMAS)?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -63,13 +67,7 @@ impl StateDb {
     /// Returns error if the database cannot be created.
     pub fn open_memory() -> Result<Self, StateError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE ports (
-                 name TEXT PRIMARY KEY,
-                 config_json TEXT NOT NULL,
-                 opened_at INTEGER NOT NULL
-             );",
-        )?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -118,11 +116,13 @@ impl StateDb {
         Ok(entries)
     }
 
-    /// Get the path to the data directory (for constructing port DB paths).
-    #[must_use]
-    pub fn port_db_path(data_dir: &Path, port_name: &str) -> PathBuf {
-        let sanitized = port_name.replace(['/', '\\'], "_");
-        data_dir.join(format!("{sanitized}.db"))
+    /// Remove every port entry, used when state should not be restored.
+    ///
+    /// # Errors
+    /// Returns error on database failure.
+    pub fn clear_ports(&self) -> Result<(), StateError> {
+        self.conn.execute("DELETE FROM ports", [])?;
+        Ok(())
     }
 }
 
