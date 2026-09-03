@@ -259,10 +259,20 @@ mod tests {
 
     #[test]
     fn extension_swap() {
+        // The function returns a native path, so the expectation is built
+        // natively too. A literal "/tmp/log.csv" passes on Unix and fails on
+        // Windows, where Path::join writes a backslash. PathBuf comparison
+        // would hide the difference; this test compares strings on purpose,
+        // because that is what callers put in front of a user.
+        let expected = std::path::Path::new("/tmp")
+            .join("log.csv")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             with_format_extension("/tmp/log.txt", ExportFormat::Csv),
-            "/tmp/log.csv"
+            expected
         );
+        // No parent, so no separator and nothing platform dependent.
         assert_eq!(
             with_format_extension("log", ExportFormat::Jsonl),
             "log.jsonl"

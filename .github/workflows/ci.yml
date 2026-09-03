@@ -96,9 +96,11 @@ jobs:
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
       # One process per test, so the integration tests no longer need
-      # --test-threads=1 to keep their sandboxes apart.
+      # --test-threads=1 to keep their sandboxes apart. --no-fail-fast because
+      # a platform-specific failure otherwise hides every later one, and each
+      # push then reveals exactly one more.
       - name: Tests
-        run: cargo nextest run --locked ${{ matrix.features }}
+        run: cargo nextest run --locked --no-fail-fast ${{ matrix.features }}
 
       - name: Documentation
         run: cargo doc --locked --no-deps ${{ matrix.features }}
