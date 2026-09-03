@@ -1,0 +1,8 @@
+# Die einzige Quelle der Toolchain-Version: lokal, in der CI und im
+# Release-Build. Kein dtolnay/rust-toolchain mit abweichender Angabe daneben,
+# sonst gibt es zwei Wahrheiten. Dependabot haelt die Datei ueber
+# package-ecosystem: rust-toolchain aktuell.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

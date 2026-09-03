@@ -1,4 +1,37 @@
-/target
+# Muster bewusst UNVERANKERT, damit sie auf jeder Ebene greifen.
+# Ein führender Slash würde bei einem neuen Unterprojekt nicht mehr passen.
+
+target/
+**/*.rs.bk
+*.pdb
+
+# Coverage
+lcov.info
+coverage/
+*.profraw
+
+# Node, falls irgendwo ein Unterprojekt entsteht
+node_modules/
+dist/
+.pnpm-store/
+
+# Umgebung und Zustand
+.env
+.env.*
+!.env.example
+*.log
+
+# Editor und Betriebssystem
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# devserial: Laufzeitzustand des Daemons und der Aufzeichnungen
 *.db
+*.db-wal
+*.db-shm
 data/

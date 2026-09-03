@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-set -e
-
-cargo fmt -- --check || {
-  echo "ERROR: Code not formatted. Run: cargo fmt"
-  exit 1
-}

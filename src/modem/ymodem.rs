@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! YMODEM protocol implementation (YMODEM-Batch with metadata).
@@ -6,19 +6,10 @@
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::crc16_ccitt;
-
-const SOH: u8 = 0x01; // 128-byte block header
-const STX: u8 = 0x02; // 1024-byte block header (1K)
-const EOT: u8 = 0x04; // End of transmission
-const ACK: u8 = 0x06; // Acknowledge
-const NAK: u8 = 0x15; // Negative acknowledge
-const CAN: u8 = 0x18; // Cancel
-const CRC_C: u8 = 0x43; // 'C' character for CRC handshake
-const PAD: u8 = 0x1A; // Padding
-
-const MAX_RETRIES: u32 = 10;
-const TIMEOUT: Duration = Duration::from_secs(3);
+use super::{
+    ACK, CAN, CRC_C, EOT, MAX_RETRIES, NAK, PAD, SOH, STX, TIMEOUT, crc16_ccitt,
+    read_byte_with_timeout,
+};
 
 /// Send a file with filename and payload using YMODEM.
 ///
@@ -121,12 +112,12 @@ where
     }
 
     // Receiver may send 'C' for next file
-    if let Ok(c) = read_byte_with_timeout(stream, Duration::from_millis(500)).await {
-        if c == CRC_C {
-            // 5. Send Null Block 0 to terminate batch
-            send_null_block(stream).await?;
-            let _ = read_byte_with_timeout(stream, TIMEOUT).await;
-        }
+    if let Ok(c) = read_byte_with_timeout(stream, Duration::from_millis(500)).await
+        && c == CRC_C
+    {
+        // 5. Send Null Block 0 to terminate batch
+        send_null_block(stream).await?;
+        let _ = read_byte_with_timeout(stream, TIMEOUT).await;
     }
 
     Ok(total_bytes)
@@ -152,21 +143,21 @@ where
         stream.write_all(&[CRC_C]).await.ok();
         stream.flush().await.ok();
 
-        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await {
-            if b == SOH || b == STX {
-                // Parse Block 0
-                let (name, size) = read_header_block(stream, b).await?;
-                if name.is_empty() {
-                    // Empty header -> end of batch
-                    stream.write_all(&[ACK]).await.ok();
-                    stream.flush().await.ok();
-                    return Ok((String::new(), Vec::new()));
-                }
-                filename = name;
-                expected_size = size;
-                started = true;
-                break;
+        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await
+            && (b == SOH || b == STX)
+        {
+            // Parse Block 0
+            let (name, size) = read_header_block(stream, b).await?;
+            if name.is_empty() {
+                // Empty header -> end of batch
+                stream.write_all(&[ACK]).await.ok();
+                stream.flush().await.ok();
+                return Ok((String::new(), Vec::new()));
             }
+            filename = name;
+            expected_size = size;
+            started = true;
+            break;
         }
     }
 
@@ -246,12 +237,12 @@ where
     }
 
     // 3. Read termination block 0
-    if let Ok(b) = read_byte_with_timeout(stream, Duration::from_millis(500)).await {
-        if b == SOH || b == STX {
-            let _ = read_header_block(stream, b).await;
-            stream.write_all(&[ACK]).await.ok();
-            stream.flush().await.ok();
-        }
+    if let Ok(b) = read_byte_with_timeout(stream, Duration::from_millis(500)).await
+        && (b == SOH || b == STX)
+    {
+        let _ = read_header_block(stream, b).await;
+        stream.write_all(&[ACK]).await.ok();
+        stream.flush().await.ok();
     }
 
     Ok((filename, received))
@@ -368,18 +359,6 @@ where
         }
     }
     Err(format!("YMODEM timeout waiting for {expected:#04x}"))
-}
-
-async fn read_byte_with_timeout<S>(stream: &mut S, timeout: Duration) -> Result<u8, String>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; 1];
-    match tokio::time::timeout(timeout, stream.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => Ok(buf[0]),
-        Ok(Err(e)) => Err(format!("I/O error reading byte: {e}")),
-        Err(_) => Err("Timeout reading byte".to_string()),
-    }
 }
 
 #[cfg(test)]

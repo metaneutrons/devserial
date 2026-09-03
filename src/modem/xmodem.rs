@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! XMODEM protocol implementation (Standard, CRC, 1K).
@@ -6,19 +6,10 @@
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{checksum8, crc16_ccitt};
-
-const SOH: u8 = 0x01; // 128-byte block header
-const STX: u8 = 0x02; // 1024-byte block header (1K)
-const EOT: u8 = 0x04; // End of transmission
-const ACK: u8 = 0x06; // Acknowledge
-const NAK: u8 = 0x15; // Negative acknowledge
-const CAN: u8 = 0x18; // Cancel
-const CRC_C: u8 = 0x43; // 'C' character for CRC handshake
-const PAD: u8 = 0x1A; // Standard CPM/XMODEM EOF padding
-
-const MAX_RETRIES: u32 = 10;
-const TIMEOUT: Duration = Duration::from_secs(3);
+use super::{
+    ACK, CAN, CRC_C, EOT, MAX_RETRIES, NAK, PAD, SOH, STX, TIMEOUT, checksum8, crc16_ccitt,
+    read_byte_with_timeout,
+};
 
 /// Send data using XMODEM.
 ///
@@ -152,24 +143,24 @@ where
             .map_err(|e| format!("XMODEM write error: {e}"))?;
         stream.flush().await.ok();
 
-        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await {
-            if b == SOH || b == STX || b == EOT || b == CAN {
-                started = true;
-                // Process this first byte
-                if b == EOT {
-                    stream.write_all(&[ACK]).await.ok();
-                    stream.flush().await.ok();
-                    return Ok(received);
-                }
-                if b == CAN {
-                    return Err("XMODEM cancelled by sender".to_string());
-                }
-                // Handle SOH / STX block
-                handle_incoming_block(stream, b, expected_block, use_crc, &mut received).await?;
-                expected_block = expected_block.wrapping_add(1);
-                on_progress(received.len());
-                break;
+        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await
+            && (b == SOH || b == STX || b == EOT || b == CAN)
+        {
+            started = true;
+            // Process this first byte
+            if b == EOT {
+                stream.write_all(&[ACK]).await.ok();
+                stream.flush().await.ok();
+                return Ok(received);
             }
+            if b == CAN {
+                return Err("XMODEM cancelled by sender".to_string());
+            }
+            // Handle SOH / STX block
+            handle_incoming_block(stream, b, expected_block, use_crc, &mut received).await?;
+            expected_block = expected_block.wrapping_add(1);
+            on_progress(received.len());
+            break;
         }
     }
 
@@ -289,18 +280,6 @@ where
         }
     }
     Err("XMODEM timeout waiting for receiver start signal ('C' or NAK)".to_string())
-}
-
-async fn read_byte_with_timeout<S>(stream: &mut S, timeout: Duration) -> Result<u8, String>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; 1];
-    match tokio::time::timeout(timeout, stream.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => Ok(buf[0]),
-        Ok(Err(e)) => Err(format!("I/O error reading byte: {e}")),
-        Err(_) => Err("Timeout reading byte".to_string()),
-    }
 }
 
 #[cfg(test)]

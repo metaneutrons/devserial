@@ -1,9 +1,17 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
+
+//! MCP transport.
+//!
+//! Every tool translates its parameters into a [`RequestPayload`], hands it to
+//! the [`CommandEngine`] and renders the response for a language model. There is
+//! deliberately no operation logic here; that lives in the engine and is shared
+//! with the CLI and the daemon.
 
 #![allow(unknown_lints)]
 #![allow(clippy::unused_async_trait_impl)]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use rmcp::{
@@ -15,137 +23,171 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::port_manager::PortManagerHandle;
-
-/// Maximum lines returned by `serial_read`.
-const MAX_READ_LINES: u32 = 10_000;
-/// Default lines returned by `serial_read`.
-const DEFAULT_READ_LINES: u32 = 100;
-/// Maximum results returned by `serial_search`.
-const MAX_SEARCH_RESULTS: u32 = 1000;
-/// Default results returned by `serial_search`.
-const DEFAULT_SEARCH_RESULTS: u32 = 100;
+use crate::engine::{CommandEngine, EngineError};
+use crate::export::ExportFormat;
+use crate::modem::FileTransferProtocol;
+use crate::protocol::{
+    LinesPage, PortSettings, ReadWindow, RequestPayload, ResponsePayload, SearchMode,
+};
+use crate::serial_params::{DataBits, FlowControl, Parity, StopBits};
 
 /// MCP server for serial hardware bridging.
 #[derive(Clone)]
 pub struct DevSerialServer {
-    #[allow(dead_code)] // Used by #[tool_router] proc macro
     tool_router: ToolRouter<Self>,
-    port_manager: PortManagerHandle,
-    config: crate::config::Config,
-    state_db: Arc<std::sync::Mutex<crate::state::StateDb>>,
+    engine: CommandEngine,
     #[cfg(feature = "monitor")]
-    monitors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, MonitorState>>>,
+    monitors: Arc<std::sync::Mutex<std::collections::HashMap<String, MonitorState>>>,
 }
 
-/// State for a running monitor (feature-gated).
+/// State for a running monitor window (feature-gated).
 #[cfg(feature = "monitor")]
 struct MonitorState {
     handle: crate::monitor::MonitorHandle,
 }
 
 impl DevSerialServer {
-    /// Create a new server with config.
-    ///
-    /// # Panics
-    /// Panics if `config.db` cannot be opened in the data directory.
+    /// Create a server over an existing engine.
     #[must_use]
-    pub fn new(port_manager: PortManagerHandle, config: crate::config::Config) -> Self {
-        let state_db =
-            crate::state::StateDb::open(&config.global.data_dir).expect("failed to open config.db");
+    pub fn new(engine: CommandEngine) -> Self {
         Self {
-            tool_router: Self::tool_router(),
-            port_manager,
-            config,
-            state_db: Arc::new(std::sync::Mutex::new(state_db)),
+            tool_router: Self::build_router(),
+            engine,
             #[cfg(feature = "monitor")]
-            monitors: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            monitors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
-    /// Create a new server with default config (for testing).
+    /// Create a server with an in-memory state database, for tests.
     ///
     /// # Panics
-    /// Panics if the in-memory state database cannot be created.
+    /// Panics if the in-memory state database cannot be created, which would
+    /// mean the bundled `SQLite` is broken.
     #[must_use]
-    pub fn with_port_manager(port_manager: PortManagerHandle) -> Self {
-        let state_db = crate::state::StateDb::open_memory().expect("failed to open memory state");
-        Self {
-            tool_router: Self::tool_router(),
+    pub fn with_port_manager(port_manager: crate::port_manager::PortManagerHandle) -> Self {
+        let state = crate::state::StateDb::open_memory().expect("in-memory state database");
+        let engine = CommandEngine::new(
             port_manager,
-            config: crate::config::Config::default(),
-            state_db: Arc::new(std::sync::Mutex::new(state_db)),
-            #[cfg(feature = "monitor")]
-            monitors: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
+            Arc::new(std::sync::Mutex::new(state)),
+            Arc::new(crate::config::Config::default()),
+        );
+        Self::new(engine)
     }
 
-    /// Get the configured data directory.
-    fn data_dir(&self) -> std::path::PathBuf {
-        self.config.global.data_dir.clone()
+    /// The engine backing this server.
+    #[must_use]
+    pub const fn engine(&self) -> &CommandEngine {
+        &self.engine
     }
 
-    /// Insert a separator/log line into a port's buffer.
-    async fn log_to_buffer(&self, port_name: &str, message: &str) {
-        if let Ok(storage) = self.port_manager.get_storage(port_name).await {
-            let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let msg = message.to_string();
-            tokio::task::spawn_blocking(move || {
-                let s = storage
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                s.insert_lines(&[(ts, &msg)]).ok();
-            })
+    /// Combine the always-present tools with the optional ones.
+    ///
+    /// The ESP tools live in their own router so that a build without the `esp`
+    /// feature still produces a complete, compiling router.
+    fn build_router() -> ToolRouter<Self> {
+        let router = Self::core_tools();
+        #[cfg(feature = "esp")]
+        let router = router + Self::esp_tools();
+        router
+    }
+
+    /// Run an operation and map failures onto MCP errors.
+    async fn run(&self, payload: RequestPayload) -> Result<ResponsePayload, rmcp::ErrorData> {
+        self.engine
+            .execute(payload)
             .await
-            .ok();
-        }
+            .map_err(|e| to_error_data(&e))
     }
 }
+
+/// Map an engine error onto the closest MCP error kind.
+fn to_error_data(error: &EngineError) -> rmcp::ErrorData {
+    let message = error.to_string();
+    match *error {
+        EngineError::Invalid(_)
+        | EngineError::Param(_)
+        | EngineError::Hex(_)
+        | EngineError::Regex(_)
+        | EngineError::UnknownMacro { .. } => rmcp::ErrorData::invalid_params(message, None),
+        _ => rmcp::ErrorData::internal_error(message, None),
+    }
+}
+
+fn bad_params(message: impl Into<String>) -> rmcp::ErrorData {
+    rmcp::ErrorData::invalid_params(message.into(), None)
+}
+
+/// Convert an optional raw data-bit count into the validated type.
+fn data_bits(value: Option<u8>) -> Result<Option<DataBits>, rmcp::ErrorData> {
+    value
+        .map(DataBits::try_from)
+        .transpose()
+        .map_err(|e| bad_params(e.to_string()))
+}
+
+/// Convert an optional raw stop-bit count into the validated type.
+fn stop_bits(value: Option<u8>) -> Result<Option<StopBits>, rmcp::ErrorData> {
+    value
+        .map(StopBits::try_from)
+        .transpose()
+        .map_err(|e| bad_params(e.to_string()))
+}
+
+/// Parse an optional RFC 3339 timestamp into nanoseconds.
+fn parse_time(value: Option<&str>) -> Result<Option<i64>, rmcp::ErrorData> {
+    value
+        .map(|text| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
+                .map_err(|e| bad_params(format!("invalid time '{text}': {e}")))
+        })
+        .transpose()
+}
+
+// ------------------------------------------------------------------ params
 
 /// Parameters for `serial_read`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(
-    description = "Read lines from a serial port's persistent buffer. Response includes metadata header: [lines X-Y of Z total]. Use after_line for incremental reads without tracking IDs manually."
+    description = "Read lines from a serial port's persistent buffer. The response starts with a metadata header: [lines X-Y of Z total]. Use after_line for incremental reads."
 )]
 pub struct ReadBufferParams {
     /// Serial port name (e.g. `/dev/ttyUSB0`).
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
-    /// Starting line number (1-based). Negative = from end (-50 = last 50 lines). Default: 1.
+    /// Starting line number (1-based). Negative counts from the end.
     #[schemars(
-        description = "Starting line ID (1-based, default: 1). Negative counts from end: -50 = last 50 lines. Mutually exclusive with after_line."
+        description = "Starting line ID (1-based, default: 1). Negative counts from the end: -50 = last 50 lines."
     )]
     pub start_line: Option<i64>,
-    /// Read lines after this ID (exclusive). Ideal for incremental polling — pass the last ID you received.
+    /// Read lines after this ID (exclusive).
     #[schemars(
-        description = "Read lines after this ID (exclusive). Use the Y value from the previous response header '[lines X-Y of Z total]' to get only new data since your last read."
+        description = "Read lines after this ID (exclusive). Pass the Y value from the previous response header to get only new data."
     )]
     pub after_line: Option<i64>,
-    /// Maximum number of lines to return. Defaults to 100, max 10000.
+    /// Maximum number of lines to return.
     #[schemars(description = "Max lines to return (default: 100, max: 10000)")]
     pub max_lines: Option<u32>,
-    /// Whether to include timestamps in output.
-    #[schemars(description = "Include ISO timestamps before each line (default: false)")]
+    /// Whether to include timestamps in the output.
+    #[schemars(description = "Include timestamps before each line (default: false)")]
     pub include_timestamps: Option<bool>,
-    /// Wait up to this many milliseconds for new data before returning empty. 0 = no wait (default).
+    /// Wait up to this many milliseconds for new data.
     #[schemars(
-        description = "Wait up to N ms for new data if buffer is empty at requested position (0 = return immediately, default). Useful to avoid empty polling loops."
+        description = "Wait up to N ms for new data if the buffer is empty at the requested position (0 = return immediately, default)."
     )]
     pub wait_ms: Option<u64>,
-    /// Only return lines with timestamps after this ISO 8601 time.
+    /// Only return lines newer than this RFC 3339 timestamp.
     #[schemars(
-        description = "Only return lines newer than this timestamp (ISO 8601, e.g. 2026-05-10T23:00:00Z). Useful for 'show me everything since the last flash'."
+        description = "Only return lines newer than this timestamp (RFC 3339, e.g. 2026-05-10T23:00:00Z)."
     )]
     pub since_time: Option<String>,
 }
 
-/// Parameters for `serial_status`.
+/// Parameters for a tool that only needs a port name.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(
-    description = "Get port status: connection state, total lines buffered, total bytes, last activity timestamp, and DB size."
-)]
-pub struct GetStreamStatsParams {
-    /// Serial port name (e.g. `/dev/ttyUSB0`).
+#[schemars(description = "Operate on a single serial port")]
+pub struct PortParams {
+    /// Serial port name.
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
 }
@@ -153,7 +195,7 @@ pub struct GetStreamStatsParams {
 /// Parameters for `serial_search`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(
-    description = "Search serial buffer with grep-like queries. Returns matching lines with line numbers and timestamps. Use time bounds to narrow large buffers."
+    description = "Search the serial buffer. Returns matching lines with line numbers and timestamps."
 )]
 pub struct SearchBufferParams {
     /// Serial port name.
@@ -162,16 +204,13 @@ pub struct SearchBufferParams {
     /// Search query string.
     #[schemars(description = "Search query (pattern or literal text)")]
     pub query: String,
-    /// Query type: exact, substring, or regex.
-    #[schemars(
-        description = "Query type: 'exact' (full match), 'substring' (contains, default), or 'regex' (Rust regex syntax)"
-    )]
-    pub query_type: Option<String>,
-    /// Start time bound (ISO 8601).
-    #[schemars(description = "Optional start time bound (ISO 8601, e.g. 2026-01-15T10:00:00Z)")]
+    /// How the query is interpreted.
+    pub query_type: Option<SearchMode>,
+    /// Start time bound (RFC 3339).
+    #[schemars(description = "Optional start time bound (RFC 3339, e.g. 2026-01-15T10:00:00Z)")]
     pub start_time: Option<String>,
-    /// End time bound (ISO 8601).
-    #[schemars(description = "Optional end time bound (ISO 8601, e.g. 2026-01-15T12:00:00Z)")]
+    /// End time bound (RFC 3339).
+    #[schemars(description = "Optional end time bound (RFC 3339, e.g. 2026-01-15T12:00:00Z)")]
     pub end_time: Option<String>,
     /// Maximum results to return.
     #[schemars(description = "Max results to return (default: 100, max: 1000)")]
@@ -180,14 +219,13 @@ pub struct SearchBufferParams {
 
 /// Parameters for `serial_export`.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Export serial buffer to a file")]
+#[schemars(description = "Export the serial buffer to a file")]
 pub struct ExportBufferParams {
     /// Serial port name.
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
-    /// Output format: txt, csv, or jsonl.
-    #[schemars(description = "File format: 'txt', 'csv', or 'jsonl' (default: txt)")]
-    pub file_format: Option<String>,
+    /// Output format.
+    pub file_format: Option<ExportFormat>,
     /// Start line (inclusive).
     #[schemars(description = "Start line number (inclusive, default: 1)")]
     pub start_line: Option<i64>,
@@ -201,13 +239,15 @@ pub struct ExportBufferParams {
 
 /// Parameters for `serial_clear`.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Clear a serial port's buffer with optional archive")]
+#[schemars(description = "Clear a serial port's buffer, optionally archiving it first")]
 pub struct ClearBufferParams {
     /// Serial port name.
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
     /// Whether to archive the current data before clearing.
-    #[schemars(description = "Archive current data before clearing (default: false)")]
+    #[schemars(
+        description = "Archive current data into the configured archive directory before clearing (default: false)"
+    )]
     pub archive_current: Option<bool>,
 }
 
@@ -222,14 +262,15 @@ pub struct ConfigurePortParams {
     #[schemars(description = "Baud rate (default: 115200)")]
     pub baudrate: Option<u32>,
     /// Data bits (5-8).
-    #[schemars(description = "Data bits: 5, 6, 7, or 8 (default: 8)")]
+    #[schemars(description = "Data bits: 5, 6, 7 or 8 (default: 8)")]
     pub data_bits: Option<u8>,
-    /// Parity: none, odd, even.
-    #[schemars(description = "Parity: 'none', 'odd', or 'even' (default: none)")]
-    pub parity: Option<String>,
+    /// Parity.
+    pub parity: Option<Parity>,
     /// Stop bits (1, 2).
     #[schemars(description = "Stop bits: 1 or 2 (default: 1)")]
     pub stop_bits: Option<u8>,
+    /// Flow control.
+    pub flow_control: Option<FlowControl>,
 }
 
 /// Parameters for `serial_signal`.
@@ -249,111 +290,72 @@ pub struct SetControlLinesParams {
 
 /// Parameters for `serial_break`.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(
-    description = "Send an RS-232 serial BREAK signal (holding TX low for a specified duration)"
-)]
+#[schemars(description = "Send an RS-232 BREAK signal by holding TX low")]
 pub struct SerialBreakParams {
     /// Serial port name.
     #[schemars(description = "Serial port name")]
     pub port_name: String,
-    /// Duration in milliseconds (default: 250ms).
+    /// Duration in milliseconds.
     #[schemars(description = "Break signal duration in milliseconds (default: 250)")]
     pub duration_ms: Option<u64>,
 }
 
 /// Parameters for `serial_send_file`.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(
-    description = "Send a file over serial port using modem transfer protocols (XMODEM, YMODEM, ZMODEM)"
-)]
+#[schemars(description = "Send a file over a serial port using a modem transfer protocol")]
 pub struct SerialSendFileParams {
     /// Serial port name.
     #[schemars(description = "Serial port name")]
     pub port_name: String,
-    /// Absolute path to the file to send.
-    #[schemars(description = "Path to file to send")]
+    /// Path to the file to send.
+    #[schemars(description = "Path to the file to send")]
     pub file_path: String,
-    /// Transfer protocol ('zmodem', 'ymodem', 'xmodem-1k', 'xmodem-crc', 'xmodem'). Default: 'zmodem'.
-    #[schemars(
-        description = "Transfer protocol (zmodem, ymodem, xmodem-1k, xmodem-crc, xmodem). Default: zmodem"
-    )]
-    pub protocol: Option<String>,
+    /// Transfer protocol, defaults to ZMODEM.
+    pub protocol: Option<FileTransferProtocol>,
 }
 
 /// Parameters for `serial_receive_file`.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(
-    description = "Receive a file over serial port using modem transfer protocols (XMODEM, YMODEM, ZMODEM)"
-)]
+#[schemars(description = "Receive a file over a serial port using a modem transfer protocol")]
 pub struct SerialReceiveFileParams {
     /// Serial port name.
     #[schemars(description = "Serial port name")]
     pub port_name: String,
-    /// Output directory where received file will be stored. Default: current directory.
-    #[schemars(description = "Output directory for received file (default: .)")]
+    /// Output directory for the received file.
+    #[schemars(description = "Output directory for the received file (default: .)")]
     pub output_dir: Option<String>,
-    /// Transfer protocol ('zmodem', 'ymodem', 'xmodem-1k', 'xmodem-crc', 'xmodem'). Default: 'zmodem'.
-    #[schemars(
-        description = "Transfer protocol (zmodem, ymodem, xmodem-1k, xmodem-crc, xmodem). Default: zmodem"
-    )]
-    pub protocol: Option<String>,
+    /// Transfer protocol, defaults to ZMODEM.
+    pub protocol: Option<FileTransferProtocol>,
 }
 
 /// Parameters for `serial_macro`.
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Execute a predefined or user-defined macro sequence on a serial port")]
+#[schemars(description = "Execute a built-in or user-defined macro sequence on a serial port")]
 pub struct TriggerMacroParams {
     /// Serial port name.
     #[schemars(description = "Serial port name")]
     pub port_name: String,
-    /// Macro name (built-in: `reset`, `enter_bootloader`, `break`).
+    /// Macro name.
     #[schemars(
         description = "Macro name (built-in: 'reset', 'enter_bootloader', 'break', or user-defined)"
     )]
     pub macro_name: String,
 }
 
-/// Parameters for `serial_close`.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Close a managed serial port")]
-pub struct ClosePortParams {
-    /// Serial port name.
-    #[schemars(description = "Serial port name to close")]
-    pub port_name: String,
-}
-
 /// Parameters for `serial_write`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(
-    description = "Write data to a serial port. No newline is appended automatically — include \\r\\n in the data if needed."
+    description = "Write data to a serial port. No newline is appended automatically; include \\r\\n in the data if the device expects it."
 )]
 pub struct WritePortParams {
     /// Serial port name.
     #[schemars(description = "Serial port name")]
     pub port_name: String,
-    /// Data to write. UTF-8 text, or hex-encoded bytes prefixed with 0x.
+    /// Data to write.
     #[schemars(
-        description = "Data to write. UTF-8 text (include \\r\\n if needed), or hex bytes prefixed with '0x' (e.g. '0x0D0A')"
+        description = "Data to write. UTF-8 text, or hex bytes prefixed with '0x' (e.g. '0x0D0A')"
     )]
     pub data: String,
-}
-
-/// Parameters for `serial_monitor_open`.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Open a GUI monitor window for a serial port")]
-pub struct MonitorOpenParams {
-    /// Serial port name (must already be open).
-    #[schemars(description = "Serial port name (must be open via serial_open first)")]
-    pub port_name: String,
-}
-
-/// Parameters for `serial_monitor_close`.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Close the GUI monitor window for a serial port")]
-pub struct MonitorCloseParams {
-    /// Serial port name.
-    #[schemars(description = "Serial port name whose monitor to close")]
-    pub port_name: String,
 }
 
 /// Parameters for `serial_esp_flash`.
@@ -364,1359 +366,733 @@ pub struct EspFlashParams {
     /// Serial port name.
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
-    /// Path to the firmware file (ELF or binary).
-    #[schemars(description = "Path to firmware file (ELF or .bin)")]
+    /// Path to the firmware file.
+    #[schemars(description = "Path to the firmware file (ELF or .bin)")]
     pub firmware_path: String,
     /// Optional baud rate for flashing.
-    #[schemars(description = "Flash baud rate (default: espflash default, typically 460800)")]
+    #[schemars(description = "Flash baud rate (default: espflash default)")]
     pub baud: Option<u32>,
-}
-
-/// Parameters for `serial_esp_info`.
-#[cfg(feature = "esp")]
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Get ESP chip/board information")]
-pub struct EspInfoParams {
-    /// Serial port name.
-    #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
-    pub port_name: String,
-}
-
-/// Parameters for `serial_esp_erase`.
-#[cfg(feature = "esp")]
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Erase entire flash of an ESP device")]
-pub struct EspEraseParams {
-    /// Serial port name.
-    #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
-    pub port_name: String,
 }
 
 /// Parameters for `serial_esp_write_bin`.
 #[cfg(feature = "esp")]
 #[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(description = "Write a raw binary file to a specific flash address on an ESP device")]
+#[schemars(description = "Write a raw binary file to a flash address on an ESP device")]
 pub struct EspWriteBinParams {
     /// Serial port name.
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
     /// Path to the binary file.
-    #[schemars(description = "Path to binary file (.bin)")]
+    #[schemars(description = "Path to the binary file (.bin)")]
     pub file_path: String,
-    /// Flash address (hex, e.g. 0x1000).
+    /// Flash address.
     #[schemars(description = "Flash address in hex (e.g. 0x1000, 0x8000, 0x10000)")]
     pub address: String,
 }
 
-/// Decode a hex string (without 0x prefix) into bytes.
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    let s = s.replace(' ', "");
-    if s.len() % 2 != 0 {
-        return Err("odd number of hex digits".into());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
+// ------------------------------------------------------------------ tools
 
-#[tool_router]
+#[tool_router(router = core_tools, vis = "pub")]
 impl DevSerialServer {
-    /// Read lines from a serial port's captured data.
+    /// Read captured serial data.
     #[tool(
-        description = "Read captured serial data. Returns metadata header + lines. Use after_line for efficient incremental polling."
+        description = "Read captured serial data. Returns a metadata header plus lines. Use after_line for efficient incremental polling."
     )]
     async fn serial_read(
         &self,
         Parameters(params): Parameters<ReadBufferParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let max = params
-            .max_lines
-            .unwrap_or(DEFAULT_READ_LINES)
-            .min(MAX_READ_LINES);
-        let timestamps = params.include_timestamps.unwrap_or(false);
-        let wait_ms = params.wait_ms.unwrap_or(0);
-
-        let storage = self
-            .port_manager
-            .get_storage(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        // Resolve since_time to nanoseconds
-        let since_ns = params
-            .since_time
-            .as_deref()
-            .map(parse_iso_to_ns)
-            .transpose()?;
-
-        // Resolve start position
-        let start = if since_ns.is_some() {
-            1 // will use time-based query instead
-        } else if let Some(after) = params.after_line {
-            after + 1
-        } else {
-            let raw = params.start_line.unwrap_or(1);
-            if raw < 0 {
-                let total = i64::try_from(
-                    storage
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get_stats()
-                        .map_or(0, |s| s.total_lines),
-                )
-                .unwrap_or(0);
-                (total + raw + 1).max(1)
-            } else {
-                raw.max(1)
-            }
+        let window = ReadWindow {
+            start_id: params.start_line,
+            after_id: params.after_line,
+            tail: None,
+            since_ns: parse_time(params.since_time.as_deref())?,
+            limit: params.max_lines,
+            wait_ms: params.wait_ms,
         };
 
-        // Read with optional wait
-        let lines = tokio::task::spawn_blocking({
-            let storage = Arc::clone(&storage);
-            move || {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-                loop {
-                    let s = storage
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = if let Some(ns) = since_ns {
-                        s.search_time_range(ns, i64::MAX, max)?
-                    } else {
-                        s.read_lines(start, max)?
-                    };
-                    if !result.is_empty() || wait_ms == 0 {
-                        return Ok(result);
-                    }
-                    drop(s);
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(Vec::new());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e: crate::storage::StorageError| {
-            rmcp::ErrorData::internal_error(e.to_string(), None)
-        })?;
+        let response = self
+            .run(RequestPayload::ReadLines {
+                port: params.port_name,
+                window,
+            })
+            .await?;
+        let ResponsePayload::Lines(page) = response else {
+            return Err(unexpected());
+        };
 
-        // Get total for metadata
-        let total_lines = storage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_stats()
-            .map_or(0, |s| s.total_lines);
-
-        // Build response with metadata header
-        let first_id = lines.first().map_or(0, |l| l.id);
-        let last_id = lines.last().map_or(0, |l| l.id);
-        let count = lines.len();
-
-        let mut output = format!("[lines {first_id}-{last_id} of {total_lines} total]\n");
-
-        for l in &lines {
-            if timestamps {
-                use std::fmt::Write;
-                let ts =
-                    chrono::DateTime::from_timestamp_nanos(l.timestamp_ns).format("%H:%M:%S%.3f");
-                let _ = writeln!(output, "{ts} {}", l.payload);
-            } else {
-                output.push_str(&l.payload);
-                output.push('\n');
-            }
-        }
-
-        if count == 0 {
-            output = format!("[no new lines after {start}, {total_lines} total]");
-        }
-
-        Ok(output)
+        Ok(render_lines(
+            &page,
+            params.include_timestamps.unwrap_or(false),
+        ))
     }
 
-    /// Get port status: connection state and buffer statistics.
+    /// Port status: connection state and buffer statistics.
     #[tool(
-        description = "Get serial port status: connection state, total lines, bytes, last activity, DB size."
+        description = "Get serial port status: connection state, total lines, bytes, last activity and database size."
     )]
     async fn serial_status(
         &self,
-        Parameters(params): Parameters<GetStreamStatsParams>,
+        Parameters(params): Parameters<PortParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let state = self
-            .port_manager
-            .get_state(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let response = self
+            .run(RequestPayload::GetStatus {
+                port: params.port_name,
+            })
+            .await?;
+        let ResponsePayload::Status { name, state, stats } = response else {
+            return Err(unexpected());
+        };
 
-        let storage = self
-            .port_manager
-            .get_storage(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let stats = tokio::task::spawn_blocking(move || {
-            let s = storage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.get_stats()
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let last_activity = stats.last_timestamp_ns.map_or_else(
-            || "never".to_string(),
-            |ns| {
-                chrono::DateTime::from_timestamp_nanos(ns)
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .to_string()
-            },
-        );
-
-        let result = serde_json::json!({
-            "port": params.port_name,
+        let json = serde_json::json!({
+            "port": name,
             "state": format!("{state:?}"),
             "total_lines": stats.total_lines,
             "total_bytes": stats.total_bytes,
-            "last_activity": last_activity,
+            "last_activity": stats
+                .last_timestamp_ns
+                .map_or_else(|| "never".to_string(), crate::export::format_timestamp),
             "db_size_bytes": stats.db_size_bytes,
         });
-
-        serde_json::to_string_pretty(&result)
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+        serde_json::to_string_pretty(&json)
+            .map_err(|e| to_error_data(&EngineError::Tool(e.to_string())))
     }
 
-    /// Search captured serial data with grep-like queries (exact, substring, regex) with optional time bounds.
+    /// Search captured serial data.
     #[tool(
-        description = "Search serial data. Supports exact, substring, and regex queries with optional time bounds."
+        description = "Search serial data by substring, exact match or regular expression, with optional time bounds."
     )]
     async fn serial_search(
         &self,
         Parameters(params): Parameters<SearchBufferParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let max = params
-            .max_results
-            .unwrap_or(DEFAULT_SEARCH_RESULTS)
-            .min(MAX_SEARCH_RESULTS);
-        let query_type = params.query_type.as_deref().unwrap_or("substring");
-
-        let time_range =
-            parse_time_range(params.start_time.as_deref(), params.end_time.as_deref())?;
-
-        let storage = self
-            .port_manager
-            .get_storage(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let query = params.query.clone();
-        let qt = query_type.to_string();
-
-        let results = tokio::task::spawn_blocking(move || {
-            let s = storage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match qt.as_str() {
-                "exact" => {
-                    // Use substring search then filter for exact match
-                    let candidates = s.search_substring(&query, time_range, max * 10)?;
-                    Ok(candidates
-                        .into_iter()
-                        .filter(|l| l.payload == query)
-                        .take(max as usize)
-                        .collect::<Vec<_>>())
-                }
-                "regex" => {
-                    let re = regex::Regex::new(&query)
-                        .map_err(crate::storage::StorageError::InvalidRegex)?;
-                    // Narrow by time range if provided, then filter with regex
-                    let candidates = if let Some(tr) = time_range {
-                        s.search_time_range(tr.start_ns, tr.end_ns, max * 10)?
-                    } else {
-                        s.read_lines(1, max * 10)?
-                    };
-                    Ok(candidates
-                        .into_iter()
-                        .filter(|l| re.is_match(&l.payload))
-                        .take(max as usize)
-                        .collect::<Vec<_>>())
-                }
-                _ => {
-                    // substring (default)
-                    s.search_substring(&query, time_range, max)
-                }
-            }
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e: crate::storage::StorageError| {
-            rmcp::ErrorData::internal_error(e.to_string(), None)
-        })?;
-
-        let output: Vec<String> = results
-            .iter()
-            .map(|l| {
-                let ts = chrono::DateTime::from_timestamp_nanos(l.timestamp_ns)
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ");
-                format!("{}:[{}] {}", l.id, ts, l.payload)
+        let response = self
+            .run(RequestPayload::Search {
+                port: params.port_name,
+                query: params.query,
+                mode: params.query_type.unwrap_or_default(),
+                start_ns: parse_time(params.start_time.as_deref())?,
+                end_ns: parse_time(params.end_time.as_deref())?,
+                limit: params.max_results,
             })
-            .collect();
+            .await?;
+        let ResponsePayload::SearchResults(outcome) = response else {
+            return Err(unexpected());
+        };
 
-        Ok(output.join("\n"))
+        let mut out = String::new();
+        for line in &outcome.results {
+            let _ = writeln!(
+                out,
+                "{}:[{}] {}",
+                line.id,
+                crate::export::format_timestamp(line.timestamp_ns),
+                line.payload
+            );
+        }
+        if outcome.results.is_empty() {
+            out.push_str("(no matches)\n");
+        }
+        if outcome.truncated {
+            out.push_str(
+                "(scan limit reached, later lines were not examined; narrow the time range)\n",
+            );
+        }
+        Ok(out)
     }
 
-    /// Export captured serial data to a file in txt, csv, or jsonl format.
+    /// Export captured serial data to a file.
     #[tool(
-        description = "Export serial data to a file. Supports txt (raw lines), csv (RFC 4180), and jsonl formats."
+        description = "Export serial data to a file as txt (raw lines), csv (RFC 4180) or jsonl."
     )]
     async fn serial_export(
         &self,
         Parameters(params): Parameters<ExportBufferParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let format = params.file_format.as_deref().unwrap_or("txt");
-        let output_path = std::path::PathBuf::from(&params.output_path);
-
-        // Validate output path
-        if output_path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(rmcp::ErrorData::internal_error(
-                "invalid output path: path traversal not allowed".to_string(),
-                None,
-            ));
-        }
-        if let Some(parent) = output_path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("parent directory does not exist: {}", parent.display()),
-                    None,
-                ));
-            }
-        }
-
-        let start = params.start_line.unwrap_or(1);
-        let end = params.end_line.unwrap_or(i64::MAX);
-
-        let storage = self
-            .port_manager
-            .get_storage(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let fmt = format.to_string();
-        let path = output_path.clone();
-
-        let count = tokio::task::spawn_blocking(move || -> Result<u64, String> {
-            use std::io::Write;
-
-            let s = storage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let lines = s.export_range(start, end).map_err(|e| e.to_string())?;
-            drop(s);
-            let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-            let mut writer = std::io::BufWriter::new(file);
-
-            if fmt == "csv" {
-                writeln!(writer, "line_number,timestamp,payload").map_err(|e| e.to_string())?;
-            }
-
-            let mut count = 0u64;
-            for line in &lines {
-                match fmt.as_str() {
-                    "csv" => {
-                        let ts = chrono::DateTime::from_timestamp_nanos(line.timestamp_ns)
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ");
-                        let escaped = line.payload.replace('"', "\"\"");
-                        writeln!(writer, "{},{},\"{}\"", line.id, ts, escaped)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    "jsonl" => {
-                        let obj = serde_json::json!({
-                            "line": line.id,
-                            "timestamp": chrono::DateTime::from_timestamp_nanos(line.timestamp_ns)
-                                .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-                            "payload": line.payload,
-                        });
-                        writeln!(
-                            writer,
-                            "{}",
-                            serde_json::to_string(&obj).unwrap_or_default()
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    _ => {
-                        // txt
-                        writeln!(writer, "{}", line.payload).map_err(|e| e.to_string())?;
-                    }
-                }
-                count += 1;
-            }
-            writer.flush().map_err(|e| e.to_string())?;
-            Ok(count)
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
-
-        let abs_path = std::fs::canonicalize(&output_path).unwrap_or(output_path);
-
+        let response = self
+            .run(RequestPayload::Export {
+                port: params.port_name,
+                output_path: params.output_path,
+                file_format: params.file_format,
+                start_line: params.start_line,
+                end_line: params.end_line,
+            })
+            .await?;
+        let ResponsePayload::ExportSuccess {
+            lines_exported,
+            path,
+            file_format,
+        } = response
+        else {
+            return Err(unexpected());
+        };
         Ok(format!(
-            "Exported {count} lines to {} (format: {format})",
-            abs_path.display()
+            "Exported {lines_exported} lines to {path} (format: {file_format})"
         ))
     }
 
-    /// Clear captured serial data, optionally archiving first.
-    #[tool(description = "Clear captured serial data. Optionally archives before clearing.")]
+    /// Clear captured serial data.
+    #[tool(
+        description = "Clear captured serial data. Optionally archives the database into the configured archive directory first."
+    )]
     async fn serial_clear(
         &self,
         Parameters(params): Parameters<ClearBufferParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let archive = params.archive_current.unwrap_or(false);
-
-        let storage = self
-            .port_manager
-            .get_storage(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let port_name = params.port_name.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let s = storage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let stats = s.get_stats().map_err(|e| e.to_string())?;
-
-            let archive_path = if archive {
-                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-                let sanitized = port_name.replace(['/', '\\'], "_");
-                let path = std::path::PathBuf::from(format!("./{sanitized}_{ts}.db"));
-                Some(path)
-            } else {
-                None
-            };
-
-            s.clear(archive_path.as_deref())
-                .map_err(|e| e.to_string())?;
-            drop(s);
-
-            archive_path.as_ref().map_or_else(
-                || {
-                    Ok(format!(
-                        "Cleared buffer ({} lines removed)",
-                        stats.total_lines
-                    ))
-                },
-                |path| {
-                    Ok(format!(
-                        "Cleared buffer ({} lines archived to {})",
-                        stats.total_lines,
-                        path.display()
-                    ))
-                },
-            )
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
-
-        Ok(result)
+        let response = self
+            .run(RequestPayload::Clear {
+                port: params.port_name,
+                archive_current: params.archive_current,
+            })
+            .await?;
+        let ResponsePayload::ClearSuccess {
+            lines_cleared,
+            archive_path,
+        } = response
+        else {
+            return Err(unexpected());
+        };
+        Ok(archive_path.map_or_else(
+            || format!("Cleared buffer ({lines_cleared} lines removed)"),
+            |path| format!("Cleared buffer ({lines_cleared} lines archived to {path})"),
+        ))
     }
 
-    /// List available serial ports and managed connections.
+    /// List system serial ports and managed connections.
     #[tool(description = "List system serial ports and managed connections with their state.")]
     async fn serial_list(&self) -> Result<String, rmcp::ErrorData> {
-        use std::fmt::Write;
+        let ResponsePayload::HardwarePorts(hardware) =
+            self.run(RequestPayload::ListHardware).await?
+        else {
+            return Err(unexpected());
+        };
+        let ResponsePayload::PortList(managed) = self.run(RequestPayload::ListPorts).await? else {
+            return Err(unexpected());
+        };
 
-        // Get system ports
-        let system_ports: Vec<String> = serial2_tokio::SerialPort::available_ports()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-
-        // Get managed ports
-        let managed = self.port_manager.list().await;
-
-        let mut output = String::from("System ports:\n");
-        if system_ports.is_empty() {
-            output.push_str("  (none detected)\n");
-        } else {
-            for p in &system_ports {
-                let _ = writeln!(output, "  {p}");
-            }
+        let mut out = String::from("System ports:\n");
+        if hardware.is_empty() {
+            out.push_str("  (none detected)\n");
+        }
+        for port in &hardware {
+            let _ = writeln!(out, "  {port}");
         }
 
-        output.push_str("\nManaged connections:\n");
+        out.push_str("\nManaged connections:\n");
         if managed.is_empty() {
-            output.push_str("  (none)\n");
-        } else {
-            for p in &managed {
-                let _ = writeln!(
-                    output,
-                    "  {} — {:?} ({} lines)",
-                    p.name, p.state, p.total_lines
-                );
-            }
+            out.push_str("  (none)\n");
         }
-
-        Ok(output)
+        for port in &managed {
+            let _ = writeln!(
+                out,
+                "  {} — {:?} ({} lines)",
+                port.name, port.state, port.total_lines
+            );
+        }
+        Ok(out)
     }
 
     /// Open or reconfigure a serial port.
     #[tool(
-        description = "Open a serial port with specified parameters. Idempotent — reconfigures if already open."
+        description = "Open a serial port with the given line settings. Idempotent: reconfigures the port when it is already open."
     )]
     async fn serial_open(
         &self,
         Parameters(params): Parameters<ConfigurePortParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        if let Some(baud) = params.baudrate {
-            if baud == 0 {
-                return Err(rmcp::ErrorData::internal_error(
-                    "invalid baud rate: must be > 0".to_string(),
-                    None,
-                ));
-            }
-        }
-
-        // Use TOML config as base if available, override with explicit params
-        let base = self
-            .config
-            .ports
-            .get(&params.port_name)
-            .cloned()
-            .unwrap_or_default();
-        let config = crate::config::PortConfig {
-            baudrate: params.baudrate.unwrap_or(base.baudrate),
-            data_bits: params.data_bits.unwrap_or(base.data_bits),
-            parity: params.parity.unwrap_or(base.parity),
-            stop_bits: params.stop_bits.unwrap_or(base.stop_bits),
-            ..base
+        let settings = PortSettings {
+            baudrate: params.baudrate,
+            data_bits: data_bits(params.data_bits)?,
+            parity: params.parity,
+            stop_bits: stop_bits(params.stop_bits)?,
+            flow_control: params.flow_control,
         };
 
-        let data_dir = self.data_dir();
-        self.port_manager
-            .open_serial(params.port_name.clone(), config.clone(), data_dir)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let response = self
+            .run(RequestPayload::OpenPort {
+                name: params.port_name,
+                settings,
+            })
+            .await?;
 
-        // Persist state for auto-reopen on restart
-        if let Ok(db) = self.state_db.lock() {
-            db.port_opened(&params.port_name, &config).ok();
-        }
-
-        Ok(format!(
-            "Opened {} ({}baud, {}{}{})",
-            params.port_name,
-            config.baudrate,
-            config.data_bits,
-            config.parity.chars().next().unwrap_or('N'),
-            config.stop_bits
-        ))
+        Ok(match response {
+            ResponsePayload::PortOpened {
+                name,
+                config_summary,
+            } => format!("Opened {name} ({config_summary})"),
+            ResponsePayload::PortReconfigured {
+                name,
+                config_summary,
+            } => format!("Reconfigured {name} ({config_summary})"),
+            _ => return Err(unexpected()),
+        })
     }
 
     /// Close a managed serial port.
-    #[tool(description = "Close a managed serial port and flush its buffer.")]
+    #[tool(description = "Close a managed serial port and stop capturing from it.")]
     async fn serial_close(
         &self,
-        Parameters(params): Parameters<ClosePortParams>,
+        Parameters(params): Parameters<PortParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        self.port_manager
-            .close(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        if let Ok(db) = self.state_db.lock() {
-            db.port_closed(&params.port_name).ok();
-        }
-
-        Ok(format!("Closed {}", params.port_name))
+        let response = self
+            .run(RequestPayload::ClosePort {
+                name: params.port_name,
+            })
+            .await?;
+        let ResponsePayload::PortClosed { name } = response else {
+            return Err(unexpected());
+        };
+        Ok(format!("Closed {name}"))
     }
 
     /// Write data to a serial port.
     #[tool(
-        description = "Write data to a serial port. Supports UTF-8 text or hex-encoded bytes (prefix with 0x)."
+        description = "Write data to a serial port. Accepts UTF-8 text or hex-encoded bytes prefixed with 0x."
     )]
     async fn serial_write(
         &self,
         Parameters(params): Parameters<WritePortParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let data = if params.data.starts_with("0x") || params.data.starts_with("0X") {
-            hex_decode(&params.data[2..])
-                .map_err(|e| rmcp::ErrorData::internal_error(format!("invalid hex: {e}"), None))?
-        } else {
-            params.data.as_bytes().to_vec()
+        let port = params.port_name.clone();
+        let response = self
+            .run(RequestPayload::WriteData {
+                port: params.port_name,
+                data: params.data,
+                is_hex: false,
+            })
+            .await?;
+        let ResponsePayload::WriteSuccess { bytes_written } = response else {
+            return Err(unexpected());
         };
-
-        let len = data.len();
-        self.port_manager
-            .write(&params.port_name, data)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        Ok(format!("Wrote {len} bytes to {}", params.port_name))
+        Ok(format!("Wrote {bytes_written} bytes to {port}"))
     }
 
-    /// Set DTR/RTS signals on a serial port.
-    #[tool(description = "Set DTR and/or RTS signals on a serial port.")]
+    /// Set DTR and RTS signals.
+    #[tool(description = "Set the DTR and/or RTS control lines of a serial port.")]
     async fn serial_signal(
         &self,
         Parameters(params): Parameters<SetControlLinesParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        if params.dtr.is_none() && params.rts.is_none() {
-            return Err(rmcp::ErrorData::internal_error(
-                "at least one of dtr or rts must be specified".to_string(),
-                None,
-            ));
-        }
-
-        let port = self
-            .port_manager
-            .get_serial_port(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let guard = port.lock().await;
-        let mut actions = Vec::new();
-
-        if let Some(dtr) = params.dtr {
-            guard.set_dtr(dtr).map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("failed to set DTR: {e}"), None)
-            })?;
-            actions.push(format!("DTR={}", if dtr { "HIGH" } else { "LOW" }));
-        }
-        if let Some(rts) = params.rts {
-            guard.set_rts(rts).map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("failed to set RTS: {e}"), None)
-            })?;
-            actions.push(format!("RTS={}", if rts { "HIGH" } else { "LOW" }));
-        }
-        drop(guard);
-
-        Ok(format!(
-            "Set {} on {}",
-            actions.join(", "),
-            params.port_name
-        ))
+        let port = params.port_name.clone();
+        let response = self
+            .run(RequestPayload::SetSignal {
+                port: params.port_name,
+                dtr: params.dtr,
+                rts: params.rts,
+            })
+            .await?;
+        let ResponsePayload::SignalSuccess { applied } = response else {
+            return Err(unexpected());
+        };
+        Ok(format!("Set {} on {port}", applied.join(", ")))
     }
 
-    /// Send an RS-232 serial BREAK pulse.
+    /// Send an RS-232 BREAK pulse.
     #[tool(
-        description = "Send an RS-232 serial BREAK pulse (TX low) for a duration in milliseconds (default: 250ms)."
+        description = "Send an RS-232 BREAK pulse (TX held low) for a duration in milliseconds (default 250)."
     )]
     async fn serial_break(
         &self,
         Parameters(params): Parameters<SerialBreakParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let port = self
-            .port_manager
-            .get_serial_port(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let duration_ms = params.duration_ms.unwrap_or(250);
-        let duration = std::time::Duration::from_millis(duration_ms);
-
-        let guard = port.lock().await;
-        guard.set_break(true).map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("failed to set break: {e}"), None)
-        })?;
-        tokio::time::sleep(duration).await;
-        guard.set_break(false).map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("failed to clear break: {e}"), None)
-        })?;
-        drop(guard);
-
-        self.log_to_buffer(
-            &params.port_name,
-            &format!("━━━ SERIAL BREAK ({duration_ms}ms) SENT ━━━"),
-        )
-        .await;
-
+        let port = params.port_name.clone();
+        let response = self
+            .run(RequestPayload::SendBreak {
+                port: params.port_name,
+                duration_ms: params.duration_ms,
+            })
+            .await?;
+        let ResponsePayload::BreakSuccess { duration_ms } = response else {
+            return Err(unexpected());
+        };
         Ok(format!(
-            "Sent serial BREAK pulse ({duration_ms}ms) on {}",
-            params.port_name
+            "Sent serial BREAK pulse ({duration_ms}ms) on {port}"
         ))
     }
 
-    /// Send a file over serial using XMODEM, YMODEM, or ZMODEM.
+    /// Send a file over serial.
     #[tool(
-        description = "Send a file over serial port using modem transfer protocols (ZMODEM, YMODEM, XMODEM-1K, XMODEM-CRC, XMODEM)."
+        description = "Send a file over a serial port using ZMODEM (default), YMODEM, XMODEM-1K, XMODEM-CRC or XMODEM."
     )]
     async fn serial_send_file(
         &self,
         Parameters(params): Parameters<SerialSendFileParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let proto = match params
-            .protocol
-            .as_deref()
-            .unwrap_or("zmodem")
-            .to_lowercase()
-            .as_str()
-        {
-            "xmodem" => crate::modem::FileTransferProtocol::Xmodem,
-            "xmodem-crc" => crate::modem::FileTransferProtocol::XmodemCrc,
-            "xmodem-1k" | "xmodem1k" => crate::modem::FileTransferProtocol::Xmodem1k,
-            "ymodem" => crate::modem::FileTransferProtocol::Ymodem,
-            _ => crate::modem::FileTransferProtocol::Zmodem,
+        let port = params.port_name.clone();
+        let response = self
+            .run(RequestPayload::SendFile {
+                port: params.port_name,
+                file_path: params.file_path,
+                protocol: params.protocol.unwrap_or(FileTransferProtocol::Zmodem),
+            })
+            .await?;
+        let ResponsePayload::TransferSuccess {
+            bytes_transferred,
+            file_name,
+            protocol,
+            ..
+        } = response
+        else {
+            return Err(unexpected());
         };
-
-        let path = std::path::Path::new(&params.file_path);
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file.bin")
-            .to_string();
-
-        let data = tokio::fs::read(&params.file_path)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("read file error: {e}"), None))?;
-
-        let port = self
-            .port_manager
-            .get_serial_port(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let mut guard = port.lock().await;
-        let bytes_sent = match proto {
-            crate::modem::FileTransferProtocol::Xmodem => {
-                crate::modem::xmodem::send(&mut *guard, &data, false, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-            crate::modem::FileTransferProtocol::XmodemCrc => {
-                crate::modem::xmodem::send(&mut *guard, &data, false, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-            crate::modem::FileTransferProtocol::Xmodem1k => {
-                crate::modem::xmodem::send(&mut *guard, &data, true, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-            crate::modem::FileTransferProtocol::Ymodem => {
-                crate::modem::ymodem::send_file(&mut *guard, &filename, &data, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-            crate::modem::FileTransferProtocol::Zmodem => {
-                crate::modem::zmodem::send_file(&mut *guard, &filename, &data, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-        };
-        drop(guard);
-
-        self.log_to_buffer(
-            &params.port_name,
-            &format!("━━━ TRANSFER SEND {proto:?} '{filename}' ({bytes_sent} bytes) → OK ━━━"),
-        )
-        .await;
-
         Ok(format!(
-            "Successfully sent {} bytes ('{}') to {} via {:?}",
-            bytes_sent, filename, params.port_name, proto
+            "Sent {bytes_transferred} bytes ('{file_name}') to {port} via {protocol:?}"
         ))
     }
 
-    /// Receive a file over serial using XMODEM, YMODEM, or ZMODEM.
+    /// Receive a file over serial.
     #[tool(
-        description = "Receive a file over serial port using modem transfer protocols (ZMODEM, YMODEM, XMODEM-1K, XMODEM-CRC, XMODEM)."
+        description = "Receive a file over a serial port using ZMODEM (default), YMODEM, XMODEM-1K, XMODEM-CRC or XMODEM."
     )]
     async fn serial_receive_file(
         &self,
         Parameters(params): Parameters<SerialReceiveFileParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let proto = match params
-            .protocol
-            .as_deref()
-            .unwrap_or("zmodem")
-            .to_lowercase()
-            .as_str()
-        {
-            "xmodem" => crate::modem::FileTransferProtocol::Xmodem,
-            "xmodem-crc" => crate::modem::FileTransferProtocol::XmodemCrc,
-            "xmodem-1k" | "xmodem1k" => crate::modem::FileTransferProtocol::Xmodem1k,
-            "ymodem" => crate::modem::FileTransferProtocol::Ymodem,
-            _ => crate::modem::FileTransferProtocol::Zmodem,
+        let port = params.port_name.clone();
+        let response = self
+            .run(RequestPayload::ReceiveFile {
+                port: params.port_name,
+                output_dir: params.output_dir.unwrap_or_else(|| ".".to_string()),
+                protocol: params.protocol.unwrap_or(FileTransferProtocol::Zmodem),
+            })
+            .await?;
+        let ResponsePayload::TransferSuccess {
+            bytes_transferred,
+            file_name,
+            path,
+            ..
+        } = response
+        else {
+            return Err(unexpected());
         };
-
-        let port = self
-            .port_manager
-            .get_serial_port(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let mut guard = port.lock().await;
-        let (filename, data) = match proto {
-            crate::modem::FileTransferProtocol::Xmodem => {
-                let bytes = crate::modem::xmodem::receive(&mut *guard, false, |_| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
-                ("xmodem_recv.bin".to_string(), bytes)
-            }
-            crate::modem::FileTransferProtocol::XmodemCrc => {
-                let bytes = crate::modem::xmodem::receive(&mut *guard, true, |_| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
-                ("xmodem_recv.bin".to_string(), bytes)
-            }
-            crate::modem::FileTransferProtocol::Xmodem1k => {
-                let bytes = crate::modem::xmodem::receive(&mut *guard, true, |_| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
-                ("xmodem1k_recv.bin".to_string(), bytes)
-            }
-            crate::modem::FileTransferProtocol::Ymodem => {
-                crate::modem::ymodem::receive_file(&mut *guard, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-            crate::modem::FileTransferProtocol::Zmodem => {
-                crate::modem::zmodem::receive_file(&mut *guard, |_, _| {})
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e, None))?
-            }
-        };
-        drop(guard);
-
-        let out_dir_str = params.output_dir.as_deref().unwrap_or(".");
-        let out_dir = std::path::Path::new(out_dir_str);
-        if !out_dir.exists() {
-            tokio::fs::create_dir_all(out_dir).await.map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("create dir error: {e}"), None)
-            })?;
-        }
-
-        let out_path = out_dir.join(&filename);
-        tokio::fs::write(&out_path, &data)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("write file error: {e}"), None))?;
-
-        self.log_to_buffer(
-            &params.port_name,
-            &format!(
-                "━━━ TRANSFER RECV {proto:?} '{filename}' ({} bytes) → OK ━━━",
-                data.len()
-            ),
-        )
-        .await;
-
+        let location = path.unwrap_or(file_name);
         Ok(format!(
-            "Successfully received {} bytes ('{}') from {} saved to '{}'",
-            data.len(),
-            filename,
-            params.port_name,
-            out_path.display()
+            "Received {bytes_transferred} bytes from {port}, saved to '{location}'"
         ))
     }
 
-    /// Run a macro sequence on a serial port.
+    /// Run a macro sequence.
     #[tool(
-        description = "Run a macro sequence on a serial port. Built-in: 'reset', 'enter_bootloader', 'break'. User-defined macros from config."
+        description = "Run a macro sequence on a serial port. Built-in: 'reset', 'enter_bootloader', 'break'; user-defined macros come from the configuration file."
     )]
     async fn serial_macro(
         &self,
         Parameters(params): Parameters<TriggerMacroParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let port = self
-            .port_manager
-            .get_serial_port(&params.port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let steps: Vec<crate::config::MacroStep> =
-            if let Some(user_macro) = self.config.macros.get(&params.macro_name) {
-                user_macro.steps.clone()
-            } else {
-                match params.macro_name.as_str() {
-                    "reset" => vec![
-                        crate::config::MacroStep::Dtr { value: false },
-                        crate::config::MacroStep::Delay { ms: 100 },
-                        crate::config::MacroStep::Dtr { value: true },
-                    ],
-                    "enter_bootloader" => vec![
-                        crate::config::MacroStep::Rts { value: true },
-                        crate::config::MacroStep::Dtr { value: false },
-                        crate::config::MacroStep::Delay { ms: 50 },
-                        crate::config::MacroStep::Dtr { value: true },
-                        crate::config::MacroStep::Delay { ms: 50 },
-                        crate::config::MacroStep::Rts { value: false },
-                    ],
-                    "break" => vec![crate::config::MacroStep::Write {
-                        value: "0x00".into(),
-                    }],
-                    other => {
-                        let available: Vec<&str> = self
-                            .config
-                            .macros
-                            .keys()
-                            .map(String::as_str)
-                            .chain(["reset", "enter_bootloader", "break"])
-                            .collect();
-                        return Err(rmcp::ErrorData::internal_error(
-                            format!(
-                                "unknown macro '{other}'. Available: {}",
-                                available.join(", ")
-                            ),
-                            None,
-                        ));
-                    }
-                }
-            };
-
-        let mut executed = Vec::new();
-        for step in &steps {
-            match step {
-                crate::config::MacroStep::Dtr { value } => {
-                    port.lock().await.set_dtr(*value).map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("DTR error: {e}"), None)
-                    })?;
-                    executed.push(format!("DTR={}", if *value { "HIGH" } else { "LOW" }));
-                }
-                crate::config::MacroStep::Rts { value } => {
-                    port.lock().await.set_rts(*value).map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("RTS error: {e}"), None)
-                    })?;
-                    executed.push(format!("RTS={}", if *value { "HIGH" } else { "LOW" }));
-                }
-                crate::config::MacroStep::Delay { ms } => {
-                    tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
-                    executed.push(format!("delay {ms}ms"));
-                }
-                crate::config::MacroStep::Write { value } => {
-                    let data = if value.starts_with("0x") || value.starts_with("0X") {
-                        hex_decode(&value[2..]).unwrap_or_default()
-                    } else {
-                        value.as_bytes().to_vec()
-                    };
-                    port.lock().await.write_all(&data).await.map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("write error: {e}"), None)
-                    })?;
-                    executed.push(format!("write {} bytes", data.len()));
-                }
-            }
-        }
-
-        // Log separator in buffer
-        let msg = format!(
-            "━━━ MACRO '{}' executed ({}) ━━━",
-            params.macro_name,
-            executed.join(" → ")
-        );
-        self.log_to_buffer(&params.port_name, &msg).await;
-
+        let port = params.port_name.clone();
+        let name = params.macro_name.clone();
+        let response = self
+            .run(RequestPayload::ExecuteMacro {
+                port: params.port_name,
+                macro_name: params.macro_name,
+            })
+            .await?;
+        let ResponsePayload::MacroSuccess { executed_steps } = response else {
+            return Err(unexpected());
+        };
         Ok(format!(
-            "Executed '{}' on {} ({} steps: {})",
-            params.macro_name,
-            params.port_name,
-            executed.len(),
-            executed.join(" → ")
+            "Executed '{name}' on {port} ({} steps: {})",
+            executed_steps.len(),
+            executed_steps.join(" → ")
         ))
     }
 
-    /// Open a GUI monitor window for a serial port.
+    /// Open a GUI monitor window.
     #[tool(
-        description = "Open a native GUI monitor window showing real-time serial data. User can send data from the window."
+        description = "Open a native GUI monitor window showing live serial data. The user can send data from that window."
     )]
     async fn serial_monitor_open(
         &self,
-        Parameters(params): Parameters<MonitorOpenParams>,
+        Parameters(params): Parameters<PortParams>,
     ) -> Result<String, rmcp::ErrorData> {
         self.monitor_open_impl(&params.port_name).await
     }
 
-    /// Close the GUI monitor window for a serial port.
+    /// Close a GUI monitor window.
     #[tool(description = "Close the native GUI monitor window for a serial port.")]
     async fn serial_monitor_close(
         &self,
-        Parameters(params): Parameters<MonitorCloseParams>,
+        Parameters(params): Parameters<PortParams>,
     ) -> Result<String, rmcp::ErrorData> {
         self.monitor_close_impl(&params.port_name).await
     }
+}
 
+#[cfg(feature = "esp")]
+#[tool_router(router = esp_tools, vis = "pub")]
+impl DevSerialServer {
     /// Flash firmware to an ESP device.
-    #[cfg(feature = "esp")]
     #[tool(
-        description = "Flash firmware to an ESP device via espflash. Requires espflash installed."
+        description = "Flash firmware to an ESP device via espflash. The port is released for the duration and reopened afterwards."
     )]
     async fn serial_esp_flash(
         &self,
         Parameters(params): Parameters<EspFlashParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        if !crate::esp::is_available() {
-            return Err(rmcp::ErrorData::internal_error(
-                "espflash not found in PATH. Install with: cargo install espflash".to_string(),
-                None,
-            ));
-        }
-        let reopen = self.release_port_for_esp(&params.port_name).await;
-        let result =
-            crate::esp::flash(&params.port_name, &params.firmware_path, params.baud, false).await;
-        if let Some((config, data_dir)) = reopen {
-            self.reopen_port_after_esp(&params.port_name, config, data_dir)
-                .await;
-        }
-        let status = if result.is_ok() { "OK" } else { "FAILED" };
-        self.log_to_buffer(
-            &params.port_name,
-            &format!("━━━ FLASH {} → {} ━━━", params.firmware_path, status),
-        )
-        .await;
-        result.map_err(|e| rmcp::ErrorData::internal_error(e, None))
+        self.esp_output(RequestPayload::EspFlash {
+            port: params.port_name,
+            firmware_path: params.firmware_path,
+            baud: params.baud,
+        })
+        .await
     }
 
-    /// Get ESP chip/board information.
-    #[cfg(feature = "esp")]
-    #[tool(
-        description = "Get ESP chip and board information (chip type, flash size, MAC address)."
-    )]
+    /// Get ESP chip and board information.
+    #[tool(description = "Get ESP chip and board information (chip type, flash size, MAC).")]
     async fn serial_esp_info(
         &self,
-        Parameters(params): Parameters<EspInfoParams>,
+        Parameters(params): Parameters<PortParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        if !crate::esp::is_available() {
-            return Err(rmcp::ErrorData::internal_error(
-                "espflash not found in PATH. Install with: cargo install espflash".to_string(),
-                None,
-            ));
-        }
-        let reopen = self.release_port_for_esp(&params.port_name).await;
-        let result = crate::esp::board_info(&params.port_name).await;
-        if let Some((config, data_dir)) = reopen {
-            self.reopen_port_after_esp(&params.port_name, config, data_dir)
-                .await;
-        }
-        result.map_err(|e| rmcp::ErrorData::internal_error(e, None))
+        self.esp_output(RequestPayload::EspInfo {
+            port: params.port_name,
+        })
+        .await
     }
 
-    /// Erase entire flash of an ESP device.
-    #[cfg(feature = "esp")]
-    #[tool(description = "Erase entire flash of an ESP device. WARNING: destroys all data.")]
+    /// Erase the entire flash of an ESP device.
+    #[tool(description = "Erase the entire flash of an ESP device. This destroys all data on it.")]
     async fn serial_esp_erase(
         &self,
-        Parameters(params): Parameters<EspEraseParams>,
+        Parameters(params): Parameters<PortParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        if !crate::esp::is_available() {
-            return Err(rmcp::ErrorData::internal_error(
-                "espflash not found in PATH. Install with: cargo install espflash".to_string(),
-                None,
-            ));
-        }
-        let reopen = self.release_port_for_esp(&params.port_name).await;
-        let result = crate::esp::erase_flash(&params.port_name).await;
-        if let Some((config, data_dir)) = reopen {
-            self.reopen_port_after_esp(&params.port_name, config, data_dir)
-                .await;
-        }
-        let status = if result.is_ok() { "OK" } else { "FAILED" };
-        self.log_to_buffer(
-            &params.port_name,
-            &format!("━━━ ERASE FLASH → {status} ━━━"),
-        )
-        .await;
-        result.map_err(|e| rmcp::ErrorData::internal_error(e, None))
+        self.esp_output(RequestPayload::EspErase {
+            port: params.port_name,
+        })
+        .await
     }
 
-    /// Write a raw binary to a specific flash address.
-    #[cfg(feature = "esp")]
+    /// Write a raw binary to a flash address.
     #[tool(
-        description = "Write a raw binary file to a specific flash address on an ESP device. Use for bootloaders, partition tables, or NVS images."
+        description = "Write a raw binary file to a specific flash address on an ESP device. Use for bootloaders, partition tables or NVS images."
     )]
     async fn serial_esp_write_bin(
         &self,
         Parameters(params): Parameters<EspWriteBinParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        if !crate::esp::is_available() {
-            return Err(rmcp::ErrorData::internal_error(
-                "espflash not found in PATH. Install with: cargo install espflash".to_string(),
-                None,
-            ));
-        }
-        let reopen = self.release_port_for_esp(&params.port_name).await;
-        let result =
-            crate::esp::write_bin(&params.port_name, &params.file_path, &params.address).await;
-        if let Some((config, data_dir)) = reopen {
-            self.reopen_port_after_esp(&params.port_name, config, data_dir)
-                .await;
-        }
-        let status = if result.is_ok() { "OK" } else { "FAILED" };
-        self.log_to_buffer(
-            &params.port_name,
-            &format!(
-                "━━━ WRITE-BIN {} @ {} → {status} ━━━",
-                params.file_path, params.address
-            ),
-        )
-        .await;
-        result.map_err(|e| rmcp::ErrorData::internal_error(e, None))
+        self.esp_output(RequestPayload::EspWriteBin {
+            port: params.port_name,
+            file_path: params.file_path,
+            address: params.address,
+        })
+        .await
     }
-}
-
-fn parse_time_range(
-    start: Option<&str>,
-    end: Option<&str>,
-) -> Result<Option<crate::storage::TimeRange>, rmcp::ErrorData> {
-    match (start, end) {
-        (Some(s), Some(e)) => {
-            let start_ns = parse_iso_to_ns(s)?;
-            let end_ns = parse_iso_to_ns(e)?;
-            Ok(Some(crate::storage::TimeRange { start_ns, end_ns }))
-        }
-        (Some(s), None) => {
-            let start_ns = parse_iso_to_ns(s)?;
-            Ok(Some(crate::storage::TimeRange {
-                start_ns,
-                end_ns: i64::MAX,
-            }))
-        }
-        (None, Some(e)) => {
-            let end_ns = parse_iso_to_ns(e)?;
-            Ok(Some(crate::storage::TimeRange {
-                start_ns: 0,
-                end_ns,
-            }))
-        }
-        (None, None) => Ok(None),
-    }
-}
-
-fn parse_iso_to_ns(s: &str) -> Result<i64, rmcp::ErrorData> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("invalid time format: {e}"), None))
 }
 
 #[cfg(feature = "esp")]
 impl DevSerialServer {
-    /// Close the port (and monitor) if managed, returning config for reopening.
-    async fn release_port_for_esp(
-        &self,
-        port_name: &str,
-    ) -> Option<(crate::config::PortConfig, std::path::PathBuf)> {
-        // Check if port is managed
-        if self.port_manager.get_state(port_name).await.is_err() {
-            return None;
-        }
-
-        // Close monitor if open
-        #[cfg(feature = "monitor")]
-        {
-            let mut monitors = self
-                .monitors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mut m) = monitors.remove(port_name) {
-                m.handle.close();
-                tracing::info!(port = %port_name, "closed monitor for espflash");
-            }
-        }
-
-        // Close port and get its actual config
-        let data_dir = self.data_dir();
-        self.port_manager
-            .close_with_config(port_name)
-            .await
-            .ok()
-            .map(|config| {
-                tracing::info!(port = %port_name, "released port for espflash");
-                (config, data_dir)
-            })
-    }
-
-    /// Reopen the port after espflash finishes.
-    async fn reopen_port_after_esp(
-        &self,
-        port_name: &str,
-        config: crate::config::PortConfig,
-        data_dir: std::path::PathBuf,
-    ) {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Err(e) = self
-            .port_manager
-            .open_serial(port_name.to_string(), config, data_dir)
-            .await
-        {
-            tracing::warn!(port = %port_name, error = %e, "failed to reopen port after espflash");
-        } else {
-            tracing::info!(port = %port_name, "reopened port after espflash");
-        }
+    async fn esp_output(&self, payload: RequestPayload) -> Result<String, rmcp::ErrorData> {
+        let ResponsePayload::EspSuccess(output) = self.run(payload).await? else {
+            return Err(unexpected());
+        };
+        Ok(output)
     }
 }
 
+// ------------------------------------------------------------------ rendering
+
+fn unexpected() -> rmcp::ErrorData {
+    rmcp::ErrorData::internal_error("unexpected response for this operation".to_string(), None)
+}
+
+/// Render a page of lines with the header a model can use to continue reading.
+fn render_lines(page: &LinesPage, timestamps: bool) -> String {
+    use std::fmt::Write as _;
+
+    if page.lines.is_empty() {
+        return format!(
+            "[no new lines after {}, {} total]",
+            page.next_after_id, page.total_lines
+        );
+    }
+
+    let first = page.lines.first().map_or(0, |l| l.id);
+    let last = page.lines.last().map_or(0, |l| l.id);
+    let mut out = format!("[lines {first}-{last} of {} total]\n", page.total_lines);
+    for line in &page.lines {
+        if timestamps {
+            let ts =
+                chrono::DateTime::from_timestamp_nanos(line.timestamp_ns).format("%H:%M:%S%.3f");
+            let _ = writeln!(out, "{ts} {}", line.payload);
+        } else {
+            out.push_str(&line.payload);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------------ monitor
+
 #[cfg(feature = "monitor")]
 impl DevSerialServer {
-    #[allow(clippy::too_many_lines)]
     async fn monitor_open_impl(&self, port_name: &str) -> Result<String, rmcp::ErrorData> {
-        let state = self
-            .port_manager
-            .get_state(port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        {
-            let monitors = self
-                .monitors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if monitors.contains_key(port_name) {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("monitor already open for '{port_name}'"),
-                    None,
-                ));
-            }
-        }
-
-        let storage = self
-            .port_manager
-            .get_storage(port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let db_path = {
-            let s = storage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.db_path().to_path_buf()
+        // Fails early when the port is not managed.
+        let ResponsePayload::Status { state, .. } = self
+            .run(RequestPayload::GetStatus {
+                port: port_name.to_string(),
+            })
+            .await?
+        else {
+            return Err(unexpected());
         };
 
+        if self.monitor_is_open(port_name) {
+            return Err(bad_params(format!(
+                "a monitor window is already open for '{port_name}'"
+            )));
+        }
+
+        let db_path = crate::paths::port_db_path(self.engine.data_dir(), port_name);
         let mut handle = crate::monitor::spawn_monitor(port_name, &db_path, &format!("{state:?}"))
             .map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("failed to spawn monitor: {e}"), None)
             })?;
 
-        // Read commands from monitor's stdout pipe
         if let Some(stdout) = handle.take_stdout() {
-            let pm = self.port_manager.clone();
-            let pn = port_name.to_string();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let reader = BufReader::new(tokio::io::BufReader::new(
-                    tokio::process::ChildStdout::from_std(stdout).unwrap(),
-                ));
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(macro_name) = line.strip_prefix("__macro:") {
-                        if let Ok(port) = pm.get_serial_port(&pn).await {
-                            match macro_name.trim() {
-                                "reset" => {
-                                    port.lock().await.set_dtr(false).ok();
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    port.lock().await.set_dtr(true).ok();
-                                }
-                                "enter_bootloader" => {
-                                    let g = port.lock().await;
-                                    g.set_rts(true).ok();
-                                    g.set_dtr(false).ok();
-                                    drop(g);
-                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                    port.lock().await.set_dtr(true).ok();
-                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                    port.lock().await.set_rts(false).ok();
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else if let Some(sig) = line.strip_prefix("__signal:") {
-                        if let Ok(port) = pm.get_serial_port(&pn).await {
-                            let g = port.lock().await;
-                            match sig.trim() {
-                                "dtr:1" => {
-                                    g.set_dtr(true).ok();
-                                }
-                                "dtr:0" => {
-                                    g.set_dtr(false).ok();
-                                }
-                                "rts:1" => {
-                                    g.set_rts(true).ok();
-                                }
-                                "rts:0" => {
-                                    g.set_rts(false).ok();
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else if let Some(hex) = line.strip_prefix("__data:") {
-                        let data: Vec<u8> = (0..hex.len())
-                            .step_by(2)
-                            .filter_map(|i| {
-                                hex.get(i..i + 2)
-                                    .and_then(|h| u8::from_str_radix(h, 16).ok())
-                            })
-                            .collect();
-                        pm.write(&pn, data).await.ok();
-                    }
-                }
-            });
+            self.spawn_event_pump(port_name.to_string(), stdout);
+        }
+        if let Some(stdin) = handle.take_stdin() {
+            self.spawn_change_notifier(port_name.to_string(), stdin);
         }
 
-        {
-            let mut monitors = self
-                .monitors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let notify_tx = handle.take_stdin().expect("stdin pipe");
-
-            // Spawn notification task: polls DB for new lines, writes byte to stdin pipe
-            let storage_notify = Arc::clone(&storage);
-            let mut notify_pipe =
-                tokio::process::ChildStdin::from_std(notify_tx).expect("async stdin");
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let mut last_count: u64 = 0;
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    let count = storage_notify
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get_stats()
-                        .map_or(0, |s| s.total_lines);
-                    if count != last_count {
-                        last_count = count;
-                        if notify_pipe.write_all(b"\n").await.is_err() {
-                            break; // monitor closed
-                        }
-                    }
-                }
-            });
-
-            monitors.insert(port_name.to_string(), MonitorState { handle });
-        }
+        self.monitors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(port_name.to_string(), MonitorState { handle });
 
         Ok(format!("Monitor opened for {port_name}"))
     }
 
+    #[allow(clippy::unused_async)] // symmetry with the feature-less variant
     async fn monitor_close_impl(&self, port_name: &str) -> Result<String, rmcp::ErrorData> {
-        self.port_manager
-            .get_state(port_name)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let monitor = {
-            let mut monitors = self
-                .monitors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            monitors.remove(port_name)
-        };
+        let monitor = self
+            .monitors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(port_name);
 
         match monitor {
-            Some(mut s) => {
-                s.handle.close();
+            Some(mut state) => {
+                state.handle.close();
                 Ok(format!("Monitor closed for {port_name}"))
             }
-            None => Err(rmcp::ErrorData::internal_error(
-                format!("no monitor open for '{port_name}'"),
-                None,
-            )),
+            None => Err(bad_params(format!(
+                "no monitor window is open for '{port_name}'"
+            ))),
         }
+    }
+
+    fn monitor_is_open(&self, port_name: &str) -> bool {
+        self.monitors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(port_name)
+    }
+
+    /// Turn user actions reported by a monitor window into engine operations.
+    fn spawn_event_pump(&self, port: String, stdout: std::process::ChildStdout) {
+        let engine = self.engine.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let Ok(stdout) = tokio::process::ChildStdout::from_std(stdout) else {
+                tracing::warn!(port = %port, "could not read monitor output");
+                return;
+            };
+            let mut lines = BufReader::new(stdout).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match crate::gui_ipc::MonitorEvent::decode(&line) {
+                    Ok(event) => {
+                        let payload = monitor_event_payload(&port, event);
+                        if let Err(e) = engine.execute(payload).await {
+                            tracing::warn!(port = %port, error = %e, "monitor action failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(port = %port, error = %e, "unreadable monitor event");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Notify a monitor window when new lines arrive.
+    fn spawn_change_notifier(&self, port: String, stdin: std::process::ChildStdin) {
+        let engine = self.engine.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let Ok(mut pipe) = tokio::process::ChildStdin::from_std(stdin) else {
+                return;
+            };
+            let Ok(storage) = engine.port_manager().get_storage(&port).await else {
+                return;
+            };
+
+            let mut last_id = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Change detection uses the primary key only. Asking for full
+                // statistics here meant scanning the whole capture table many
+                // times per second.
+                let current = {
+                    let guard = storage
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.last_id().unwrap_or(last_id)
+                };
+                if current != last_id {
+                    last_id = current;
+                    if pipe.write_all(b"\n").await.is_err() {
+                        break; // window closed
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Translate a monitor window action into an engine operation.
+#[cfg(feature = "monitor")]
+fn monitor_event_payload(port: &str, event: crate::gui_ipc::MonitorEvent) -> RequestPayload {
+    use crate::gui_ipc::MonitorEvent;
+    match event {
+        MonitorEvent::Macro { name } => RequestPayload::ExecuteMacro {
+            port: port.to_string(),
+            macro_name: name,
+        },
+        MonitorEvent::Signal { dtr, rts } => RequestPayload::SetSignal {
+            port: port.to_string(),
+            dtr,
+            rts,
+        },
+        MonitorEvent::Write { hex } => RequestPayload::WriteData {
+            port: port.to_string(),
+            data: hex,
+            is_hex: true,
+        },
+        MonitorEvent::Reconfigure { settings } => RequestPayload::ReconfigurePort {
+            name: port.to_string(),
+            settings,
+        },
+        MonitorEvent::Break { duration_ms } => RequestPayload::SendBreak {
+            port: port.to_string(),
+            duration_ms,
+        },
+        MonitorEvent::SendFile { path, protocol } => RequestPayload::SendFile {
+            port: port.to_string(),
+            file_path: path,
+            protocol,
+        },
+        MonitorEvent::ReceiveFile { dir, protocol } => RequestPayload::ReceiveFile {
+            port: port.to_string(),
+            output_dir: dir,
+            protocol,
+        },
     }
 }
 
@@ -1725,7 +1101,7 @@ impl DevSerialServer {
     async fn monitor_open_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
         tokio::task::yield_now().await;
         Err(rmcp::ErrorData::internal_error(
-            "monitor feature not enabled (rebuild with --features monitor)".to_string(),
+            "this build has no GUI monitor (rebuild with --features monitor)".to_string(),
             None,
         ))
     }
@@ -1733,13 +1109,15 @@ impl DevSerialServer {
     async fn monitor_close_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
         tokio::task::yield_now().await;
         Err(rmcp::ErrorData::internal_error(
-            "monitor feature not enabled (rebuild with --features monitor)".to_string(),
+            "this build has no GUI monitor (rebuild with --features monitor)".to_string(),
             None,
         ))
     }
 }
 
-#[tool_handler]
+// ------------------------------------------------------------------ handler
+
+#[tool_handler(router = self.tool_router)]
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for DevSerialServer {
     fn get_info(&self) -> ServerInfo {
@@ -1766,8 +1144,11 @@ impl ServerHandler for DevSerialServer {
     > + Send
     + '_ {
         async {
-            let ports = self.port_manager.list().await;
-            let resources: Vec<rmcp::model::Resource> = ports
+            let ResponsePayload::PortList(ports) = self.run(RequestPayload::ListPorts).await?
+            else {
+                return Err(unexpected());
+            };
+            let resources = ports
                 .iter()
                 .map(|p| rmcp::model::Annotated {
                     raw: rmcp::model::RawResource {
@@ -1801,46 +1182,32 @@ impl ServerHandler for DevSerialServer {
     > + Send
     + '_ {
         async move {
-            // Parse URI: serial://{port_name}/status
-            let uri = &request.uri;
+            let uri = request.uri.clone();
             let port_name = uri
                 .strip_prefix("serial://")
                 .and_then(|s| s.strip_suffix("/status"))
-                .ok_or_else(|| {
-                    rmcp::ErrorData::internal_error(format!("invalid resource URI: {uri}"), None)
-                })?;
+                .ok_or_else(|| bad_params(format!("invalid resource URI: {uri}")))?;
 
-            let conn_state = self
-                .port_manager
-                .get_state(port_name)
-                .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-            let storage = self
-                .port_manager
-                .get_storage(port_name)
-                .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-            let buf_stats = {
-                let s = storage
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                s.get_stats()
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            let ResponsePayload::Status { name, state, stats } = self
+                .run(RequestPayload::GetStatus {
+                    port: port_name.to_string(),
+                })
+                .await?
+            else {
+                return Err(unexpected());
             };
 
             let json = serde_json::json!({
-                "port": port_name,
-                "state": format!("{conn_state:?}"),
-                "total_lines": buf_stats.total_lines,
-                "total_bytes": buf_stats.total_bytes,
-                "db_size_bytes": buf_stats.db_size_bytes,
+                "port": name,
+                "state": format!("{state:?}"),
+                "total_lines": stats.total_lines,
+                "total_bytes": stats.total_bytes,
+                "db_size_bytes": stats.db_size_bytes,
             });
 
             Ok(rmcp::model::ReadResourceResult::new(vec![
                 rmcp::model::ResourceContents::TextResourceContents {
-                    uri: uri.clone(),
+                    uri,
                     mime_type: Some("application/json".into()),
                     text: serde_json::to_string_pretty(&json).unwrap_or_default(),
                     meta: None,
@@ -1850,433 +1217,338 @@ impl ServerHandler for DevSerialServer {
     }
 }
 
+/// Upper bounds advertised in tool descriptions, kept next to the protocol
+/// constants they mirror so the two cannot drift.
+#[cfg(test)]
+mod limit_docs {
+    use crate::protocol::{
+        DEFAULT_READ_LIMIT, DEFAULT_SEARCH_LIMIT, MAX_READ_LIMIT, MAX_SEARCH_LIMIT,
+    };
+    use crate::serial_params::DEFAULT_BREAK_MS;
+
+    /// Tool descriptions are string literals, so the numbers in them cannot be
+    /// interpolated from the constants. This test fails if a constant changes
+    /// without its description being updated.
+    #[test]
+    fn documented_limits_match_the_constants() {
+        assert_eq!(
+            DEFAULT_READ_LIMIT, 100,
+            "update the serial_read description"
+        );
+        assert_eq!(MAX_READ_LIMIT, 10_000, "update the serial_read description");
+        assert_eq!(
+            DEFAULT_SEARCH_LIMIT, 100,
+            "update the serial_search description"
+        );
+        assert_eq!(
+            MAX_SEARCH_LIMIT, 1000,
+            "update the serial_search description"
+        );
+        assert_eq!(
+            DEFAULT_BREAK_MS, 250,
+            "update the serial_break descriptions"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::PortConfig;
+    use crate::port_manager::PortManagerHandle;
     use crate::storage::SqliteStorage;
     use crate::testutil::mock_serial::mock_serial;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     async fn setup() -> DevSerialServer {
-        let mgr = PortManagerHandle::new();
-        let (mock, ctrl) = mock_serial(100);
+        let pm = PortManagerHandle::new();
+        let server = DevSerialServer::with_port_manager(pm);
+        let (mock, ctrl) = mock_serial(4096);
         let storage = Arc::new(std::sync::Mutex::new(SqliteStorage::open_memory().unwrap()));
-
-        mgr.open("test_port".into(), mock, PortConfig::default(), storage)
+        server
+            .engine
+            .port_manager()
+            .open("/dev/mock".into(), mock, PortConfig::default(), storage)
             .await
             .unwrap();
-
-        ctrl.feed_lines(&["line 1", "line 2", "line 3"]).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        DevSerialServer::with_port_manager(mgr)
+        ctrl.feed_lines(&["[INFO] boot", "[ERROR] failure", "[INFO] done"])
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        server
     }
 
-    #[tokio::test]
-    async fn test_serial_read_basic() {
-        let server = setup().await;
-        let params = ReadBufferParams {
-            port_name: "test_port".into(),
+    fn read_params(port: &str) -> ReadBufferParams {
+        ReadBufferParams {
+            port_name: port.to_string(),
             start_line: None,
-            max_lines: Some(10),
-            include_timestamps: Some(false),
             after_line: None,
-            wait_ms: None,
-            since_time: None,
-        };
-
-        let result = server.serial_read(Parameters(params)).await.unwrap();
-        assert!(result.contains("line 1"));
-        assert!(result.contains("line 2"));
-        assert!(result.contains("line 3"));
-    }
-
-    #[tokio::test]
-    async fn test_serial_read_with_timestamps() {
-        let server = setup().await;
-        let params = ReadBufferParams {
-            port_name: "test_port".into(),
-            start_line: None,
-            max_lines: Some(10),
-            include_timestamps: Some(true),
-            after_line: None,
-            wait_ms: None,
-            since_time: None,
-        };
-
-        let result = server.serial_read(Parameters(params)).await.unwrap();
-        assert!(result.contains(':')); // timestamp HH:MM:SS
-        assert!(result.contains("line 1"));
-    }
-
-    #[tokio::test]
-    async fn test_serial_read_nonexistent_port() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = ReadBufferParams {
-            port_name: "nonexistent".into(),
-            start_line: None,
             max_lines: None,
             include_timestamps: None,
-            after_line: None,
             wait_ms: None,
             since_time: None,
-        };
-
-        let result = server.serial_read(Parameters(params)).await;
-        assert!(result.is_err());
+        }
     }
 
     #[tokio::test]
-    async fn test_serial_status() {
+    async fn read_returns_header_and_lines() {
         let server = setup().await;
-        let params = GetStreamStatsParams {
-            port_name: "test_port".into(),
-        };
-
-        let result = server.serial_status(Parameters(params)).await.unwrap();
-        assert!(result.contains("total_lines"));
-        assert!(result.contains("Connected"));
-    }
-
-    #[tokio::test]
-    async fn test_serial_read_empty_result() {
-        let server = setup().await;
-        let params = ReadBufferParams {
-            port_name: "test_port".into(),
-            start_line: Some(9999),
-            max_lines: Some(10),
-            include_timestamps: None,
-            after_line: None,
-            wait_ms: None,
-            since_time: None,
-        };
-
-        let result = server.serial_read(Parameters(params)).await.unwrap();
-        assert!(result.contains("no new lines"));
-    }
-
-    async fn setup_search() -> DevSerialServer {
-        let mgr = PortManagerHandle::new();
-        let (mock, ctrl) = mock_serial(1000);
-        let storage = Arc::new(std::sync::Mutex::new(SqliteStorage::open_memory().unwrap()));
-
-        mgr.open("test_port".into(), mock, PortConfig::default(), storage)
+        let out = server
+            .serial_read(Parameters(read_params("/dev/mock")))
             .await
             .unwrap();
-
-        // Feed mixed content
-        let lines: Vec<String> = (0..100)
-            .map(|i| {
-                if i % 10 == 0 {
-                    format!("[ERROR] failure at step {i}")
-                } else {
-                    format!("[INFO] normal operation {i}")
-                }
-            })
-            .collect();
-        for line in &lines {
-            ctrl.feed_lines(&[line.as_str()]).await;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        DevSerialServer::with_port_manager(mgr)
+        assert!(out.starts_with("[lines 1-3 of 3 total]"));
+        assert!(out.contains("[ERROR] failure"));
     }
 
     #[tokio::test]
-    async fn test_serial_search_substring() {
-        let server = setup_search().await;
-        let params = SearchBufferParams {
-            port_name: "test_port".into(),
-            query: "[ERROR]".into(),
-            query_type: Some("substring".into()),
-            start_time: None,
-            end_time: None,
-            max_results: None,
-        };
-
-        let result = server.serial_search(Parameters(params)).await.unwrap();
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 10);
-        assert!(lines.iter().all(|l| l.contains("[ERROR]")));
+    async fn read_with_timestamps() {
+        let server = setup().await;
+        let out = server
+            .serial_read(Parameters(ReadBufferParams {
+                include_timestamps: Some(true),
+                ..read_params("/dev/mock")
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains(':'), "expected a clock time in the output");
     }
 
     #[tokio::test]
-    async fn test_serial_search_regex() {
-        let server = setup_search().await;
-        let params = SearchBufferParams {
-            port_name: "test_port".into(),
-            query: r"\[ERROR\].*step \d0".into(),
-            query_type: Some("regex".into()),
-            start_time: None,
-            end_time: None,
-            max_results: None,
-        };
-
-        let result = server.serial_search(Parameters(params)).await.unwrap();
-        // Matches step 0, 10, 20, ..., 90
-        assert!(!result.is_empty());
-        assert!(result.contains("[ERROR]"));
+    async fn read_after_line_reports_no_new_lines() {
+        let server = setup().await;
+        let out = server
+            .serial_read(Parameters(ReadBufferParams {
+                after_line: Some(3),
+                ..read_params("/dev/mock")
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("no new lines"));
     }
 
     #[tokio::test]
-    async fn test_serial_search_invalid_regex() {
-        let server = setup_search().await;
-        let params = SearchBufferParams {
-            port_name: "test_port".into(),
-            query: "[unclosed".into(),
-            query_type: Some("regex".into()),
-            start_time: None,
-            end_time: None,
-            max_results: None,
-        };
-
-        let result = server.serial_search(Parameters(params)).await;
-        assert!(result.is_err());
+    async fn unknown_port_is_an_error() {
+        let server = setup().await;
+        let err = server
+            .serial_read(Parameters(read_params("/dev/absent")))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not found"));
     }
 
     #[tokio::test]
-    async fn test_serial_search_no_matches() {
-        let server = setup_search().await;
-        let params = SearchBufferParams {
-            port_name: "test_port".into(),
-            query: "NONEXISTENT_PATTERN".into(),
+    async fn status_is_json() {
+        let server = setup().await;
+        let out = server
+            .serial_status(Parameters(PortParams {
+                port_name: "/dev/mock".into(),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["total_lines"], 3);
+        assert_eq!(json["state"], "Connected");
+    }
+
+    #[tokio::test]
+    async fn search_modes_behave_differently() {
+        let server = setup().await;
+        let base = SearchBufferParams {
+            port_name: "/dev/mock".into(),
+            query: "[INFO] boot".into(),
             query_type: None,
             start_time: None,
             end_time: None,
             max_results: None,
         };
 
-        let result = server.serial_search(Parameters(params)).await.unwrap();
-        assert!(result.is_empty());
-    }
+        let substring = server.serial_search(Parameters(base)).await.unwrap();
+        assert!(substring.contains("[INFO] boot"));
 
-    #[tokio::test]
-    async fn test_serial_search_max_results() {
-        let server = setup_search().await;
-        let params = SearchBufferParams {
-            port_name: "test_port".into(),
-            query: "[INFO]".into(),
-            query_type: None,
-            start_time: None,
-            end_time: None,
-            max_results: Some(5),
-        };
-
-        let result = server.serial_search(Parameters(params)).await.unwrap();
-        assert_eq!(result.lines().count(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_serial_export_txt() {
-        let server = setup().await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("export.txt");
-
-        let params = ExportBufferParams {
-            port_name: "test_port".into(),
-            file_format: Some("txt".into()),
-            start_line: None,
-            end_line: None,
-            output_path: path.to_str().unwrap().into(),
-        };
-
-        let result = server.serial_export(Parameters(params)).await.unwrap();
-        assert!(result.contains("3 lines"));
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("line 1"));
-        assert!(content.contains("line 3"));
-    }
-
-    #[tokio::test]
-    async fn test_serial_export_csv() {
-        let server = setup().await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("export.csv");
-
-        let params = ExportBufferParams {
-            port_name: "test_port".into(),
-            file_format: Some("csv".into()),
-            start_line: None,
-            end_line: None,
-            output_path: path.to_str().unwrap().into(),
-        };
-
-        let result = server.serial_export(Parameters(params)).await.unwrap();
-        assert!(result.contains("3 lines"));
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.starts_with("line_number,timestamp,payload"));
-        assert!(content.contains("\"line 1\""));
-    }
-
-    #[tokio::test]
-    async fn test_serial_export_jsonl() {
-        let server = setup().await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("export.jsonl");
-
-        let params = ExportBufferParams {
-            port_name: "test_port".into(),
-            file_format: Some("jsonl".into()),
-            start_line: None,
-            end_line: None,
-            output_path: path.to_str().unwrap().into(),
-        };
-
-        let result = server.serial_export(Parameters(params)).await.unwrap();
-        assert!(result.contains("3 lines"));
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        for line in content.lines() {
-            let _: serde_json::Value = serde_json::from_str(line).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_serial_export_path_traversal_rejected() {
-        let server = setup().await;
-        let params = ExportBufferParams {
-            port_name: "test_port".into(),
-            file_format: None,
-            start_line: None,
-            end_line: None,
-            output_path: "../../etc/passwd".into(),
-        };
-
-        let result = server.serial_export(Parameters(params)).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_serial_export_nonexistent_parent() {
-        let server = setup().await;
-        let params = ExportBufferParams {
-            port_name: "test_port".into(),
-            file_format: None,
-            start_line: None,
-            end_line: None,
-            output_path: "/nonexistent_dir_xyz/file.txt".into(),
-        };
-
-        let result = server.serial_export(Parameters(params)).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_serial_clear_no_archive() {
-        let server = setup().await;
-        let params = ClearBufferParams {
-            port_name: "test_port".into(),
-            archive_current: Some(false),
-        };
-
-        let result = server.serial_clear(Parameters(params)).await.unwrap();
-        assert!(result.contains("3 lines removed"));
-
-        // Verify buffer is empty
-        let stats_params = GetStreamStatsParams {
-            port_name: "test_port".into(),
-        };
-        let stats = server
-            .serial_status(Parameters(stats_params))
+        let regex = server
+            .serial_search(Parameters(SearchBufferParams {
+                port_name: "/dev/mock".into(),
+                query: r"^\[ERROR\]".into(),
+                query_type: Some(SearchMode::Regex),
+                start_time: None,
+                end_time: None,
+                max_results: None,
+            }))
             .await
             .unwrap();
-        assert!(stats.contains("\"total_lines\": 0"));
+        assert!(regex.contains("failure"));
+        assert!(!regex.contains("boot"));
     }
 
     #[tokio::test]
-    async fn test_serial_clear_nonexistent_port() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = ClearBufferParams {
-            port_name: "nope".into(),
-            archive_current: None,
-        };
-
-        let result = server.serial_clear(Parameters(params)).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_serial_list() {
+    async fn invalid_regex_is_invalid_params() {
         let server = setup().await;
-        let result = server.serial_list().await.unwrap();
-        assert!(result.contains("Managed connections:"));
-        assert!(result.contains("test_port"));
+        let err = server
+            .serial_search(Parameters(SearchBufferParams {
+                port_name: "/dev/mock".into(),
+                query: "[".into(),
+                query_type: Some(SearchMode::Regex),
+                start_time: None,
+                end_time: None,
+                max_results: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("regex"));
     }
 
     #[tokio::test]
-    async fn test_serial_open_invalid_baud() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = ConfigurePortParams {
-            port_name: "/dev/ttyUSB0".into(),
-            baudrate: Some(0),
-            data_bits: None,
-            parity: None,
-            stop_bits: None,
-        };
+    async fn export_uses_the_shared_format() {
+        let server = setup().await;
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("export.csv");
 
-        let result = server.serial_open(Parameters(params)).await;
-        assert!(result.is_err());
+        let out = server
+            .serial_export(Parameters(ExportBufferParams {
+                port_name: "/dev/mock".into(),
+                file_format: Some(ExportFormat::Csv),
+                start_line: None,
+                end_line: None,
+                output_path: out_path.display().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("Exported 3 lines"));
+
+        let content = std::fs::read_to_string(&out_path).unwrap();
+        assert!(content.starts_with("line,timestamp,timestamp_ns,payload\n"));
     }
 
     #[tokio::test]
-    async fn test_serial_signal_nonexistent() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = SetControlLinesParams {
-            port_name: "nope".into(),
-            dtr: Some(true),
-            rts: None,
-        };
-
-        let result = server.serial_signal(Parameters(params)).await;
-        assert!(result.is_err());
+    async fn export_rejects_traversal() {
+        let server = setup().await;
+        let err = server
+            .serial_export(Parameters(ExportBufferParams {
+                port_name: "/dev/mock".into(),
+                file_format: None,
+                start_line: None,
+                end_line: None,
+                output_path: "../evil.txt".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains(".."));
     }
 
     #[tokio::test]
-    async fn test_serial_break_nonexistent() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = SerialBreakParams {
-            port_name: "nonexistent".into(),
-            duration_ms: Some(100),
-        };
-
-        let result = server.serial_break(Parameters(params)).await;
-        assert!(result.is_err());
+    async fn invalid_baud_is_invalid_params() {
+        let server = setup().await;
+        let err = server
+            .serial_open(Parameters(ConfigurePortParams {
+                port_name: "/dev/mock".into(),
+                baudrate: Some(0),
+                data_bits: None,
+                parity: None,
+                stop_bits: None,
+                flow_control: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("baud"));
     }
 
     #[tokio::test]
-    async fn test_serial_send_file_nonexistent() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = SerialSendFileParams {
-            port_name: "nonexistent".into(),
-            file_path: "/nonexistent/test.bin".into(),
-            protocol: Some("zmodem".into()),
-        };
-
-        let result = server.serial_send_file(Parameters(params)).await;
-        assert!(result.is_err());
+    async fn invalid_data_bits_are_rejected_before_reaching_hardware() {
+        let server = setup().await;
+        let err = server
+            .serial_open(Parameters(ConfigurePortParams {
+                port_name: "/dev/mock".into(),
+                baudrate: None,
+                data_bits: Some(9),
+                parity: None,
+                stop_bits: None,
+                flow_control: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("data bits"));
     }
 
     #[tokio::test]
-    async fn test_serial_receive_file_nonexistent() {
-        let mgr = PortManagerHandle::new();
-        let server = DevSerialServer::with_port_manager(mgr);
-        let params = SerialReceiveFileParams {
-            port_name: "nonexistent".into(),
-            output_dir: Some("/tmp".into()),
-            protocol: Some("zmodem".into()),
-        };
+    async fn signal_needs_at_least_one_line() {
+        let server = setup().await;
+        let err = server
+            .serial_signal(Parameters(SetControlLinesParams {
+                port_name: "/dev/mock".into(),
+                dtr: None,
+                rts: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("dtr"));
+    }
 
-        let result = server.serial_receive_file(Parameters(params)).await;
-        assert!(result.is_err());
+    #[tokio::test]
+    async fn clear_reports_removed_lines() {
+        let server = setup().await;
+        let out = server
+            .serial_clear(Parameters(ClearBufferParams {
+                port_name: "/dev/mock".into(),
+                archive_current: None,
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("3 lines removed"));
+    }
+
+    #[tokio::test]
+    async fn list_shows_managed_ports() {
+        let server = setup().await;
+        let out = server.serial_list().await.unwrap();
+        assert!(out.contains("Managed connections:"));
+        assert!(out.contains("/dev/mock"));
+    }
+
+    #[tokio::test]
+    async fn mock_ports_have_no_hardware_handle() {
+        let server = setup().await;
+        let err = server
+            .serial_break(Parameters(SerialBreakParams {
+                port_name: "/dev/mock".into(),
+                duration_ms: Some(10),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("no hardware handle"));
+    }
+
+    #[tokio::test]
+    async fn macro_on_unknown_name_lists_alternatives() {
+        let server = setup().await;
+        let err = server
+            .serial_macro(Parameters(TriggerMacroParams {
+                port_name: "/dev/mock".into(),
+                macro_name: "nope".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("reset"));
+    }
+
+    #[cfg(feature = "monitor")]
+    #[test]
+    fn monitor_events_map_onto_operations() {
+        use crate::gui_ipc::MonitorEvent;
+
+        let payload = monitor_event_payload(
+            "/dev/x",
+            MonitorEvent::Macro {
+                name: "reset".into(),
+            },
+        );
+        assert!(matches!(
+            payload,
+            RequestPayload::ExecuteMacro { ref macro_name, .. } if macro_name == "reset"
+        ));
+
+        let payload = monitor_event_payload("/dev/x", MonitorEvent::Write { hex: "41".into() });
+        assert!(matches!(
+            payload,
+            RequestPayload::WriteData { is_hex: true, .. }
+        ));
     }
 }

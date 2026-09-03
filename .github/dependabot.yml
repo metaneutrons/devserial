@@ -1,0 +1,47 @@
+# Die Gruppierung ist nach Aktualisierungsart getrennt. Eine Gruppe
+# `patterns: ['*']` über alle Arten bündelt Breaking Changes mit harmlosen
+# Anhebungen, und eine kaputte Abhängigkeit blockiert dann den ganzen Stapel.
+# Minor und Patch bleiben gebündelt, weil eine Einzelprüfung dort nichts
+# bringt. Major bleibt ungruppiert, damit jeder Fall allein ankommt.
+#
+# `cooldown` hält eine Version, die kurz nach Veröffentlichung zurückgezogen
+# wird, aus jedem Pull Request heraus. Zeiten ohne `timezone` sind UTC.
+#
+# Kein npm-Eintrag, das Projekt hat kein Node-Unterprojekt. Der Eintrag für
+# `package-ecosystem: rust-toolchain` fehlt bewusst, solange es keine
+# rust-toolchain.toml gibt; er kommt mit dieser Datei zusammen.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '05:00'
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    groups:
+      rust-minor-patch:
+        patterns: ['*']
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '05:15'
+    open-pull-requests-limit: 5
+    cooldown:
+      # semver-major-days does not apply to this ecosystem: Dependabot rejects
+      # the whole file when it appears here, and then every update stops
+      # silently. Observed on another repository of this owner.
+      default-days: 3
+    groups:
+      github-actions-minor-patch:
+        patterns: ['*']
+        update-types: [minor, patch]

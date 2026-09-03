@@ -1,25 +1,115 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
-//! Modular CLI definitions, parser, and router.
+//! Command line surface: definitions, parser and router.
+//!
+//! Handlers return errors instead of terminating the process, so the library
+//! stays usable from tests and other front ends. The exit code is set once, in
+//! `main`.
 
+pub mod bootstrap;
 pub mod daemon;
 pub mod handlers;
 pub mod mcp;
 pub mod output;
 
-use clap::{Parser, Subcommand};
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::ipc::{IpcClient, default_socket_path};
-use crate::modem::FileTransferProtocol;
+use clap::{Parser, Subcommand};
 
-/// `DevSerial` — Serial hardware bridge for LLMs, daemons, and developers.
+use crate::export::ExportFormat;
+use crate::modem::FileTransferProtocol;
+use crate::protocol::SearchMode;
+use crate::serial_params::{DEFAULT_BAUD, DEFAULT_BREAK_MS, FlowControl, Parity};
+
+/// Errors reported by the command line front end.
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Ipc(#[from] crate::ipc::IpcError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Params(#[from] crate::serial_params::ParamError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Message(String),
+}
+
+impl CliError {
+    /// Build an error from any message.
+    pub fn msg(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+}
+
+/// Serial line options shared by the commands that open a port.
+#[derive(Parser, Debug, Clone, Copy)]
+pub struct LineOptions {
+    /// Baud rate
+    #[arg(short, long, default_value_t = DEFAULT_BAUD)]
+    pub baud: u32,
+    /// Data bits (5, 6, 7, 8)
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
+    pub data_bits: u8,
+    /// Parity
+    #[arg(long, value_enum, default_value_t = Parity::None)]
+    pub parity: Parity,
+    /// Stop bits (1, 2)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub stop_bits: u8,
+    /// Flow control
+    #[arg(long, value_enum, default_value_t = FlowControl::None)]
+    pub flow_control: FlowControl,
+}
+
+impl LineOptions {
+    /// Convert into a port configuration, validating the numeric fields.
+    ///
+    /// # Errors
+    /// Returns an error if a value is out of range.
+    pub fn to_port_config(
+        self,
+    ) -> Result<crate::config::PortConfig, crate::serial_params::ParamError> {
+        Ok(crate::config::PortConfig {
+            baudrate: crate::serial_params::validate_baud(self.baud)?,
+            data_bits: self.data_bits.try_into()?,
+            parity: self.parity,
+            stop_bits: self.stop_bits.try_into()?,
+            flow_control: self.flow_control,
+            ..crate::config::PortConfig::default()
+        })
+    }
+
+    /// Convert into protocol settings.
+    ///
+    /// # Errors
+    /// Returns an error if a value is out of range.
+    pub fn to_settings(
+        self,
+    ) -> Result<crate::protocol::PortSettings, crate::serial_params::ParamError> {
+        Ok(crate::protocol::PortSettings {
+            baudrate: Some(crate::serial_params::validate_baud(self.baud)?),
+            data_bits: Some(self.data_bits.try_into()?),
+            parity: Some(self.parity),
+            stop_bits: Some(self.stop_bits.try_into()?),
+            flow_control: Some(self.flow_control),
+        })
+    }
+}
+
+/// `DevSerial`, a serial hardware bridge for LLMs, daemons and developers.
 #[derive(Parser)]
 #[command(name = "devserial", version, about)]
 pub struct Cli {
-    /// Custom IPC socket path
+    /// Path to a configuration file (default: ./devserial.toml, then the user config directory)
+    #[arg(long, global = true, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    /// Custom IPC endpoint (Unix socket path or Windows named pipe)
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
@@ -29,12 +119,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run as MCP server (stdio transport) — default when stdin is piped
+    /// Run as MCP server (stdio transport), the default when stdin is piped
     Mcp,
 
     /// Start or manage the background daemon service
     Daemon {
-        /// Check if daemon is currently running
+        /// Check if the daemon is currently running
         #[arg(long)]
         status: bool,
 
@@ -54,21 +144,8 @@ pub enum Command {
     Open {
         /// Serial port path (e.g. /dev/ttyUSB0, COM3)
         port: String,
-        /// Baud rate
-        #[arg(short, long, default_value = "115200")]
-        baud: u32,
-        /// Data bits (5, 6, 7, 8)
-        #[arg(long, default_value = "8")]
-        data_bits: u8,
-        /// Parity (none, odd, even)
-        #[arg(long, default_value = "none")]
-        parity: String,
-        /// Stop bits (1, 2)
-        #[arg(long, default_value = "1")]
-        stop_bits: u8,
-        /// Flow control (none, software, hardware)
-        #[arg(long, default_value = "none")]
-        flow_control: String,
+        #[command(flatten)]
+        line: LineOptions,
     },
 
     /// Close a managed serial port
@@ -81,19 +158,28 @@ pub enum Command {
     Read {
         /// Serial port path
         port: String,
-        /// Number of recent lines to read (from end)
+        /// Number of recent lines to read (from the end)
         #[arg(short, long)]
         tail: Option<u32>,
-        /// Starting line ID (1-based)
-        #[arg(long)]
+        /// Starting line ID (1-based, negative counts from the end)
+        #[arg(long, allow_hyphen_values = true)]
         from: Option<i64>,
+        /// Read lines after this ID (exclusive)
+        #[arg(long)]
+        after: Option<i64>,
+        /// Only lines newer than this RFC 3339 timestamp
+        #[arg(long, value_name = "RFC3339")]
+        since: Option<String>,
         /// Maximum number of lines to read
-        #[arg(short, long, default_value = "100")]
+        #[arg(short, long, default_value_t = crate::protocol::DEFAULT_READ_LIMIT)]
         limit: u32,
+        /// Wait up to this many milliseconds for new data
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
         /// Continuously follow and stream new lines
         #[arg(short, long)]
         follow: bool,
-        /// Include nanosecond timestamps in output
+        /// Include timestamps in the output
         #[arg(long)]
         timestamps: bool,
         /// Output as JSON
@@ -110,7 +196,7 @@ pub enum Command {
         /// Treat data as hex-encoded bytes (e.g. "0x0D0A" or "414243")
         #[arg(long)]
         hex: bool,
-        /// Append newline (\r\n) to data
+        /// Append a newline (\r\n) to the data
         #[arg(short, long)]
         newline: bool,
     },
@@ -119,8 +205,8 @@ pub enum Command {
     Break {
         /// Serial port path
         port: String,
-        /// Duration of BREAK pulse in milliseconds (default: 250)
-        #[arg(short, long, default_value = "250")]
+        /// Duration of the BREAK pulse in milliseconds
+        #[arg(short, long, default_value_t = DEFAULT_BREAK_MS)]
         duration_ms: u64,
     },
 
@@ -128,23 +214,23 @@ pub enum Command {
     Send {
         /// Serial port path
         port: String,
-        /// Path to file to send
+        /// Path to the file to send
         file: String,
-        /// Protocol to use (default: zmodem)
-        #[arg(short, long, value_enum)]
-        protocol: Option<FileTransferProtocol>,
+        /// Protocol to use
+        #[arg(short, long, value_enum, default_value_t = FileTransferProtocol::Zmodem)]
+        protocol: FileTransferProtocol,
     },
 
     /// Receive a file via modem protocol (XMODEM, YMODEM, ZMODEM)
     Recv {
         /// Serial port path
         port: String,
-        /// Output directory to save received file(s)
+        /// Output directory to save the received file in
         #[arg(short, long, default_value = ".")]
         output: String,
-        /// Protocol to use (default: zmodem)
-        #[arg(short, long, value_enum)]
-        protocol: Option<FileTransferProtocol>,
+        /// Protocol to use
+        #[arg(short, long, value_enum, default_value_t = FileTransferProtocol::Zmodem)]
+        protocol: FileTransferProtocol,
     },
 
     /// Set DTR and/or RTS control lines
@@ -159,7 +245,7 @@ pub enum Command {
         rts: Option<bool>,
     },
 
-    /// Execute a macro sequence on a port (e.g. 'reset', '`enter_bootloader`')
+    /// Execute a macro sequence on a port (e.g. `reset`, `enter_bootloader`)
     Macro {
         /// Serial port path
         port: String,
@@ -167,32 +253,38 @@ pub enum Command {
         name: String,
     },
 
-    /// Search buffered serial data (substring or regex)
+    /// Search buffered serial data
     Search {
         /// Serial port path
         port: String,
         /// Search pattern
         query: String,
-        /// Use regular expression search
-        #[arg(short, long)]
-        regex: bool,
+        /// How the query is interpreted
+        #[arg(short, long, value_enum, default_value_t = SearchMode::Substring)]
+        mode: SearchMode,
+        /// Only lines at or after this RFC 3339 timestamp
+        #[arg(long, value_name = "RFC3339")]
+        start: Option<String>,
+        /// Only lines at or before this RFC 3339 timestamp
+        #[arg(long, value_name = "RFC3339")]
+        end: Option<String>,
         /// Maximum results to return
-        #[arg(short, long, default_value = "100")]
+        #[arg(short, long, default_value_t = crate::protocol::DEFAULT_SEARCH_LIMIT)]
         limit: u32,
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
 
-    /// Export buffered lines to a file (txt, csv, jsonl)
+    /// Export buffered lines to a file
     Export {
         /// Serial port path
         port: String,
         /// Output file path
         output: String,
-        /// File format: txt, csv, or jsonl
-        #[arg(short, long, default_value = "txt")]
-        format: String,
+        /// File format
+        #[arg(short, long, value_enum, default_value_t = ExportFormat::Txt)]
+        format: ExportFormat,
         /// Starting line ID
         #[arg(long)]
         start: Option<i64>,
@@ -205,12 +297,12 @@ pub enum Command {
     Clear {
         /// Serial port path
         port: String,
-        /// Create a timestamped archive database before clearing
+        /// Archive the database into the configured archive directory first
         #[arg(long)]
         archive: bool,
     },
 
-    /// Show buffer and port statistics
+    /// Show connection state and buffer statistics
     Stats {
         /// Serial port path
         port: String,
@@ -224,24 +316,31 @@ pub enum Command {
     Flash {
         /// Serial port path
         port: String,
-        /// Path to firmware file (ELF or .bin)
+        /// Path to the firmware file (ELF or .bin)
         firmware: String,
         /// Baud rate for flashing
         #[arg(short, long)]
         baud: Option<u32>,
-        /// Open live monitor after flashing
+        /// Follow the serial output after flashing
         #[arg(short, long)]
         monitor: bool,
     },
+
+    /// Open the GUI port connection manager
+    ///
+    /// Starting `devserial` without arguments does the same, but only from a
+    /// terminal. A desktop launcher has no terminal on stdin, so it needs this
+    /// explicit form.
+    #[cfg(feature = "monitor")]
+    Gui,
 
     /// Open a standalone GUI serial monitor
     #[cfg(feature = "monitor")]
     Monitor {
         /// Serial port path (e.g. /dev/ttyUSB0)
         port: String,
-        /// Baud rate
-        #[arg(short, long, default_value = "115200")]
-        baud: u32,
+        #[command(flatten)]
+        line: LineOptions,
     },
 
     /// Open a TUI serial monitor in the terminal
@@ -249,12 +348,14 @@ pub enum Command {
     Tui {
         /// Serial port path (e.g. /dev/ttyUSB0)
         port: String,
-        /// Baud rate
-        #[arg(short, long, default_value = "115200")]
-        baud: u32,
+        #[command(flatten)]
+        line: LineOptions,
     },
 
-    /// Internal: monitor subprocess (used by MCP `serial_monitor_open`)
+    /// Display version, author, license and repository info
+    About,
+
+    /// Internal: monitor subprocess (used by the MCP tool `serial_monitor_open`)
     #[command(hide = true)]
     #[cfg(feature = "monitor")]
     MonitorSubprocess {
@@ -267,165 +368,204 @@ pub enum Command {
     },
 }
 
-/// Run CLI application.
+/// Parse the command line and run the requested command.
 ///
 /// # Errors
-/// Returns error on execution failure.
-#[allow(clippy::too_many_lines)]
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// Returns the command's error; `main` turns it into an exit code.
+pub fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
-    let socket_path = cli.socket.unwrap_or_else(default_socket_path);
-    let client = IpcClient::new(socket_path.clone());
+    dispatch(cli)
+}
+
+fn dispatch(cli: Cli) -> Result<(), CliError> {
+    let config_path = cli.config.clone();
+
+    // An explicitly named configuration file is validated here, so a typo is
+    // reported by the command the user ran rather than by a background daemon.
+    if let Some(path) = config_path.as_deref() {
+        crate::config::load_config(Some(path))?;
+    }
 
     match cli.command {
         None | Some(Command::Mcp) => {
-            if std::io::stdin().is_terminal() && cli.command.is_none() {
-                use clap::CommandFactory;
-                Cli::command().print_help()?;
-                println!();
-                return Ok(());
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            if interactive && !matches!(cli.command, Some(Command::Mcp)) {
+                return interactive_default();
             }
-            mcp::run_mcp()?;
+            mcp::run_mcp(config_path.as_deref())
         }
 
         Some(Command::Daemon { status, stop }) => {
             if status || stop {
-                handlers::handle_daemon_control(&client, &socket_path, status, stop)?;
+                let session = handlers::Session::new(cli.socket, config_path)?;
+                handlers::daemon_control(&session, status, stop)
             } else {
-                daemon::run_daemon(socket_path)?;
+                daemon::run_daemon(cli.socket, config_path.as_deref())
             }
         }
 
-        Some(Command::List { json }) => {
-            handlers::handle_list(&client, json)?;
-        }
-
-        Some(Command::Open {
-            port,
-            baud,
-            data_bits,
-            parity,
-            stop_bits,
-            flow_control,
-        }) => {
-            handlers::handle_open(
-                &client,
-                &port,
-                baud,
-                data_bits,
-                &parity,
-                stop_bits,
-                &flow_control,
-            )?;
-        }
-
-        Some(Command::Close { port }) => {
-            handlers::handle_close(&client, &port)?;
-        }
-
-        Some(Command::Read {
-            port,
-            tail,
-            from,
-            limit,
-            follow,
-            timestamps,
-            json,
-        }) => {
-            handlers::handle_read(&client, &port, tail, from, limit, follow, timestamps, json)?;
-        }
-
-        Some(Command::Write {
-            port,
-            data,
-            hex,
-            newline,
-        }) => {
-            handlers::handle_write(&client, &port, data, hex, newline)?;
-        }
-
-        Some(Command::Break { port, duration_ms }) => {
-            handlers::handle_break(&client, &port, Some(duration_ms))?;
-        }
-
-        Some(Command::Send {
-            port,
-            file,
-            protocol,
-        }) => {
-            handlers::handle_send_file(&client, &port, &file, protocol)?;
-        }
-
-        Some(Command::Recv {
-            port,
-            output,
-            protocol,
-        }) => {
-            handlers::handle_recv_file(&client, &port, &output, protocol)?;
-        }
-
-        Some(Command::Signal { port, dtr, rts }) => {
-            handlers::handle_signal(&client, &port, dtr, rts)?;
-        }
-
-        Some(Command::Macro { port, name }) => {
-            handlers::handle_macro(&client, &port, &name)?;
-        }
-
-        Some(Command::Search {
-            port,
-            query,
-            regex,
-            limit,
-            json,
-        }) => {
-            handlers::handle_search(&client, &port, &query, regex, limit, json)?;
-        }
-
-        Some(Command::Export {
-            port,
-            output,
-            format,
-            start,
-            end,
-        }) => {
-            handlers::handle_export(&client, &port, &output, &format, start, end)?;
-        }
-
-        Some(Command::Clear { port, archive }) => {
-            handlers::handle_clear(&client, &port, archive)?;
-        }
-
-        Some(Command::Stats { port, json }) => {
-            handlers::handle_stats(&client, &port, json)?;
-        }
-
-        #[cfg(feature = "esp")]
-        Some(Command::Flash {
-            port,
-            firmware,
-            baud,
-            monitor,
-        }) => {
-            handlers::handle_flash(&client, &port, &firmware, baud, monitor)?;
+        Some(Command::About) => {
+            output::print_about();
+            Ok(())
         }
 
         #[cfg(feature = "monitor")]
-        Some(Command::Monitor { port, baud }) => {
-            crate::standalone::run_monitor_standalone(&port, baud)?;
-        }
+        Some(Command::Gui) => crate::standalone::run_monitor_gui_app(),
+
+        #[cfg(feature = "monitor")]
+        Some(Command::Monitor { port, line }) => crate::standalone::run_monitor_standalone(
+            &port,
+            &line.to_port_config()?,
+            config_path.as_deref(),
+        ),
 
         #[cfg(feature = "tui")]
-        Some(Command::Tui { port, baud }) => {
-            crate::standalone::run_tui_standalone(&port, baud)?;
-        }
+        Some(Command::Tui { port, line }) => crate::standalone::run_tui_standalone(
+            &port,
+            &line.to_port_config()?,
+            config_path.as_deref(),
+        ),
 
         #[cfg(feature = "monitor")]
         Some(Command::MonitorSubprocess { port, db, info }) => {
             crate::monitor::run_monitor(&port, std::path::Path::new(&db), &info)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                .map_err(CliError::Message)
+        }
+
+        Some(command) => {
+            let session = handlers::Session::new(cli.socket, config_path)?;
+            handlers::run_remote(&session, command)
         }
     }
+}
 
-    Ok(())
+/// What happens when the binary is started without arguments in a terminal.
+fn interactive_default() -> Result<(), CliError> {
+    #[cfg(feature = "monitor")]
+    {
+        crate::standalone::run_monitor_gui_app()
+    }
+    #[cfg(not(feature = "monitor"))]
+    {
+        use clap::CommandFactory;
+        Cli::command()
+            .print_help()
+            .map_err(|e| CliError::msg(e.to_string()))?;
+        println!();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn line_options_reject_out_of_range_values() {
+        let err = Cli::try_parse_from(["devserial", "open", "/dev/x", "--data-bits", "9"]);
+        assert!(err.is_err());
+        let err = Cli::try_parse_from(["devserial", "open", "/dev/x", "--stop-bits", "3"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parity_is_validated_by_the_parser() {
+        assert!(
+            Cli::try_parse_from(["devserial", "open", "/dev/x", "--parity", "sideways"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["devserial", "open", "/dev/x", "--parity", "even"]).is_ok());
+    }
+
+    #[test]
+    fn export_format_is_validated_by_the_parser() {
+        assert!(
+            Cli::try_parse_from(["devserial", "export", "/dev/x", "out", "--format", "xml"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["devserial", "export", "/dev/x", "out", "--format", "jsonl"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn line_options_convert_into_a_port_config() {
+        let cli = Cli::try_parse_from([
+            "devserial",
+            "open",
+            "/dev/x",
+            "--baud",
+            "9600",
+            "--parity",
+            "odd",
+            "--data-bits",
+            "7",
+            "--stop-bits",
+            "2",
+            "--flow-control",
+            "hardware",
+        ])
+        .unwrap();
+        let Some(Command::Open { line, .. }) = cli.command else {
+            panic!("expected open");
+        };
+        let config = line.to_port_config().unwrap();
+        assert_eq!(config.baudrate, 9600);
+        assert_eq!(config.parity, Parity::Odd);
+        assert_eq!(config.data_bits.get(), 7);
+        assert_eq!(config.stop_bits.get(), 2);
+        assert_eq!(config.flow_control, FlowControl::Hardware);
+        assert_eq!(config.framing_summary(), "9600 7O2 (RTS/CTS)");
+    }
+
+    #[test]
+    fn a_negative_start_line_is_accepted() {
+        // The engine counts back from the end for negative IDs, so the parser
+        // has to let the value through instead of reading it as a flag.
+        let cli = Cli::try_parse_from(["devserial", "read", "/dev/x", "--from", "-20"]).unwrap();
+        let Some(Command::Read { from, .. }) = cli.command else {
+            panic!("expected read");
+        };
+        assert_eq!(from, Some(-20));
+    }
+
+    #[test]
+    fn zero_baud_is_rejected_on_conversion() {
+        let options = LineOptions {
+            baud: 0,
+            data_bits: 8,
+            parity: Parity::None,
+            stop_bits: 1,
+            flow_control: FlowControl::None,
+        };
+        assert!(options.to_port_config().is_err());
+    }
+}
+
+#[cfg(test)]
+mod error_size {
+    use super::CliError;
+
+    /// Guards against a large `Err` variant creeping back in.
+    ///
+    /// clippy's `result_large_err` fires above 128 bytes, and the size of an
+    /// error type is platform dependent: `CliError` sat at 120 bytes on macOS
+    /// and over the threshold on Windows, so the lint failed only in the
+    /// Windows cell of the matrix. This asserts real margin rather than a
+    /// value that happens to pass on the machine the test runs on.
+    #[test]
+    fn cli_error_stays_small() {
+        let size = size_of::<CliError>();
+        assert!(
+            size <= 64,
+            "CliError grew to {size} bytes; box the largest variant's payload \
+             before clippy::result_large_err starts failing on some platform"
+        );
+    }
 }

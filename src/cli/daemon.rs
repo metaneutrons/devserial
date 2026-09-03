@@ -1,80 +1,49 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
-//! Daemon foreground execution and port restoration service.
+//! Foreground execution of the background daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::config::load_config;
+use crate::cli::{CliError, bootstrap};
 use crate::engine::CommandEngine;
-use crate::ipc::{IpcServer, default_pid_path};
-use crate::port_manager::PortManagerHandle;
+use crate::ipc::IpcServer;
+use crate::paths;
 use crate::state::StateDb;
 
-/// Run the background daemon process until shutdown signal.
+/// Run the daemon until it is asked to shut down.
 ///
 /// # Errors
-/// Returns error on initialization or socket failure.
-pub fn run_daemon(socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async move {
-            use tracing_subscriber::EnvFilter;
+/// Returns an error on initialization or endpoint failure.
+pub fn run_daemon(socket: Option<PathBuf>, config_path: Option<&Path>) -> Result<(), CliError> {
+    let startup = bootstrap::start(config_path, "daemon")?;
+    let config = Arc::clone(&startup.config);
+    let endpoint = socket.unwrap_or_else(paths::default_socket_path);
+    let pid_path = paths::pid_path(&endpoint);
 
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
-                )
-                .with_writer(std::io::stderr)
-                .with_ansi(false)
-                .init();
+    startup.runtime.block_on(async move {
+        let port_manager = bootstrap::port_manager(&config);
+        let state_db = Arc::new(Mutex::new(
+            StateDb::open(&config.global.data_dir).map_err(|e| CliError::msg(e.to_string()))?,
+        ));
 
-            tracing::info!("Starting DevSerial Background Daemon");
+        let restored = bootstrap::restore_ports(&port_manager, &state_db, &config).await;
+        if restored > 0 {
+            tracing::info!(restored, "restored previously open ports");
+        }
 
-            let config = load_config(None).unwrap_or_default();
-            tracing::info!(data_dir = %config.global.data_dir.display(), "config loaded");
+        let engine = CommandEngine::new(port_manager, state_db, Arc::clone(&config));
+        let server = IpcServer::new(engine, endpoint, pid_path);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
-            let port_manager = PortManagerHandle::new();
-            let state_db = Arc::new(Mutex::new(StateDb::open(&config.global.data_dir)?));
-
-            // Restore previously open ports
-            let restored_ports = state_db
-                .lock()
-                .map_or_else(|_| Vec::new(), |db| db.active_ports().unwrap_or_default());
-
-            for entry in restored_ports {
-                let data_dir = config.global.data_dir.clone();
-                match port_manager
-                    .open_serial(entry.name.clone(), entry.config.clone(), data_dir)
-                    .await
-                {
-                    Ok(()) => tracing::info!(port = %entry.name, "restored port"),
-                    Err(e) => {
-                        tracing::warn!(port = %entry.name, error = %e, "failed to restore port");
-                    }
-                }
-            }
-
-            let pid_path = default_pid_path();
-            let engine = CommandEngine::new(
-                port_manager,
-                state_db,
-                Arc::new(config.clone()),
-                config.global.data_dir.clone(),
-            );
-
-            let server = IpcServer::new(engine, socket_path, pid_path);
-            let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
-            // Handle Ctrl+C
-            tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
                 let _ = shutdown_tx.send(());
-            });
+            }
+        });
 
-            server.run(shutdown_rx).await?;
-            Ok(())
-        })
+        server.run(shutdown_rx).await?;
+        Ok(())
+    })
 }

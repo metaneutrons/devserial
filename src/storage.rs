@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 use std::path::{Path, PathBuf};
@@ -45,10 +45,33 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("invalid regex: {0}")]
     InvalidRegex(#[from] regex::Error),
+    #[error("archive file already exists: {}", .0.display())]
+    ArchiveExists(std::path::PathBuf),
 }
 
 /// Static counter for generating unique in-memory database URIs.
 static NEXT_MEM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Connection pragmas applied to every connection.
+const PRAGMAS: &str = "PRAGMA busy_timeout=5000;";
+
+/// Pragmas applied to file-backed writer connections only.
+const WRITE_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
+     PRAGMA synchronous=NORMAL;";
+
+/// Capture schema. The single definition, used by file and in-memory databases
+/// alike so that tests exercise the same tables as production.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ns INTEGER NOT NULL,
+        payload TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_timestamp ON lines(timestamp_ns);
+    CREATE TABLE IF NOT EXISTS send_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ns INTEGER NOT NULL,
+        command TEXT NOT NULL
+    );";
 
 /// SQLite-backed storage for a single port's serial data.
 ///
@@ -71,27 +94,12 @@ impl SqliteStorage {
         }
 
         let write_conn = Connection::open(path)?;
-        write_conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;",
-        )?;
-        write_conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_ns INTEGER NOT NULL,
-                payload TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON lines(timestamp_ns);
-            CREATE TABLE IF NOT EXISTS send_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_ns INTEGER NOT NULL,
-                command TEXT NOT NULL
-            );",
-        )?;
+        write_conn.execute_batch(WRITE_PRAGMAS)?;
+        write_conn.execute_batch(PRAGMAS)?;
+        write_conn.execute_batch(SCHEMA)?;
 
         let read_conn = Connection::open(path)?;
-        read_conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        read_conn.execute_batch(PRAGMAS)?;
 
         Ok(Self {
             write_conn: std::sync::Mutex::new(write_conn),
@@ -119,32 +127,55 @@ impl SqliteStorage {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
-        write_conn.execute_batch(
-            "PRAGMA busy_timeout=5000;
-             CREATE TABLE lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_ns INTEGER NOT NULL,
-                payload TEXT NOT NULL
-            );
-            CREATE INDEX idx_timestamp ON lines(timestamp_ns);
-            CREATE TABLE send_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_ns INTEGER NOT NULL,
-                command TEXT NOT NULL
-            );",
-        )?;
+        write_conn.execute_batch(PRAGMAS)?;
+        write_conn.execute_batch(SCHEMA)?;
 
         let read_conn = Connection::open_with_flags(
             &uri,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
         )?;
-        read_conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        read_conn.execute_batch(PRAGMAS)?;
 
         Ok(Self {
             write_conn: std::sync::Mutex::new(write_conn),
             read_conn: std::sync::Mutex::new(read_conn),
             db_path: PathBuf::from(":memory:"),
         })
+    }
+
+    /// Number of buffered lines.
+    ///
+    /// Counts over the primary key only, so this stays cheap enough to be
+    /// called from polling loops. Use [`Self::get_stats`] when byte totals are
+    /// actually needed.
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` failure.
+    pub fn line_count(&self) -> Result<u64, StorageError> {
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count: u64 = conn.query_row("SELECT COUNT(*) FROM lines", [], |r| r.get(0))?;
+        drop(conn);
+        Ok(count)
+    }
+
+    /// Highest line id, or zero when the buffer is empty.
+    ///
+    /// Resolved from the primary key index without touching row data, which
+    /// makes it the right choice for change detection.
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` failure.
+    pub fn last_id(&self) -> Result<i64, StorageError> {
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM lines", [], |r| r.get(0))?;
+        drop(conn);
+        Ok(id)
     }
 
     /// Insert a batch of lines in a single transaction.
@@ -181,13 +212,7 @@ impl SqliteStorage {
         let mut stmt = conn.prepare_cached(
             "SELECT id, timestamp_ns, payload FROM lines WHERE id >= ?1 ORDER BY id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![start_id, count], |row| {
-            Ok(StoredLine {
-                id: row.get(0)?,
-                timestamp_ns: row.get(1)?,
-                payload: row.get(2)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![start_id, count], map_row)?;
         let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
         drop(stmt);
         drop(conn);
@@ -249,13 +274,7 @@ impl SqliteStorage {
                  WHERE payload LIKE ?1 AND timestamp_ns >= ?2 AND timestamp_ns <= ?3 \
                  ORDER BY id LIMIT ?4",
             )?;
-            let rows = stmt.query_map(params![pattern, tr.start_ns, tr.end_ns, limit], |row| {
-                Ok(StoredLine {
-                    id: row.get(0)?,
-                    timestamp_ns: row.get(1)?,
-                    payload: row.get(2)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![pattern, tr.start_ns, tr.end_ns, limit], map_row)?;
             let r = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
             drop(stmt);
             r
@@ -264,13 +283,7 @@ impl SqliteStorage {
                 "SELECT id, timestamp_ns, payload FROM lines \
                  WHERE payload LIKE ?1 ORDER BY id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![pattern, limit], |row| {
-                Ok(StoredLine {
-                    id: row.get(0)?,
-                    timestamp_ns: row.get(1)?,
-                    payload: row.get(2)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![pattern, limit], map_row)?;
             let r = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
             drop(stmt);
             r
@@ -297,13 +310,7 @@ impl SqliteStorage {
             "SELECT id, timestamp_ns, payload FROM lines \
              WHERE timestamp_ns >= ?1 AND timestamp_ns <= ?2 ORDER BY id LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![start_ns, end_ns, limit], |row| {
-            Ok(StoredLine {
-                id: row.get(0)?,
-                timestamp_ns: row.get(1)?,
-                payload: row.get(2)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![start_ns, end_ns, limit], map_row)?;
         let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
         drop(stmt);
         drop(conn);
@@ -315,21 +322,83 @@ impl SqliteStorage {
     /// # Errors
     /// Returns error on `SQLite` or IO failure.
     pub fn clear(&self, archive_path: Option<&Path>) -> Result<(), StorageError> {
-        if let Some(archive) = archive_path {
-            if self.db_path.to_str() != Some(":memory:") {
-                if let Some(parent) = archive.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(&self.db_path, archive)?;
-            }
-        }
         let conn = self
             .write_conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(archive) = archive_path {
+            if let Some(parent) = archive.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            if archive.exists() {
+                return Err(StorageError::ArchiveExists(archive.to_path_buf()));
+            }
+            // `VACUUM INTO` writes a consistent snapshot including everything
+            // still sitting in the write-ahead log. A plain file copy would
+            // silently drop the newest lines.
+            let target = archive.to_string_lossy().replace('\'', "''");
+            conn.execute_batch(&format!("VACUUM INTO '{target}';"))?;
+        }
+
         conn.execute_batch("DELETE FROM lines; VACUUM;")?;
         drop(conn);
         Ok(())
+    }
+
+    /// Scan lines from `start_id` upwards, keeping those the predicate accepts.
+    ///
+    /// Reads in pages instead of pulling a fixed multiple of `limit` into
+    /// memory, so a match far into a large buffer is still found. The returned
+    /// flag reports whether scanning stopped at `max_scan` before the buffer
+    /// was exhausted, which lets callers say "no match in the range scanned"
+    /// instead of implying "no match at all".
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` failure.
+    pub fn scan_filtered(
+        &self,
+        start_id: i64,
+        time_range: Option<TimeRange>,
+        limit: u32,
+        max_scan: u64,
+        keep: &dyn Fn(&StoredLine) -> bool,
+    ) -> Result<(Vec<StoredLine>, bool), StorageError> {
+        const PAGE: u32 = 4096;
+
+        let mut found = Vec::new();
+        let mut cursor = start_id;
+        let mut scanned: u64 = 0;
+
+        loop {
+            if found.len() >= limit as usize {
+                return Ok((found, false));
+            }
+            if scanned >= max_scan {
+                return Ok((found, true));
+            }
+
+            let page = self.read_lines(cursor, PAGE)?;
+            if page.is_empty() {
+                return Ok((found, false));
+            }
+
+            for line in page {
+                cursor = line.id + 1;
+                scanned += 1;
+                let in_range = time_range.is_none_or(|tr| {
+                    line.timestamp_ns >= tr.start_ns && line.timestamp_ns <= tr.end_ns
+                });
+                if in_range && keep(&line) {
+                    found.push(line);
+                    if found.len() >= limit as usize {
+                        return Ok((found, false));
+                    }
+                }
+            }
+        }
     }
 
     /// Export a range of lines by ID (inclusive).
@@ -349,13 +418,7 @@ impl SqliteStorage {
             "SELECT id, timestamp_ns, payload FROM lines \
              WHERE id >= ?1 AND id <= ?2 ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![start_id, end_id], |row| {
-            Ok(StoredLine {
-                id: row.get(0)?,
-                timestamp_ns: row.get(1)?,
-                payload: row.get(2)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![start_id, end_id], map_row)?;
         let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
         drop(stmt);
         drop(conn);
@@ -429,6 +492,15 @@ impl SqliteStorage {
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
+}
+
+/// Map a `(id, timestamp_ns, payload)` row onto a [`StoredLine`].
+fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredLine> {
+    Ok(StoredLine {
+        id: row.get(0)?,
+        timestamp_ns: row.get(1)?,
+        payload: row.get(2)?,
+    })
 }
 
 #[cfg(test)]

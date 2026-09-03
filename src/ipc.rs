@@ -1,113 +1,124 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
-//! IPC server and client for background daemon communication.
+//! Newline-delimited JSON-RPC over the local [`crate::transport`].
 //!
-//! Uses Unix Domain Sockets on POSIX systems with newline-delimited JSON-RPC framing.
+//! Framing and dispatch are written once and are platform independent; the
+//! transport decides whether that is a Unix domain socket or a Windows named
+//! pipe.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::engine::CommandEngine;
+use crate::paths;
 use crate::protocol::{RequestPayload, ResponsePayload, RpcRequest, RpcResponse};
+use crate::transport;
 
-/// Default location for the devserial daemon IPC socket.
+/// Largest request line the daemon accepts, to bound memory per connection.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default time a client waits for a response.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an auto-spawned daemon may take to become reachable.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default location for the devserial daemon IPC endpoint.
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME").map_or_else(
-            || PathBuf::from("./devserial.sock"),
-            |h| PathBuf::from(h).join("Library/Application Support/devserial/devserial.sock"),
-        )
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|r| PathBuf::from(r).join("devserial.sock"))
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join(".local/state/devserial/devserial.sock"))
-            })
-            .unwrap_or_else(|| PathBuf::from("/tmp/devserial.sock"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        std::env::temp_dir().join("devserial.sock")
-    }
+    paths::default_socket_path()
 }
 
 /// Default location for the devserial daemon PID file.
 #[must_use]
 pub fn default_pid_path() -> PathBuf {
-    let mut sock = default_socket_path();
-    sock.set_extension("pid");
-    sock
+    paths::pid_path(&paths::default_socket_path())
+}
+
+/// Default location for the devserial GUI multiplexer endpoint.
+#[must_use]
+pub fn default_gui_socket_path() -> PathBuf {
+    paths::default_gui_socket_path()
+}
+
+/// Errors surfaced to clients of the daemon.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcError {
+    #[error("cannot reach the devserial daemon on {endpoint}: {source}")]
+    Connect {
+        endpoint: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("the daemon did not answer within {0:?}")]
+    Timeout(Duration),
+    #[error("malformed response from daemon: {0}")]
+    Protocol(String),
+    #[error("{0}")]
+    Remote(String),
+    #[error("could not start the daemon: {0}")]
+    Spawn(String),
+    #[error("the daemon is not available on this platform: {0}")]
+    Unsupported(String),
 }
 
 /// The IPC server running in the daemon process.
 pub struct IpcServer {
     engine: CommandEngine,
-    socket_path: PathBuf,
+    endpoint: PathBuf,
     pid_path: PathBuf,
 }
 
 impl IpcServer {
     /// Create a new IPC server.
     #[must_use]
-    pub const fn new(engine: CommandEngine, socket_path: PathBuf, pid_path: PathBuf) -> Self {
+    pub const fn new(engine: CommandEngine, endpoint: PathBuf, pid_path: PathBuf) -> Self {
         Self {
             engine,
-            socket_path,
+            endpoint,
             pid_path,
         }
     }
 
-    /// Run the IPC server accept loop until shutdown signal.
+    /// Run the accept loop until the shutdown signal fires.
     ///
     /// # Errors
-    /// Returns error if socket cannot be created or bound.
-    #[cfg(unix)]
+    /// Returns an error if the endpoint cannot be bound.
     pub async fn run(
         &self,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<(), std::io::Error> {
-        // Ensure parent directory exists
-        if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let mut listener = transport::Listener::bind(&self.endpoint).await?;
 
-        // Clean up stale socket file if daemon is not actually running
-        if self.socket_path.exists() {
-            if let Ok(mut stream) = UnixStream::connect(&self.socket_path).await {
-                // Another daemon is actively listening!
-                let _ = stream.shutdown().await;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "daemon is already running at {}",
-                        self.socket_path.display()
-                    ),
-                ));
-            }
-            std::fs::remove_file(&self.socket_path)?;
+        if let Some(parent) = self.pid_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = paths::create_private_dir(parent);
         }
-
-        // Write PID file
         let pid = std::process::id();
-        std::fs::write(&self.pid_path, pid.to_string())?;
+        if let Err(e) = std::fs::write(&self.pid_path, pid.to_string()) {
+            tracing::warn!(path = %self.pid_path.display(), error = %e, "could not write PID file");
+        }
 
-        let listener = UnixListener::bind(&self.socket_path)?;
-        tracing::info!(socket = %self.socket_path.display(), pid = pid, "IPC server listening");
+        tracing::info!(
+            endpoint = %transport::describe(&self.endpoint),
+            pid,
+            "IPC server listening"
+        );
 
-        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        // Two ways to stop: the caller's signal, and a client asking for
+        // shutdown over the wire. The second receiver has to be subscribed
+        // here; without it a `Shutdown` request was acknowledged and then
+        // silently ignored, leaving the daemon running.
+        let (shutdown_tx, mut requested_rx) = broadcast::channel::<()>(1);
 
         loop {
             tokio::select! {
@@ -115,240 +126,317 @@ impl IpcServer {
                     tracing::info!("IPC server received shutdown signal");
                     break;
                 }
-                accept_res = listener.accept() => {
-                    match accept_res {
-                        Ok((stream, _addr)) => {
+                _ = requested_rx.recv() => {
+                    tracing::info!("client requested shutdown");
+                    break;
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok(stream) => {
                             let engine = self.engine.clone();
-                            let shutdown_notifier = shutdown_tx.clone();
+                            let notifier = shutdown_tx.clone();
                             tokio::spawn(async move {
-                                handle_client_connection(stream, engine, shutdown_notifier).await;
+                                serve_connection(stream, engine, notifier).await;
                             });
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "IPC accept failed");
-                        }
+                        Err(e) => tracing::warn!(error = %e, "IPC accept failed"),
                     }
                 }
             }
         }
 
-        // Cleanup socket & PID file
-        let _ = std::fs::remove_file(&self.socket_path);
+        transport::cleanup(&self.endpoint);
         let _ = std::fs::remove_file(&self.pid_path);
-
         Ok(())
-    }
-
-    /// Run the IPC server accept loop (fallback on non-unix).
-    ///
-    /// # Errors
-    /// Returns unsupported error.
-    #[cfg(not(unix))]
-    pub async fn run(&self, _shutdown_rx: broadcast::Receiver<()>) -> Result<(), std::io::Error> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "daemon IPC requires a Unix platform",
-        ))
     }
 }
 
-#[cfg(unix)]
-async fn handle_client_connection(
-    stream: UnixStream,
-    engine: CommandEngine,
-    shutdown_notifier: broadcast::Sender<()>,
-) {
-    let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
+/// Serve one client connection until it closes or requests shutdown.
+async fn serve_connection<S>(stream: S, engine: CommandEngine, shutdown: broadcast::Sender<()>)
+where
+    S: tokio::io::AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
 
     loop {
-        line.clear();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let req: RpcRequest = match serde_json::from_str(trimmed) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let err_resp = RpcResponse {
-                            id: 0,
-                            result: Err(format!("invalid JSON-RPC request: {e}")),
-                        };
-                        if let Ok(mut json) = serde_json::to_string(&err_resp) {
-                            json.push('\n');
-                            let _ = writer.write_all(json.as_bytes()).await;
-                        }
-                        continue;
-                    }
-                };
-
-                let req_id = req.id;
-                let is_shutdown = matches!(req.payload, RequestPayload::Shutdown);
-
-                let result = engine.execute(req.payload).await;
-
-                let resp = RpcResponse { id: req_id, result };
-
-                if let Ok(mut json) = serde_json::to_string(&resp) {
-                    json.push('\n');
-                    if writer.write_all(json.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-
-                if is_shutdown {
-                    let _ = shutdown_notifier.send(());
-                    break;
-                }
-            }
+        let frame = match read_frame(&mut reader, MAX_FRAME_BYTES).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
             Err(e) => {
                 tracing::debug!(error = %e, "IPC connection read error");
                 break;
             }
+        };
+
+        let text = String::from_utf8_lossy(&frame);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let request: RpcRequest = match serde_json::from_str(trimmed) {
+            Ok(request) => request,
+            Err(e) => {
+                let response = RpcResponse {
+                    id: 0,
+                    result: Err(format!("invalid JSON-RPC request: {e}")),
+                };
+                if write_frame(&mut writer, &response).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let id = request.id;
+        let is_shutdown = matches!(request.payload, RequestPayload::Shutdown);
+        let result = engine
+            .execute(request.payload)
+            .await
+            .map_err(|e| e.to_string());
+
+        if write_frame(&mut writer, &RpcResponse { id, result })
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        if is_shutdown {
+            let _ = shutdown.send(());
+            break;
         }
     }
+}
+
+/// Read one newline-delimited frame, refusing oversized input.
+async fn read_frame<R>(reader: &mut R, max_bytes: usize) -> Result<Option<Vec<u8>>, std::io::Error>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if out.is_empty() { None } else { Some(out) });
+        }
+        if let Some(index) = available.iter().position(|b| *b == b'\n') {
+            out.extend_from_slice(&available[..index]);
+            reader.consume(index + 1);
+            return Ok(Some(out));
+        }
+        let len = available.len();
+        out.extend_from_slice(available);
+        reader.consume(len);
+        if out.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame exceeds {max_bytes} bytes"),
+            ));
+        }
+    }
+}
+
+/// Write one newline-delimited JSON frame.
+async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize + Sync,
+{
+    let mut json = serde_json::to_string(value).map_err(std::io::Error::other)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await
 }
 
 /// IPC client to communicate with a running devserial daemon.
 #[derive(Debug, Clone)]
 pub struct IpcClient {
-    socket_path: PathBuf,
+    endpoint: PathBuf,
     next_id: Arc<AtomicU64>,
+    timeout: Duration,
+    config_path: Option<PathBuf>,
 }
 
 impl IpcClient {
-    /// Create a new IPC client for the given socket path.
+    /// Create a new IPC client for the given endpoint.
     #[must_use]
-    pub fn new(socket_path: PathBuf) -> Self {
+    pub fn new(endpoint: PathBuf) -> Self {
         Self {
-            socket_path,
+            endpoint,
             next_id: Arc::new(AtomicU64::new(1)),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            config_path: None,
         }
     }
 
-    /// Check if the daemon is currently running and responding to pings.
+    /// Set the response timeout.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Pass a configuration file on to an auto-spawned daemon.
+    #[must_use]
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.config_path = path;
+        self
+    }
+
+    /// The endpoint this client talks to.
+    #[must_use]
+    pub fn endpoint(&self) -> &Path {
+        &self.endpoint
+    }
+
+    /// Check whether a daemon is listening and answering.
     pub async fn is_alive(&self) -> bool {
-        #[cfg(unix)]
-        {
-            matches!(
-                self.send(RequestPayload::Ping).await,
-                Ok(ResponsePayload::Pong)
-            )
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        matches!(
+            self.send(RequestPayload::Ping).await,
+            Ok(ResponsePayload::Pong)
+        )
     }
 
     /// Send a request payload to the daemon and receive the response.
     ///
     /// # Errors
-    /// Returns error if communication fails or daemon returns an error.
-    #[cfg(unix)]
-    pub async fn send(&self, payload: RequestPayload) -> Result<ResponsePayload, String> {
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            format!(
-                "failed to connect to daemon socket at {}: {e}",
-                self.socket_path.display()
-            )
-        })?;
+    /// Returns an error if the daemon is unreachable, times out, or reports a
+    /// failure.
+    pub async fn send(&self, payload: RequestPayload) -> Result<ResponsePayload, IpcError> {
+        tokio::time::timeout(self.timeout, self.exchange(payload))
+            .await
+            .unwrap_or(Err(IpcError::Timeout(self.timeout)))
+    }
+
+    async fn exchange(&self, payload: RequestPayload) -> Result<ResponsePayload, IpcError> {
+        let stream =
+            transport::connect(&self.endpoint)
+                .await
+                .map_err(|source| IpcError::Connect {
+                    endpoint: transport::describe(&self.endpoint),
+                    source,
+                })?;
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let req = RpcRequest { id, payload };
+        let (reader, mut writer) = tokio::io::split(stream);
+        write_frame(&mut writer, &RpcRequest { id, payload }).await?;
 
-        let mut req_json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-        req_json.push('\n');
+        let mut reader = BufReader::new(reader);
+        let frame = read_frame(&mut reader, MAX_FRAME_BYTES)
+            .await?
+            .ok_or_else(|| IpcError::Protocol("daemon closed the connection".to_string()))?;
 
-        let (reader, mut writer) = stream.into_split();
-        writer
-            .write_all(req_json.as_bytes())
-            .await
-            .map_err(|e| format!("IPC write error: {e}"))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| format!("IPC flush error: {e}"))?;
+        let text = String::from_utf8_lossy(&frame);
+        let response: RpcResponse = serde_json::from_str(text.trim())
+            .map_err(|e| IpcError::Protocol(format!("{e} (raw: {text:?})")))?;
 
-        let mut buf_reader = BufReader::new(reader);
-        let mut line = String::new();
-        buf_reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("IPC read error: {e}"))?;
-
-        if line.is_empty() {
-            return Err("daemon closed connection unexpectedly".to_string());
-        }
-
-        let resp: RpcResponse = serde_json::from_str(line.trim())
-            .map_err(|e| format!("invalid response from daemon: {e} (raw: {line:?})"))?;
-
-        resp.result
+        response.result.map_err(IpcError::Remote)
     }
 
-    /// Send a request payload to the daemon (fallback on non-unix).
+    /// Ensure the daemon is running, spawning it in the background if needed.
     ///
     /// # Errors
-    /// Returns error on non-unix.
-    #[cfg(not(unix))]
-    pub async fn send(&self, _payload: RequestPayload) -> Result<ResponsePayload, String> {
-        Err("daemon IPC requires a Unix platform".to_string())
-    }
-
-    /// Ensure the daemon is running, auto-spawning it in background if necessary.
-    ///
-    /// # Errors
-    /// Returns error if daemon cannot be spawned or fails to become ready within timeout.
-    #[cfg(unix)]
-    pub async fn ensure_daemon(&self) -> Result<(), String> {
+    /// Returns an error if the daemon cannot be spawned or does not become
+    /// reachable in time.
+    pub async fn ensure_daemon(&self) -> Result<(), IpcError> {
         if self.is_alive().await {
             return Ok(());
         }
 
         let exe = std::env::current_exe()
-            .map_err(|e| format!("failed to get current executable: {e}"))?;
+            .map_err(|e| IpcError::Spawn(format!("cannot locate the devserial binary: {e}")))?;
 
-        tracing::info!(socket = %self.socket_path.display(), "auto-spawning devserial daemon...");
+        tracing::info!(
+            endpoint = %transport::describe(&self.endpoint),
+            "starting devserial daemon in the background"
+        );
 
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("daemon")
             .arg("--socket")
-            .arg(&self.socket_path)
+            .arg(&self.endpoint)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        cmd.spawn()
-            .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+        if let Some(config) = &self.config_path {
+            cmd.env(paths::ENV_CONFIG, config);
+        }
 
-        // Wait with backoff up to 2.5s
-        for _ in 0..100 {
+        // Windows needs two things Stdio::null() does not provide.
+        //
+        // Stdio::null() redirects the daemon's own three handles. It does not
+        // stop the daemon from inheriting the handles this process holds, and
+        // CreateProcess passes on every handle marked inheritable. When
+        // devserial's own output is a pipe, the daemon inherits the write end
+        // and keeps it open for its whole life. Whoever reads that pipe then
+        // waits for an end-of-file that never comes: `devserial stats COM3 |
+        // more` did not return, and the CLI test that auto-starts the daemon
+        // hung for as long as it was allowed to. Clearing the inheritance flag
+        // before the spawn is the fix; there is no safe std API for it.
+        //
+        // DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP are separate and
+        // independent: a child otherwise shares the console and the process
+        // group, so Ctrl+C in the terminal would also reach a daemon that is
+        // meant to outlive the command.
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, RawHandle};
+            use std::os::windows::process::CommandExt;
+
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+            // The only unsafe in this module, and the second in the crate
+            // after the macOS integration in platform.rs. Declared locally
+            // rather than through a dependency, for the same reason as there.
+            #[allow(unsafe_code)]
+            unsafe extern "system" {
+                fn SetHandleInformation(handle: RawHandle, mask: u32, flags: u32) -> i32;
+            }
+
+            #[allow(unsafe_code)]
+            fn stop_inheriting(handle: RawHandle) {
+                if handle.is_null() {
+                    return;
+                }
+                // SAFETY: the handle comes from the standard library's own std
+                // stream and is valid for the life of the process. The call
+                // only clears an inheritance flag on it and cannot invalidate
+                // it. A failure is not actionable here: the spawn still works,
+                // the daemon merely keeps inheriting, so the return value is
+                // deliberately dropped.
+                let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+
+            stop_inheriting(std::io::stdin().as_raw_handle());
+            stop_inheriting(std::io::stdout().as_raw_handle());
+            stop_inheriting(std::io::stderr().as_raw_handle());
+
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+
+        cmd.spawn()
+            .map_err(|e| IpcError::Spawn(format!("could not spawn the daemon: {e}")))?;
+
+        let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
             if self.is_alive().await {
-                tracing::info!("daemon is ready!");
+                tracing::info!("daemon is ready");
                 return Ok(());
             }
         }
 
-        Err("daemon auto-spawn timed out after 2.5s".to_string())
-    }
-
-    /// Ensure the daemon is running (fallback on non-unix).
-    ///
-    /// # Errors
-    /// Returns error on non-unix.
-    #[cfg(not(unix))]
-    pub async fn ensure_daemon(&self) -> Result<(), String> {
-        Err("daemon IPC requires a Unix platform".to_string())
+        Err(IpcError::Spawn(format!(
+            "the daemon did not become reachable within {DAEMON_START_TIMEOUT:?}"
+        )))
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -356,60 +444,133 @@ mod tests {
     use crate::state::StateDb;
     use std::sync::Mutex;
 
-    #[tokio::test]
-    async fn test_ipc_ping_pong() {
-        let _ = std::fs::create_dir_all("./target/tmp");
-        let dir = tempfile::Builder::new().tempdir_in("./target/tmp").unwrap();
-        let socket_path = dir.path().join("test_daemon.sock");
-        let pid_path = dir.path().join("test_daemon.pid");
+    struct Harness {
+        client: IpcClient,
+        shutdown: broadcast::Sender<()>,
+        _dir: tempfile::TempDir,
+    }
 
-        let pm = PortManagerHandle::new();
-        let state_db = Arc::new(Mutex::new(StateDb::open_memory().unwrap()));
-        let config = Arc::new(Config::default());
-        let engine = CommandEngine::new(pm, state_db, config, dir.path().to_path_buf());
+    async fn harness(name: &str) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join(format!("{name}.sock"));
+        let pid_path = dir.path().join(format!("{name}.pid"));
 
-        let server = IpcServer::new(engine, socket_path.clone(), pid_path.clone());
-        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+        let mut config = Config::default();
+        config.global.data_dir = dir.path().to_path_buf();
+        config.global.archive_dir = dir.path().join("archive");
 
+        let engine = CommandEngine::new(
+            PortManagerHandle::new(),
+            Arc::new(Mutex::new(StateDb::open_memory().unwrap())),
+            Arc::new(config),
+        );
+
+        let server = IpcServer::new(engine, endpoint.clone(), pid_path);
+        let (shutdown, shutdown_rx) = broadcast::channel::<()>(1);
         tokio::spawn(async move {
             let _ = server.run(shutdown_rx).await;
         });
 
-        // Wait for server to bind
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let client = IpcClient::new(endpoint).with_timeout(Duration::from_secs(5));
+        for _ in 0..100 {
+            if client.is_alive().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
-        let client = IpcClient::new(socket_path);
-        let resp = client.send(RequestPayload::Ping).await.unwrap();
+        Harness {
+            client,
+            shutdown,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ipc_ping_pong() {
+        let h = harness("ping").await;
+        let resp = h.client.send(RequestPayload::Ping).await.unwrap();
         assert_eq!(resp, ResponsePayload::Pong);
-
-        let _ = shutdown_tx.send(());
+        let _ = h.shutdown.send(());
     }
 
     #[tokio::test]
     async fn test_ipc_list_ports_empty() {
-        let _ = std::fs::create_dir_all("./target/tmp");
-        let dir = tempfile::Builder::new().tempdir_in("./target/tmp").unwrap();
-        let socket_path = dir.path().join("test_list.sock");
-        let pid_path = dir.path().join("test_list.pid");
-
-        let pm = PortManagerHandle::new();
-        let state_db = Arc::new(Mutex::new(StateDb::open_memory().unwrap()));
-        let config = Arc::new(Config::default());
-        let engine = CommandEngine::new(pm, state_db, config, dir.path().to_path_buf());
-
-        let server = IpcServer::new(engine, socket_path.clone(), pid_path.clone());
-        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-
-        tokio::spawn(async move {
-            let _ = server.run(shutdown_rx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let client = IpcClient::new(socket_path);
-        let resp = client.send(RequestPayload::ListPorts).await.unwrap();
+        let h = harness("list").await;
+        let resp = h.client.send(RequestPayload::ListPorts).await.unwrap();
         assert_eq!(resp, ResponsePayload::PortList(vec![]));
+        let _ = h.shutdown.send(());
+    }
 
-        let _ = shutdown_tx.send(());
+    #[tokio::test]
+    async fn engine_errors_reach_the_client_as_messages() {
+        let h = harness("err").await;
+        let err = h
+            .client
+            .send(RequestPayload::GetStats {
+                port: "/dev/absent".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IpcError::Remote(_)));
+        assert!(err.to_string().contains("not found"));
+        let _ = h.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_request_actually_stops_the_server() {
+        let h = harness("stop").await;
+        assert!(h.client.is_alive().await);
+
+        let ack = h.client.send(RequestPayload::Shutdown).await.unwrap();
+        assert_eq!(ack, ResponsePayload::ShutdownAck);
+
+        for _ in 0..100 {
+            if !h.client.is_alive().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the server kept accepting connections after a shutdown request");
+    }
+
+    #[tokio::test]
+    async fn unreachable_endpoint_is_reported_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            IpcClient::new(dir.path().join("absent.sock")).with_timeout(Duration::from_millis(500));
+        let err = client.send(RequestPayload::Ping).await.unwrap_err();
+        assert!(matches!(err, IpcError::Connect { .. }));
+        assert!(!client.is_alive().await);
+    }
+
+    #[tokio::test]
+    async fn oversized_frames_are_refused() {
+        let mut reader = BufReader::new(&b"aaaaaaaaaaaaaaaa"[..]);
+        let err = read_frame(&mut reader, 4).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn frames_split_on_newlines() {
+        let mut reader = BufReader::new(&b"one\ntwo\n"[..]);
+        assert_eq!(
+            read_frame(&mut reader, 1024).await.unwrap().unwrap(),
+            b"one".to_vec()
+        );
+        assert_eq!(
+            read_frame(&mut reader, 1024).await.unwrap().unwrap(),
+            b"two".to_vec()
+        );
+        assert!(read_frame(&mut reader, 1024).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_trailing_frame_without_newline_is_still_returned() {
+        let mut reader = BufReader::new(&b"tail"[..]);
+        assert_eq!(
+            read_frame(&mut reader, 1024).await.unwrap().unwrap(),
+            b"tail".to_vec()
+        );
     }
 }

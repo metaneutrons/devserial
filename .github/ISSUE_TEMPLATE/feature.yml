@@ -1,0 +1,62 @@
+name: Feature request
+description: Something devserial should be able to do and cannot
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do, and where does devserial stop being useful?
+        Describe the situation rather than the solution; the solution is easier
+        to judge once the problem is clear.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today instead
+      description: >
+        Another tool, a shell pipeline, a manual step. If there is no workaround
+        at all, say so; that is useful information.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface it belongs to
+      description: >
+        Operations live in one place and every surface is a transport over them,
+        so a feature usually lands in all of them at once. Pick where you would
+        use it.
+      multiple: true
+      options:
+        - CLI
+        - MCP server
+        - background daemon
+        - GUI monitor
+        - terminal monitor (TUI)
+        - packaging or installation
+    validations:
+      required: true
+
+  - type: textarea
+    id: shape
+    attributes:
+      label: How you imagine it
+      description: >
+        Optional. A command line, an MCP tool call, a config key. A concrete
+        sketch is easier to argue about than a description.
+      placeholder: devserial watch /dev/cu.usbserial-1420 --pattern 'ERROR .*'
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: >
+            This is about talking to serial hardware or about the capture of
+            that traffic, not about a different protocol or transport.
+          required: true

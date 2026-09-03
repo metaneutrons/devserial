@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 use std::io;
@@ -126,10 +126,10 @@ impl AsyncRead for MockSerial {
             Poll::Ready(Some(data)) => {
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
-                if to_copy < data.len() {
-                    if let Ok(mut pending) = this.pending_buf.try_lock() {
-                        pending.extend_from_slice(&data[to_copy..]);
-                    }
+                if to_copy < data.len()
+                    && let Ok(mut pending) = this.pending_buf.try_lock()
+                {
+                    pending.extend_from_slice(&data[to_copy..]);
                 }
                 Poll::Ready(Ok(()))
             }

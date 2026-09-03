@@ -1,64 +1,47 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
-//! MCP server execution service (stdio transport).
+//! MCP server execution over standard I/O.
 
-use crate::config::load_config;
-use crate::port_manager::PortManagerHandle;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use crate::cli::{CliError, bootstrap};
+use crate::engine::CommandEngine;
+use crate::server::DevSerialServer;
 use crate::state::StateDb;
 
-/// Run the MCP server over standard I/O until connection closes.
+/// Run the MCP server until the client disconnects.
 ///
 /// # Errors
-/// Returns error on initialization or serving failure.
-pub fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            use rmcp::{ServiceExt, transport::stdio};
-            use tracing_subscriber::EnvFilter;
+/// Returns an error on initialization or serving failure.
+pub fn run_mcp(config_path: Option<&Path>) -> Result<(), CliError> {
+    let startup = bootstrap::start(config_path, "mcp")?;
+    let config = Arc::clone(&startup.config);
 
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
-                )
-                .with_writer(std::io::stderr)
-                .with_ansi(false)
-                .init();
+    startup.runtime.block_on(async move {
+        use rmcp::{ServiceExt, transport::stdio};
 
-            tracing::info!("Starting DevSerial MCP Server");
+        let port_manager = bootstrap::port_manager(&config);
+        let state_db = Arc::new(Mutex::new(
+            StateDb::open(&config.global.data_dir).map_err(|e| CliError::msg(e.to_string()))?,
+        ));
 
-            let config = load_config(None).unwrap_or_default();
-            tracing::info!(data_dir = %config.global.data_dir.display(), "config loaded");
+        let restored = bootstrap::restore_ports(&port_manager, &state_db, &config).await;
+        if restored > 0 {
+            tracing::info!(restored, "restored previously open ports");
+        }
 
-            let port_manager = PortManagerHandle::new();
+        let engine = CommandEngine::new(port_manager, state_db, config);
+        let service = DevSerialServer::new(engine)
+            .serve(stdio())
+            .await
+            .map_err(|e| CliError::msg(format!("MCP transport error: {e}")))?;
 
-            // Restore previously open ports
-            let restored_ports = StateDb::open(&config.global.data_dir).map_or_else(
-                |_| Vec::new(),
-                |state_db| state_db.active_ports().unwrap_or_default(),
-            );
-
-            for entry in restored_ports {
-                let data_dir = config.global.data_dir.clone();
-                match port_manager
-                    .open_serial(entry.name.clone(), entry.config.clone(), data_dir)
-                    .await
-                {
-                    Ok(()) => tracing::info!(port = %entry.name, "restored port"),
-                    Err(e) => {
-                        tracing::warn!(port = %entry.name, error = %e, "failed to restore port (will retry on next start)");
-                    }
-                }
-            }
-
-            let server = crate::server::DevSerialServer::new(port_manager, config);
-            let service = server.serve(stdio()).await.inspect_err(|e| {
-                tracing::error!("serving error: {:?}", e);
-            })?;
-
-            service.waiting().await?;
-            Ok(())
-        })
+        service
+            .waiting()
+            .await
+            .map_err(|e| CliError::msg(format!("MCP session error: {e}")))?;
+        Ok(())
+    })
 }

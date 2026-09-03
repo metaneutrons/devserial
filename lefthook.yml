@@ -1,0 +1,48 @@
+# Hooks sind schnelle Rueckmeldung, keine Durchsetzung. Jede Pruefung hier hat
+# eine Entsprechung im CI-Workflow; `git commit --no-verify` umgeht die Hooks,
+# nicht die CI.
+#
+# Installation:
+#   brew install lefthook gitleaks
+#   just setup
+#
+# Die Skripte unter scripts/hooks/ sind managerunabhaengig und funktionieren
+# auch unter core.hooksPath oder husky.
+
+commit-msg:
+  commands:
+    conventional-commits:
+      # {1} ist der Pfad zur Commit-Nachricht.
+      run: sh scripts/hooks/check-commit-message.sh {1}
+
+pre-commit:
+  parallel: true
+  commands:
+    staged-guards:
+      run: sh scripts/hooks/check-staged.sh
+    secrets:
+      run: gitleaks git --pre-commit --redact --staged --verbose
+    # Nur Formatierung: clippy kompiliert und sprengt das pre-commit-Budget.
+    format:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+
+pre-push:
+  parallel: false
+  commands:
+    secrets:
+      run: sh scripts/hooks/check-push-secrets.sh
+    # Gemessen am 3. September 2026 auf dem Arbeitsrechner, nach einer
+    # Quelländerung und mit warmem Cache: 5 s. Damit deutlich unter dem
+    # 30-s-Budget.
+    clippy:
+      # --all-features bewusst weggelassen, das erzwingt einen vollstaendigen
+      # Neubau. Die vollstaendige Matrix laeuft in der CI.
+      run: cargo clippy --all-targets -- -D warnings
+    # Aus, und zwar begruendet: der Testlauf selbst dauert 3 s, der dafuer
+    # noetige Neubau des Testprofils aber 23 s. Zusammen mit clippy waere das
+    # pre-push bei etwa 28 s und damit ohne Reserve am Budget. Die Tests laufen
+    # in der CI auf drei Betriebssystemen.
+    tests:
+      run: cargo nextest run
+      skip: true

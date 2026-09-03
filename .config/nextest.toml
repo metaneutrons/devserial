@@ -1,0 +1,9 @@
+# A hung test must fail, not run until the job's six-hour limit. The Windows
+# named-pipe transport had never been executed before this matrix existed, and
+# its first run blocked both Windows cells for over an hour with no diagnostic
+# beyond "in progress". With a terminating timeout, nextest names the test.
+#
+# The whole suite takes about three seconds locally and the slowest single test
+# under two, so sixty seconds is generous rather than tight.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 2 }

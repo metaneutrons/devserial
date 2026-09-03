@@ -1,0 +1,41 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: devserial
+Upstream-Contact: metaneutrons <metaneutrons@users.noreply.github.com>
+Source: https://github.com/metaneutrons/devserial
+
+Files: *
+Copyright: 2026 Fabian Schmieder
+License: GPL-3.0-or-later
+Comment: Releases 0.1.1 through 0.1.4 were distributed under GPL-3.0-only.
+ Whoever received one of those keeps those terms for that version; the change
+ to GPL-3.0-or-later applies from the next release onwards.
+
+Files: resources/fonts/JetBrainsMono-Regular.ttf
+Copyright: 2020 The JetBrains Mono Project Authors
+License: OFL-1.1
+
+License: GPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation, either version 3 of the License, or (at your option) any later
+ version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License version
+ 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: OFL-1.1
+ This Font Software is licensed under the SIL Open Font License, Version 1.1.
+ The complete text is shipped as
+ /usr/share/doc/devserial/licenses/OFL-1.1.txt and is also available at
+ https://openfontlicense.org
+ .
+ The binary additionally embeds Noto Emoji (OFL-1.1, Copyright 2013 Google
+ Inc.), Ubuntu Light (UFL-1.0, Copyright 2011 Canonical Ltd.), Hack (MIT,
+ Copyright 2018 Source Foundry Authors) and emoji-icon-font (MIT, Copyright
+ 2014 John Slegers) by way of the epaint_default_fonts crate. Their notices
+ and licence texts are in /usr/share/doc/devserial/THIRD-PARTY-NOTICES.md and
+ /usr/share/doc/devserial/licenses/.
