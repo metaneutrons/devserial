@@ -226,7 +226,7 @@ mod windows {
         ///
         /// # Errors
         /// Returns `AddrInUse` if another daemon already owns the pipe.
-        #[allow(clippy::unused_async)]
+        #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
         pub async fn bind(endpoint: &Path) -> io::Result<Self> {
             let name = pipe_name(endpoint);
             let pending = ServerOptions::new()
@@ -360,7 +360,7 @@ mod unsupported {
         ///
         /// # Errors
         /// Always returns `Unsupported`.
-        #[allow(clippy::unused_async)]
+        #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
         pub async fn bind(_endpoint: &Path) -> io::Result<Self> {
             Err(unsupported())
         }
@@ -369,7 +369,7 @@ mod unsupported {
         ///
         /// # Errors
         /// Always returns `Unsupported`.
-        #[allow(clippy::unused_async)]
+        #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
         pub async fn accept(&mut self) -> io::Result<ServerStream> {
             Err(unsupported())
         }
