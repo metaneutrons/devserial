@@ -37,8 +37,10 @@ updates:
       time: '05:15'
     open-pull-requests-limit: 5
     cooldown:
+      # semver-major-days does not apply to this ecosystem: Dependabot rejects
+      # the whole file when it appears here, and then every update stops
+      # silently. Observed on another repository of this owner.
       default-days: 3
-      semver-major-days: 7
     groups:
       github-actions-minor-patch:
         patterns: ['*']

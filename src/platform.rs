@@ -154,9 +154,18 @@ use macos as imp;
 #[cfg(not(target_os = "macos"))]
 use fallback as imp;
 
+// The four wrappers below cannot be const: on macOS `imp` is the Objective-C
+// FFI. Off macOS `imp` is the no-op fallback, and clippy's nursery lint
+// `missing_const_for_fn` then rightly observes that the wrapper could be const
+// there. Marking them const would break the macOS build, and making the
+// attribute conditional on the target would put the platform split in two
+// places instead of one. The allow sits on each function so a fifth wrapper
+// does not inherit it silently.
+
 /// Initialize native application integration (dock icon, menus, about panel).
 ///
 /// Inert on platforms without native integration.
+#[allow(clippy::missing_const_for_fn)]
 pub fn init_app() {
     imp::init_app(crate::assets::ICON_PNG, env!("CARGO_PKG_VERSION"));
 }
@@ -166,6 +175,7 @@ pub fn init_app() {
 /// Returns `None` when the platform provides no native clipboard access; the
 /// GUI framework's own clipboard is used in that case.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn clipboard_text() -> Option<String> {
     imp::clipboard_text()
 }
@@ -174,11 +184,13 @@ pub fn clipboard_text() -> Option<String> {
 ///
 /// Returns `true` exactly once per menu activation.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn take_menu_request(request: MenuRequest) -> bool {
     imp::take_menu_request(request)
 }
 
 /// Publish the current edit state so native menu items enable and disable.
+#[allow(clippy::missing_const_for_fn)]
 pub fn update_edit_state(state: EditState) {
     imp::update_edit_state(state);
 }
