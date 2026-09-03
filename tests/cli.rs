@@ -23,9 +23,14 @@ impl Sandbox {
     }
 
     /// A devserial invocation that cannot touch production state.
+    ///
+    /// Every call carries a timeout. Without one a blocking invocation makes
+    /// the whole test hang, and the failure then names the test rather than
+    /// the call that blocked.
     fn command(&self) -> Command {
         let mut cmd = Command::cargo_bin("devserial").expect("binary");
-        cmd.env("DEVSERIAL_DATA_DIR", self.dir.path())
+        cmd.timeout(std::time::Duration::from_secs(20))
+            .env("DEVSERIAL_DATA_DIR", self.dir.path())
             .env("DEVSERIAL_SOCKET", self.dir.path().join("test.sock"))
             .env_remove("DEVSERIAL_CONFIG")
             // A stray configuration file in the working directory must not

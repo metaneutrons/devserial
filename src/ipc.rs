@@ -363,6 +363,22 @@ impl IpcClient {
         if let Some(config) = &self.config_path {
             cmd.env(paths::ENV_CONFIG, config);
         }
+
+        // On Windows a child stays attached to the parent's console and its
+        // process group by default. A daemon that outlives the command which
+        // started it must not: it would receive the console's Ctrl+C, and a
+        // caller reading the command's output can wait on handles the daemon
+        // still holds. DETACHED_PROCESS gives it no console,
+        // CREATE_NEW_PROCESS_GROUP takes it out of the group. Stdio::null()
+        // above only redirects its own three handles and does neither.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+
         cmd.spawn()
             .map_err(|e| IpcError::Spawn(format!("could not spawn the daemon: {e}")))?;
 

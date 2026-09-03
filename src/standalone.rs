@@ -447,11 +447,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_file = dir.path().join("devserial.toml");
         let data_dir = dir.path().join("captures");
-        std::fs::write(
-            &config_file,
-            format!("[global]\ndata_dir = \"{}\"\n", data_dir.display()),
-        )
-        .unwrap();
+        // The value is serialised rather than interpolated. A Windows path
+        // carries backslashes, and \U or \T is not a valid TOML escape, so
+        // interpolation produced a file that failed to parse; resolve_data_dir
+        // then fell back to the platform default and the assertion compared
+        // two unrelated paths.
+        let value = toml::Value::String(data_dir.to_string_lossy().into_owned());
+        std::fs::write(&config_file, format!("[global]\ndata_dir = {value}\n")).unwrap();
 
         assert_eq!(resolve_data_dir(Some(&config_file)), data_dir);
     }
