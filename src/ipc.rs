@@ -364,18 +364,57 @@ impl IpcClient {
             cmd.env(paths::ENV_CONFIG, config);
         }
 
-        // On Windows a child stays attached to the parent's console and its
-        // process group by default. A daemon that outlives the command which
-        // started it must not: it would receive the console's Ctrl+C, and a
-        // caller reading the command's output can wait on handles the daemon
-        // still holds. DETACHED_PROCESS gives it no console,
-        // CREATE_NEW_PROCESS_GROUP takes it out of the group. Stdio::null()
-        // above only redirects its own three handles and does neither.
+        // Windows needs two things Stdio::null() does not provide.
+        //
+        // Stdio::null() redirects the daemon's own three handles. It does not
+        // stop the daemon from inheriting the handles this process holds, and
+        // CreateProcess passes on every handle marked inheritable. When
+        // devserial's own output is a pipe, the daemon inherits the write end
+        // and keeps it open for its whole life. Whoever reads that pipe then
+        // waits for an end-of-file that never comes: `devserial stats COM3 |
+        // more` did not return, and the CLI test that auto-starts the daemon
+        // hung for as long as it was allowed to. Clearing the inheritance flag
+        // before the spawn is the fix; there is no safe std API for it.
+        //
+        // DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP are separate and
+        // independent: a child otherwise shares the console and the process
+        // group, so Ctrl+C in the terminal would also reach a daemon that is
+        // meant to outlive the command.
         #[cfg(windows)]
         {
+            use std::os::windows::io::{AsRawHandle, RawHandle};
             use std::os::windows::process::CommandExt;
+
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+            // The only unsafe in this module, and the second in the crate
+            // after the macOS integration in platform.rs. Declared locally
+            // rather than through a dependency, for the same reason as there.
+            #[allow(unsafe_code)]
+            unsafe extern "system" {
+                fn SetHandleInformation(handle: RawHandle, mask: u32, flags: u32) -> i32;
+            }
+
+            #[allow(unsafe_code)]
+            fn stop_inheriting(handle: RawHandle) {
+                if handle.is_null() {
+                    return;
+                }
+                // SAFETY: the handle comes from the standard library's own std
+                // stream and is valid for the life of the process. The call
+                // only clears an inheritance flag on it and cannot invalidate
+                // it. A failure is not actionable here: the spawn still works,
+                // the daemon merely keeps inheriting, so the return value is
+                // deliberately dropped.
+                let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+
+            stop_inheriting(std::io::stdin().as_raw_handle());
+            stop_inheriting(std::io::stdout().as_raw_handle());
+            stop_inheriting(std::io::stderr().as_raw_handle());
+
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
 

@@ -37,12 +37,19 @@ assets = [
 ]
 
 [lints.rust]
-# Der Normalfall des Standards ist "forbid". Hier abgesenkt auf "deny", weil
-# die macOS-Integration echtes unsafe braucht: das Anwendungsmenue, die
-# Zwischenablage und der Bearbeitungszustand laufen ueber Objective-C-FFI.
-# Jede Ausnahme ist auf platform.rs begrenzt, dort einzeln mit #[allow]
-# markiert und mit einer Begruendung versehen. Ein zweiter Ort mit unsafe ist
-# ein Defekt.
+# The standard's normal case is "forbid". Lowered to "deny" because two
+# platform integrations need real unsafe, and neither has a safe std API:
+#
+#   platform.rs  the macOS application menu, the clipboard and the edit state,
+#                over Objective-C FFI
+#   ipc.rs       SetHandleInformation on Windows, so the daemon does not
+#                inherit this process's pipe handles and keep them open for
+#                its whole life
+#
+# Both declare their FFI locally rather than through a dependency, mark every
+# call site with its own #[allow(unsafe_code)] and carry a SAFETY comment. A
+# third place needs the same justification or it is a defect: unsafe here is
+# for platform APIs the standard library does not expose, nothing else.
 unsafe_code = "deny"
 
 [lints.clippy]
