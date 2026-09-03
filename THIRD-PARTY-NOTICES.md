@@ -38,8 +38,9 @@ OFL-1.1 and UFL-1.0 both carry a reserved-font-name clause. A modified copy of
 one of these faces may not be distributed under its original name.
 
 The four texts under `licenses/` were taken verbatim from
-`epaint_default_fonts` 0.34.3 and are byte for byte identical to the copies
-that crate ships.
+`epaint_default_fonts` 0.36.1 and are byte for byte identical to the copies
+that crate ships. The four typeface files themselves are unchanged between
+0.34.3 and 0.36.1, so the versions named above still hold.
 
 ## Platform faces loaded at run time
 
