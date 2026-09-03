@@ -276,7 +276,7 @@ jobs:
           done
           echo "archive is complete and runnable"
 
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: archive-${{ matrix.target }}
           path: dist/*
@@ -356,7 +356,7 @@ jobs:
           test -f /usr/share/doc/devserial/THIRD-PARTY-NOTICES.md
           test -f /usr/share/doc/devserial/licenses/OFL-1.1.txt
           dpkg --verify devserial
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deb-${{ matrix.arch }}
           path: deb/*.deb
@@ -472,7 +472,7 @@ jobs:
           done
           echo "every payload attestation verifies"
 
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: signed-payloads
           path: payloads/*
@@ -577,7 +577,7 @@ jobs:
             packaging/devserial.rb
             packaging/devserial.PKGBUILD
             packaging/devserial-bin.PKGBUILD
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: packaging
           path: packaging/*
@@ -640,7 +640,7 @@ jobs:
           # The release set is the candidate list plus the checksum file itself.
           echo "asset_count=$(( expected + 1 ))" >> "$GITHUB_OUTPUT"
           echo "$expected assets plus SHA256SUMS"
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: candidate
           path: candidate/*
