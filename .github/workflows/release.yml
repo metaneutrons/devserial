@@ -814,6 +814,11 @@ jobs:
           pacman -U --noconfirm "$package"
           /usr/bin/devserial --version
           /usr/bin/devserial list >/dev/null
+
+          # The same promise the .deb and the binary package carry: the font
+          # notices travel with the binary that embeds the fonts.
+          test -f /usr/share/licenses/devserial/THIRD-PARTY-NOTICES.md
+          test -f /usr/share/licenses/devserial/OFL-1.1.txt
           echo "source package builds, installs and runs"
 
   verify-homebrew:
