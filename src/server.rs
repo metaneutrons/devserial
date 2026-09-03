@@ -1150,25 +1150,16 @@ impl ServerHandler for DevSerialServer {
             };
             let resources = ports
                 .iter()
-                .map(|p| rmcp::model::Annotated {
-                    raw: rmcp::model::RawResource {
-                        uri: format!("serial://{}/status", p.name),
-                        name: format!("{} status", p.name),
-                        title: None,
-                        description: Some(format!("Connection state for {}", p.name)),
-                        mime_type: Some("application/json".into()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    },
-                    annotations: None,
+                .map(|p| {
+                    rmcp::model::Resource::new(
+                        format!("serial://{}/status", p.name),
+                        format!("{} status", p.name),
+                    )
+                    .with_description(format!("Connection state for {}", p.name))
+                    .with_mime_type("application/json")
                 })
                 .collect();
-            Ok(rmcp::model::ListResourcesResult {
-                resources,
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(rmcp::model::ListResourcesResult::with_all_items(resources))
         }
     }
 
@@ -1178,7 +1169,7 @@ impl ServerHandler for DevSerialServer {
         request: rmcp::model::ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<
-        Output = Result<rmcp::model::ReadResourceResult, rmcp::model::ErrorData>,
+        Output = Result<rmcp::model::ReadResourceResponse, rmcp::model::ErrorData>,
     > + Send
     + '_ {
         async move {
@@ -1205,6 +1196,9 @@ impl ServerHandler for DevSerialServer {
                 "db_size_bytes": stats.db_size_bytes,
             });
 
+            // rmcp 3 answers with ReadResourceResponse, an enum whose Complete
+            // variant carries the old result type. Nothing here ever asks the
+            // caller for input, so the conversion is the whole change.
             Ok(rmcp::model::ReadResourceResult::new(vec![
                 rmcp::model::ResourceContents::TextResourceContents {
                     uri,
@@ -1212,7 +1206,8 @@ impl ServerHandler for DevSerialServer {
                     text: serde_json::to_string_pretty(&json).unwrap_or_default(),
                     meta: None,
                 },
-            ]))
+            ])
+            .into())
         }
     }
 }
