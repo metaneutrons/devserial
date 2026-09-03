@@ -198,8 +198,18 @@ jobs:
             fi
           elif [[ "$TARGET" == *musl* ]]; then
             file "$binary" | tee linkage.txt
-            if ! grep -q 'statically linked' linkage.txt; then
-              echo "::error::the musl build is not statically linked"
+            # file spells the same fact two ways: a classic static binary is
+            # "statically linked", a static PIE is "static-pie linked". Rust
+            # produces the second for x86_64-unknown-linux-musl and the first
+            # for aarch64-unknown-linux-musl, so demanding one spelling
+            # rejected a perfectly good binary. What actually matters is the
+            # absence of a dynamic interpreter, hence both tests.
+            if grep -q 'dynamically linked' linkage.txt; then
+              echo "::error::the musl build has a dynamic interpreter"
+              exit 1
+            fi
+            if ! grep -Eq 'statically linked|static-pie linked' linkage.txt; then
+              echo "::error::file does not report the musl build as static: $(cat linkage.txt)"
               exit 1
             fi
           else
