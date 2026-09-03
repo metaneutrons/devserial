@@ -156,9 +156,9 @@ impl SqliteStorage {
             .read_conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count: u64 = conn.query_row("SELECT COUNT(*) FROM lines", [], |r| r.get(0))?;
+        let count = conn.query_row("SELECT COUNT(*) FROM lines", [], |r| r.get::<_, i64>(0))?;
         drop(conn);
-        Ok(count)
+        count_as_u64(count)
     }
 
     /// Highest line id, or zero when the buffer is empty.
@@ -229,13 +229,15 @@ impl SqliteStorage {
                 .read_conn
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let total_lines: u64 =
-                conn.query_row("SELECT COUNT(*) FROM lines", [], |r| r.get(0))?;
-            let total_bytes: u64 = conn.query_row(
+            let total_lines =
+                count_as_u64(
+                    conn.query_row("SELECT COUNT(*) FROM lines", [], |r| r.get::<_, i64>(0))?,
+                )?;
+            let total_bytes = count_as_u64(conn.query_row(
                 "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM lines",
                 [],
-                |r| r.get(0),
-            )?;
+                |r| r.get::<_, i64>(0),
+            )?)?;
             let last_timestamp_ns: Option<i64> =
                 conn.query_row("SELECT MAX(timestamp_ns) FROM lines", [], |r| r.get(0))?;
             drop(conn);
@@ -479,9 +481,13 @@ impl SqliteStorage {
             .write_conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SQLite binds signed 64-bit integers, so the limit goes in as i64. A
+        // limit above i64::MAX means "keep everything", and i64::MAX already
+        // exceeds any row count SQLite can hold, so clamping keeps that intent.
+        let limit = i64::try_from(max_lines).unwrap_or(i64::MAX);
         conn.execute(
             "DELETE FROM lines WHERE id NOT IN (SELECT id FROM lines ORDER BY id DESC LIMIT ?1)",
-            params![max_lines],
+            params![limit],
         )?;
         drop(conn);
         Ok(())
@@ -495,6 +501,19 @@ impl SqliteStorage {
 }
 
 /// Map a `(id, timestamp_ns, payload)` row onto a [`StoredLine`].
+/// Converts a SQLite integer that cannot be negative into `u64`.
+///
+/// rusqlite 0.40 no longer implements `FromSql` for `u64`, because SQLite
+/// stores signed 64-bit integers and a value above `i64::MAX` could not round
+/// trip. Every caller here reads a `COUNT` or a `SUM(LENGTH(...))`, neither of
+/// which SQLite can report as negative, so the error path is unreachable in
+/// practice. It is still reported rather than clamped: a negative count would
+/// mean the engine broke its own contract, and silently turning that into a
+/// plausible number would hide it.
+fn count_as_u64(value: i64) -> Result<u64, StorageError> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value).into())
+}
+
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredLine> {
     Ok(StoredLine {
         id: row.get(0)?,
@@ -569,6 +588,15 @@ mod tests {
 
         let lines = s.read_lines(100, 50).unwrap();
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn count_as_u64_rejects_a_negative_count() {
+        // Unreachable through SQLite, but the conversion must report rather
+        // than clamp, so the boundary is pinned by a test.
+        assert_eq!(count_as_u64(0).unwrap(), 0);
+        assert_eq!(count_as_u64(i64::MAX).unwrap(), i64::MAX.unsigned_abs());
+        assert!(count_as_u64(-1).is_err());
     }
 
     #[test]
