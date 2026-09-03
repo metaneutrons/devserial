@@ -983,10 +983,23 @@ jobs:
         run: |
           set -euo pipefail
           gh release edit "$TAG" --draft=false --prerelease --latest=false
-          gh release view "$TAG" --json isDraft,isPrerelease,isLatest --jq \
-            'if .isDraft or (.isPrerelease | not) or .isLatest
-             then "unexpected release state" | halt_error(1)
-             else "staged as a prerelease" end'
+
+          # "latest" is not a field of a release. gh release view --json has
+          # no isLatest, and the REST release object has no such boolean
+          # either: the latest release is a separate endpoint. So the two
+          # flags are read back from the release, and "not latest" is asserted
+          # against that endpoint. A 404 there means the repository has no
+          # latest release at all, which also satisfies the assertion.
+          gh release view "$TAG" --json isDraft,isPrerelease --jq \
+            'if .isDraft or (.isPrerelease | not)
+             then "unexpected release state: " + tostring | halt_error(1)
+             else "flags are draft=false prerelease=true" end'
+          latest=$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name 2>/dev/null || echo '')
+          if [[ "$latest" == "$TAG" ]]; then
+            echo "::error::the prerelease $TAG is being served as the latest release"
+            exit 1
+          fi
+          echo "staged as a prerelease, latest is still ${latest:-<none>}"
 
   # ---------------------------------------------------------------- stage 8
   publish-homebrew:
@@ -1131,7 +1144,18 @@ jobs:
           set -euo pipefail
           # The assets are not touched here. Only the two flags change.
           gh release edit "$TAG" --prerelease=false --latest
-          gh release view "$TAG" --json isDraft,isPrerelease,isLatest --jq \
-            'if .isDraft or .isPrerelease or (.isLatest | not)
-             then "unexpected release state" | halt_error(1)
-             else "promoted to latest" end'
+
+          # Same reasoning as in stage 7: the two flags come from the release,
+          # "is latest" comes from the endpoint that decides it. Here the
+          # endpoint has to name this tag, and a 404 is a failure rather than
+          # something to tolerate.
+          gh release view "$TAG" --json isDraft,isPrerelease --jq \
+            'if .isDraft or .isPrerelease
+             then "unexpected release state: " + tostring | halt_error(1)
+             else "flags are draft=false prerelease=false" end'
+          latest=$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name)
+          if [[ "$latest" != "$TAG" ]]; then
+            echo "::error::latest is $latest, expected $TAG"
+            exit 1
+          fi
+          echo "promoted to latest"
