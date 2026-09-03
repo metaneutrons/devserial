@@ -4,6 +4,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Least privilege by default. No job in this workflow writes anything.
 permissions:
@@ -15,18 +16,41 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: '1'
 
 jobs:
-  fmt:
-    name: Format
+  quality:
+    name: Format, Clippy, Dependencies
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # No dtolnay/rust-toolchain: the version lives in rust-toolchain.toml and
+      # rustup installs it from there. Two sources would be one too many.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          components: rustfmt
+          key: quality
       - run: cargo fmt --all -- --check
+
+      # A broken hook configuration otherwise only shows up on the machine of
+      # whoever installs it next.
+      - name: Validate the hook configuration
+        env:
+          LEFTHOOK_VERSION: '2.1.12'
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/evilmartians/lefthook/releases/download/v${LEFTHOOK_VERSION}/lefthook_${LEFTHOOK_VERSION}_Linux_x86_64.gz" \
+            | gzip -d > "$RUNNER_TEMP/lefthook"
+          chmod +x "$RUNNER_TEMP/lefthook"
+          "$RUNNER_TEMP/lefthook" validate
+
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-deny
+      # Advisories, licences, duplicate versions and unknown registries.
+      # Replaces a plain cargo-audit run, which checked none of the last three.
+      - run: cargo deny check
 
   # Every published binary is built from one of these feature sets, on one of
   # these platforms. Linting and testing only the default set on Linux left the
@@ -41,7 +65,7 @@ jobs:
         # covered with the released feature set, and the reduced sets are
         # checked where they are actually shipped.
         include:
-          - { os: ubuntu-latest, name: all-features, features: "--all-features" }
+          - { os: ubuntu-latest, name: all-features, features: "--all-features", coverage: true }
           - { os: ubuntu-latest, name: default, features: "" }
           - { os: ubuntu-latest, name: no-default-features, features: "--no-default-features" }
           - { os: ubuntu-latest, name: esp-tui, features: "--no-default-features --features esp,tui" }
@@ -50,10 +74,8 @@ jobs:
           - { os: windows-latest, name: all-features, features: "--all-features" }
           - { os: windows-latest, name: default, features: "" }
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          components: clippy
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.name }}
@@ -64,45 +86,127 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
+      # cargo-llvm-cov only on the cell that measures coverage, so the other
+      # seven do not pay for a tool they never call.
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-nextest${{ matrix.coverage && ',cargo-llvm-cov' || '' }}
+
       - name: Clippy
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
-      - name: Unit tests
-        run: cargo test --locked --lib ${{ matrix.features }}
-
-      - name: Integration tests
-        run: cargo test --locked --test '*' ${{ matrix.features }} -- --test-threads=1
+      # One process per test, so the integration tests no longer need
+      # --test-threads=1 to keep their sandboxes apart.
+      - name: Tests
+        run: cargo nextest run --locked ${{ matrix.features }}
 
       - name: Documentation
         run: cargo doc --locked --no-deps ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Read rust-version from Cargo.toml
-        id: msrv
+      # Once, on the cell that compiles everything. The floor is a measurement,
+      # not an aspiration: 52.30% of lines were covered when it was introduced.
+      # The gap is the surfaces that cannot be exercised headless, monitor.rs at
+      # 0%, platform.rs at 0%, standalone.rs at 10% and tui.rs at 38%, while the
+      # engine, storage, IPC, hex and export modules sit between 70% and 95%.
+      - name: Coverage with a hard floor
+        if: matrix.coverage
         run: |
-          version=$(grep '^rust-version' Cargo.toml | head -1 | cut -d'"' -f2)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install GUI build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - run: cargo check --locked --all-targets --all-features
+          set -euo pipefail
+          rustup component add llvm-tools-preview
+          cargo llvm-cov --locked --all-features --fail-under-lines 50
 
-  audit:
-    name: Security Audit
+  commit-hygiene:
+    name: Commit hygiene
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Check the title, the body and every commit
+        # The title and body reach the script only through env, never by
+        # interpolation into the script text: otherwise the pull request title
+        # would be a shell injection vector.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          status=0
+          cc='^((feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+|Revert ".+")'
+          # grep works line by line, so .* and not [^\n]*: in ERE, [^\n] is the
+          # class "neither a backslash nor an n" and would exclude names
+          # containing an n. In a ruleset's RE2 rule, [^\n] is the right form.
+          # Anchored at the start of a line: a trailer lives on its own line
+          # by convention. Unanchored, the rule also fires when a pull request
+          # body merely mentions the forbidden trailer, for instance to
+          # describe a finding, and rejects a valid input.
+          ban='^[[:space:]]*co-authored-by:.*(claude|anthropic)|^[[:space:]]*generated with.*claude code'
+
+          # With a squash merge the title becomes the subject line on main and
+          # therefore decides the next version.
+          if ! printf '%s' "$PR_TITLE" | grep -Eq "$cc"; then
+            echo "::error::The pull request title is not a Conventional Commit: $PR_TITLE"
+            status=1
+          fi
+
+          # With squash_merge_commit_message=PR_BODY the body becomes the commit body.
+          if printf '%s' "$PR_BODY" | grep -Eiq "$ban"; then
+            echo "::error::The pull request body carries an AI attribution trailer."
+            status=1
+          fi
+
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            if git log -1 --format=%B "$sha" | grep -Eiq "$ban"; then
+              echo "::error::Commit $sha carries an AI attribution trailer."
+              status=1
+            fi
+            if git log -1 --format='%ae%n%ce' "$sha" | grep -Fq 'noreply@anthropic.com'; then
+              echo "::error::Commit $sha has an Anthropic address as author or committer."
+              status=1
+            fi
+          done
+
+          if [ "$status" -ne 0 ]; then
+            echo '::notice::Turn it off at the root in ~/.claude/settings.json: {"attribution":{"commit":"","pr":""}}'
+            exit 1
+          fi
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      # The pre-push hook only scans the commits being pushed. The full history
+      # scan belongs here, otherwise that reasoning is hollow.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          # Mandatory since the action's breaking change: without a token it
+          # aborts on every pull request, complaining about the missing token
+          # rather than reporting a finding. The generated token is enough.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only needed for organisation use. A narrowly scoped CI tool secret,
+          # never one from a publish environment.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # The only required check in the ruleset. Matrix changes therefore cannot
+  # break the repository configuration.
+  ci-success:
+    name: CI Success
+    if: always()
+    needs: [quality, check, secrets, commit-hygiene]
+    runs-on: ubuntu-latest
+    steps:
+      # "skipped" has to be acceptable, otherwise this job fails on a push to
+      # main, where commit-hygiene does not run.
+      - name: Every preceding job must have succeeded or been skipped
+        run: |
+          set -euo pipefail
+          printf '%s\n' '${{ toJSON(needs) }}' |
+            jq -e 'all(.[]; .result == "success" or .result == "skipped")'

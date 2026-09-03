@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -e
-
-cargo test
-cargo clippy -- -D warnings
-cargo audit 2>/dev/null || echo "WARN: cargo-audit not installed, skipping"

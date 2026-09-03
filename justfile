@@ -16,11 +16,11 @@ test:
 test-unit:
     cargo test --lib
 
-# Run full CI check (fmt + clippy + test)
+# Run the same gates CI runs
 check:
-    cargo fmt -- --check
-    cargo clippy -- -D warnings
-    cargo test
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-features
 
 # Format code
 fmt:
@@ -28,21 +28,24 @@ fmt:
 
 # Lint with clippy
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings
 
 # Run the MCP server
 run:
     cargo run
 
-# Security audit
+# Advisories, licences, duplicate versions and registries
 audit:
-    cargo audit
+    cargo deny check
 
 # Clean build artifacts
 clean:
     cargo clean
 
-# Setup git hooks
+# Install the git hooks through lefthook
 setup:
-    git config core.hooksPath .githooks
-    @echo "Git hooks configured."
+    @command -v lefthook >/dev/null 2>&1 || { echo "lefthook is missing: brew install lefthook"; exit 1; }
+    @command -v gitleaks >/dev/null 2>&1 || { echo "gitleaks is missing: brew install gitleaks"; exit 1; }
+    git config --unset-all core.hooksPath || true
+    lefthook install
+    @echo "Hooks installed. lefthook validate checks the configuration."
