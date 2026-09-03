@@ -170,13 +170,17 @@ source_aarch64=('$(url_for aarch64-unknown-linux-gnu)')
 sha256sums_aarch64=('${SHA[aarch64-unknown-linux-gnu]}')
 
 package() {
+  # The installed binary keeps the plain name, because that is what users type
+  # and what the archive contains. The licence and documentation directories
+  # follow \$pkgname, which is Arch convention and here also keeps this package
+  # from claiming paths that belong to the source package it conflicts with.
   install -Dm755 "\$srcdir/${PACKAGE}" "\$pkgdir/usr/bin/${PACKAGE}"
-  install -Dm644 "\$srcdir/LICENSE" "\$pkgdir/usr/share/licenses/${PACKAGE}/LICENSE"
-  install -Dm644 "\$srcdir/README.md" "\$pkgdir/usr/share/doc/${PACKAGE}/README.md"
+  install -Dm644 "\$srcdir/LICENSE" "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+  install -Dm644 "\$srcdir/README.md" "\$pkgdir/usr/share/doc/\$pkgname/README.md"
   # The binary embeds font software; its notices have to travel with it.
   install -Dm644 "\$srcdir/THIRD-PARTY-NOTICES.md" \\
-    "\$pkgdir/usr/share/licenses/${PACKAGE}/THIRD-PARTY-NOTICES.md"
-  install -Dm644 -t "\$pkgdir/usr/share/licenses/${PACKAGE}/" "\$srcdir"/licenses/*.txt
+    "\$pkgdir/usr/share/licenses/\$pkgname/THIRD-PARTY-NOTICES.md"
+  install -Dm644 -t "\$pkgdir/usr/share/licenses/\$pkgname/" "\$srcdir"/licenses/*.txt
 }
 PKGBUILD
 
@@ -201,6 +205,15 @@ license=('${LICENSE_ID}')
 depends=('gcc-libs' 'glibc' 'libxkbcommon' 'libx11' 'wayland' 'libgl')
 makedepends=('cargo' 'git' 'libxcb')
 conflicts=('${PACKAGE}-bin')
+# makepkg.conf ships OPTIONS=(... lto) and LTOFLAGS="-flto=auto", and cc-rs
+# picks CFLAGS up from the environment. The bundled sqlite3 then compiles to
+# LLVM bitcode, rustc links the resulting archive without an LTO plugin, and
+# every sqlite3 symbol comes out undefined. That failure is on record from the
+# pipeline run against devserial-v0.1.4-pipelinetest.2; disabling LTO is the
+# usual remedy for a Rust package with a vendored C library. The archlinux
+# image only runs emulated on the maintainer machine, so the fix itself is
+# proven by the next pipeline run rather than locally.
+options=('!lto')
 source=("\${pkgname}::git+${HOMEPAGE}.git#tag=${tag}")
 sha256sums=('SKIP')
 

@@ -198,8 +198,18 @@ jobs:
             fi
           elif [[ "$TARGET" == *musl* ]]; then
             file "$binary" | tee linkage.txt
-            if ! grep -q 'statically linked' linkage.txt; then
-              echo "::error::the musl build is not statically linked"
+            # file spells the same fact two ways: a classic static binary is
+            # "statically linked", a static PIE is "static-pie linked". Rust
+            # produces the second for x86_64-unknown-linux-musl and the first
+            # for aarch64-unknown-linux-musl, so demanding one spelling
+            # rejected a perfectly good binary. What actually matters is the
+            # absence of a dynamic interpreter, hence both tests.
+            if grep -q 'dynamically linked' linkage.txt; then
+              echo "::error::the musl build has a dynamic interpreter"
+              exit 1
+            fi
+            if ! grep -Eq 'statically linked|static-pie linked' linkage.txt; then
+              echo "::error::file does not report the musl build as static: $(cat linkage.txt)"
               exit 1
             fi
           else
@@ -266,7 +276,7 @@ jobs:
           done
           echo "archive is complete and runnable"
 
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: archive-${{ matrix.target }}
           path: dist/*
@@ -346,7 +356,7 @@ jobs:
           test -f /usr/share/doc/devserial/THIRD-PARTY-NOTICES.md
           test -f /usr/share/doc/devserial/licenses/OFL-1.1.txt
           dpkg --verify devserial
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deb-${{ matrix.arch }}
           path: deb/*.deb
@@ -364,12 +374,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: archive-*
           merge-multiple: true
           path: payloads
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: deb-*
           merge-multiple: true
@@ -462,7 +472,7 @@ jobs:
           done
           echo "every payload attestation verifies"
 
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: signed-payloads
           path: payloads/*
@@ -474,7 +484,7 @@ jobs:
     needs: [metadata, sign]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: signed-payloads
           path: payloads
@@ -520,7 +530,7 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: signed-payloads
           path: dist
@@ -567,7 +577,7 @@ jobs:
             packaging/devserial.rb
             packaging/devserial.PKGBUILD
             packaging/devserial-bin.PKGBUILD
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: packaging
           path: packaging/*
@@ -580,11 +590,11 @@ jobs:
     outputs:
       asset_count: ${{ steps.inventory.outputs.asset_count }}
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: signed-payloads
           path: candidate
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: packaging
           path: candidate
@@ -630,7 +640,7 @@ jobs:
           # The release set is the candidate list plus the checksum file itself.
           echo "asset_count=$(( expected + 1 ))" >> "$GITHUB_OUTPUT"
           echo "$expected assets plus SHA256SUMS"
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: candidate
           path: candidate/*
@@ -719,7 +729,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: candidate
           path: candidate
@@ -769,7 +779,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: candidate
           path: candidate
@@ -804,6 +814,11 @@ jobs:
           pacman -U --noconfirm "$package"
           /usr/bin/devserial --version
           /usr/bin/devserial list >/dev/null
+
+          # The same promise the .deb and the binary package carry: the font
+          # notices travel with the binary that embeds the fonts.
+          test -f /usr/share/licenses/devserial/THIRD-PARTY-NOTICES.md
+          test -f /usr/share/licenses/devserial/OFL-1.1.txt
           echo "source package builds, installs and runs"
 
   verify-homebrew:
@@ -815,7 +830,7 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: candidate
           path: candidate
@@ -894,7 +909,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: candidate
           path: candidate
@@ -968,10 +983,23 @@ jobs:
         run: |
           set -euo pipefail
           gh release edit "$TAG" --draft=false --prerelease --latest=false
-          gh release view "$TAG" --json isDraft,isPrerelease,isLatest --jq \
-            'if .isDraft or (.isPrerelease | not) or .isLatest
-             then "unexpected release state" | halt_error(1)
-             else "staged as a prerelease" end'
+
+          # "latest" is not a field of a release. gh release view --json has
+          # no isLatest, and the REST release object has no such boolean
+          # either: the latest release is a separate endpoint. So the two
+          # flags are read back from the release, and "not latest" is asserted
+          # against that endpoint. A 404 there means the repository has no
+          # latest release at all, which also satisfies the assertion.
+          gh release view "$TAG" --json isDraft,isPrerelease --jq \
+            'if .isDraft or (.isPrerelease | not)
+             then "unexpected release state: " + tostring | halt_error(1)
+             else "flags are draft=false prerelease=true" end'
+          latest=$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name 2>/dev/null || echo '')
+          if [[ "$latest" == "$TAG" ]]; then
+            echo "::error::the prerelease $TAG is being served as the latest release"
+            exit 1
+          fi
+          echo "staged as a prerelease, latest is still ${latest:-<none>}"
 
   # ---------------------------------------------------------------- stage 8
   publish-homebrew:
@@ -981,7 +1009,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: candidate
           path: candidate
@@ -1039,7 +1067,7 @@ jobs:
       matrix:
         package: [devserial, devserial-bin]
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: candidate
           path: candidate
@@ -1116,7 +1144,18 @@ jobs:
           set -euo pipefail
           # The assets are not touched here. Only the two flags change.
           gh release edit "$TAG" --prerelease=false --latest
-          gh release view "$TAG" --json isDraft,isPrerelease,isLatest --jq \
-            'if .isDraft or .isPrerelease or (.isLatest | not)
-             then "unexpected release state" | halt_error(1)
-             else "promoted to latest" end'
+
+          # Same reasoning as in stage 7: the two flags come from the release,
+          # "is latest" comes from the endpoint that decides it. Here the
+          # endpoint has to name this tag, and a 404 is a failure rather than
+          # something to tolerate.
+          gh release view "$TAG" --json isDraft,isPrerelease --jq \
+            'if .isDraft or .isPrerelease
+             then "unexpected release state: " + tostring | halt_error(1)
+             else "flags are draft=false prerelease=false" end'
+          latest=$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name)
+          if [[ "$latest" != "$TAG" ]]; then
+            echo "::error::latest is $latest, expected $TAG"
+            exit 1
+          fi
+          echo "promoted to latest"
