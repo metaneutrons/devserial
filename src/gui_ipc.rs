@@ -153,12 +153,16 @@ pub fn try_open_in_existing_gui(req: &OpenPortRequest) -> Result<bool, String> {
     #[cfg(not(unix))]
     {
         // Windows GUI instances do not multiplex yet; each invocation opens its
-        // own window, which is the documented behaviour there.
-        let _ = socket;
+        // own window, which is the documented behaviour there. Both parameters
+        // are consumed only by the Unix branch.
+        let _ = (socket, req);
         Ok(false)
     }
 }
 
+// Only the Unix branch above maps errors to strings; off Unix the function
+// would be dead code and -D warnings turns that into a failure.
+#[cfg(unix)]
 fn err_text(e: impl std::fmt::Display) -> String {
     e.to_string()
 }

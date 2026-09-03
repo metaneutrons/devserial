@@ -547,3 +547,25 @@ mod tests {
         assert!(options.to_port_config().is_err());
     }
 }
+
+#[cfg(test)]
+mod error_size {
+    use super::CliError;
+
+    /// Guards against a large `Err` variant creeping back in.
+    ///
+    /// clippy's `result_large_err` fires above 128 bytes, and the size of an
+    /// error type is platform dependent: `CliError` sat at 120 bytes on macOS
+    /// and over the threshold on Windows, so the lint failed only in the
+    /// Windows cell of the matrix. This asserts real margin rather than a
+    /// value that happens to pass on the machine the test runs on.
+    #[test]
+    fn cli_error_stays_small() {
+        let size = size_of::<CliError>();
+        assert!(
+            size <= 64,
+            "CliError grew to {size} bytes; box the largest variant's payload \
+             before clippy::result_large_err starts failing on some platform"
+        );
+    }
+}

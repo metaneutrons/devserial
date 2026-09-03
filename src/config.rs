@@ -283,7 +283,7 @@ fn load_required(path: &Path) -> Result<Config, ConfigError> {
     }
     let content =
         std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
-    toml::from_str(&content).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))
+    toml::from_str(&content).map_err(|e| ConfigError::Parse(path.to_path_buf(), Box::new(e)))
 }
 
 /// Configuration loading errors.
@@ -294,7 +294,11 @@ pub enum ConfigError {
     #[error("failed to read config file {}: {}", .0.display(), .1)]
     Io(PathBuf, std::io::Error),
     #[error("failed to parse config file {}: {}", .0.display(), .1)]
-    Parse(PathBuf, toml::de::Error),
+    // The toml error is boxed: it is 96 bytes on its own, which put
+    // ConfigError at 120 and CliError with it. That sits one byte under
+    // clippy's result_large_err threshold on macOS and over it on Windows, so
+    // the lint fired only there. Boxing leaves margin on every platform.
+    Parse(PathBuf, Box<toml::de::Error>),
 }
 
 #[cfg(test)]

@@ -226,6 +226,7 @@ mod windows {
         ///
         /// # Errors
         /// Returns `AddrInUse` if another daemon already owns the pipe.
+        #[allow(clippy::unused_async)]
         pub async fn bind(endpoint: &Path) -> io::Result<Self> {
             let name = pipe_name(endpoint);
             let pending = ServerOptions::new()
@@ -288,6 +289,7 @@ mod windows {
     }
 
     /// Whether a live daemon answers on the endpoint.
+    #[allow(clippy::unused_async)]
     pub async fn is_listening(endpoint: &Path) -> bool {
         let name = pipe_name(endpoint);
         match ClientOptions::new().open(&name) {
@@ -297,7 +299,15 @@ mod windows {
         }
     }
 
+    // The async signatures and the non-const cleanup exist for the shape of the
+    // interface, not for this platform's implementation. On Unix bind awaits
+    // the startup lock and is_listening awaits a connect, and cleanup removes
+    // the socket file. Callers await these regardless of platform, so dropping
+    // async here would fork the call sites. clippy sees only the platform it
+    // compiles for and is right about that platform alone.
+
     /// Named pipes disappear with their owning process, so nothing to remove.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn cleanup(_endpoint: &Path) {}
 
     /// Human-readable endpoint description.
@@ -350,6 +360,7 @@ mod unsupported {
         ///
         /// # Errors
         /// Always returns `Unsupported`.
+        #[allow(clippy::unused_async)]
         pub async fn bind(_endpoint: &Path) -> io::Result<Self> {
             Err(unsupported())
         }
@@ -358,6 +369,7 @@ mod unsupported {
         ///
         /// # Errors
         /// Always returns `Unsupported`.
+        #[allow(clippy::unused_async)]
         pub async fn accept(&mut self) -> io::Result<ServerStream> {
             Err(unsupported())
         }
@@ -367,16 +379,19 @@ mod unsupported {
     ///
     /// # Errors
     /// Always returns `Unsupported`.
+    #[allow(clippy::unused_async)]
     pub async fn connect(_endpoint: &Path) -> io::Result<ClientStream> {
         Err(unsupported())
     }
 
     /// No daemon can run on unsupported platforms.
+    #[allow(clippy::unused_async)]
     pub async fn is_listening(_endpoint: &Path) -> bool {
         false
     }
 
     /// Nothing to clean up.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn cleanup(_endpoint: &Path) {}
 
     /// Human-readable endpoint description.
