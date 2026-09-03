@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Terminal rendering for CLI results.
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn about_metadata_comes_from_the_manifest() {
         assert!(!authors().is_empty(), "Cargo.toml must declare authors");
-        assert_eq!(env!("CARGO_PKG_LICENSE"), "GPL-3.0-only");
+        assert_eq!(env!("CARGO_PKG_LICENSE"), "GPL-3.0-or-later");
         assert!(env!("CARGO_PKG_REPOSITORY").starts_with("https://"));
     }
 }

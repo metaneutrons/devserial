@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 use std::sync::Arc;
@@ -150,7 +150,7 @@ where
             let storage = Arc::clone(&writer_storage);
             let trim = if max_buffer_lines > 0 {
                 batches_since_trim = batches_since_trim.wrapping_add(1);
-                batches_since_trim % BATCHES_PER_TRIM == 0
+                batches_since_trim.is_multiple_of(BATCHES_PER_TRIM)
             } else {
                 false
             };

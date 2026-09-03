@@ -4,9 +4,8 @@ version = "0.1.4"
 edition = "2024"
 authors = ["Fabian Schmieder"]
 description = "MCP server bridging serial hardware to LLMs via SQLite-backed buffer"
-license = "GPL-3.0-only"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/metaneutrons/devserial"
-rust-version = "1.85"
 keywords = ["serial", "mcp", "embedded", "uart", "sqlite"]
 categories = ["hardware-support", "development-tools"]
 
@@ -31,11 +30,19 @@ assets = [
     ["target/deb-extra/changelog.Debian.gz", "usr/share/doc/devserial/", "644"],
     ["resources/deb-copyright", "usr/share/doc/devserial/copyright", "644"],
     ["README.md", "usr/share/doc/devserial/README.md", "644"],
+    ["THIRD-PARTY-NOTICES.md", "usr/share/doc/devserial/THIRD-PARTY-NOTICES.md", "644"],
+    ["licenses/*", "usr/share/doc/devserial/licenses/", "644"],
     ["resources/devserial.desktop", "usr/share/applications/", "644"],
     ["resources/icon-512.png", "usr/share/icons/hicolor/512x512/apps/devserial.png", "644"],
 ]
 
 [lints.rust]
+# Der Normalfall des Standards ist "forbid". Hier abgesenkt auf "deny", weil
+# die macOS-Integration echtes unsafe braucht: das Anwendungsmenue, die
+# Zwischenablage und der Bearbeitungszustand laufen ueber Objective-C-FFI.
+# Jede Ausnahme ist auf platform.rs begrenzt, dort einzeln mit #[allow]
+# markiert und mit einer Begruendung versehen. Ein zweiter Ort mit unsafe ist
+# ein Defekt.
 unsafe_code = "deny"
 
 [lints.clippy]
@@ -43,6 +50,9 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+# Mehrfach eingebundene Crate-Versionen sind hier nicht in unserer Hand: der
+# GUI-Stapel um eframe zieht mehrere Generationen derselben Crates. cargo-deny
+# meldet sie unter [bans] weiterhin als Warnung, dort sind sie sichtbar.
 multiple_crate_versions = "allow"
 
 [dependencies]

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! YMODEM protocol implementation (YMODEM-Batch with metadata).
@@ -112,12 +112,12 @@ where
     }
 
     // Receiver may send 'C' for next file
-    if let Ok(c) = read_byte_with_timeout(stream, Duration::from_millis(500)).await {
-        if c == CRC_C {
-            // 5. Send Null Block 0 to terminate batch
-            send_null_block(stream).await?;
-            let _ = read_byte_with_timeout(stream, TIMEOUT).await;
-        }
+    if let Ok(c) = read_byte_with_timeout(stream, Duration::from_millis(500)).await
+        && c == CRC_C
+    {
+        // 5. Send Null Block 0 to terminate batch
+        send_null_block(stream).await?;
+        let _ = read_byte_with_timeout(stream, TIMEOUT).await;
     }
 
     Ok(total_bytes)
@@ -143,21 +143,21 @@ where
         stream.write_all(&[CRC_C]).await.ok();
         stream.flush().await.ok();
 
-        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await {
-            if b == SOH || b == STX {
-                // Parse Block 0
-                let (name, size) = read_header_block(stream, b).await?;
-                if name.is_empty() {
-                    // Empty header -> end of batch
-                    stream.write_all(&[ACK]).await.ok();
-                    stream.flush().await.ok();
-                    return Ok((String::new(), Vec::new()));
-                }
-                filename = name;
-                expected_size = size;
-                started = true;
-                break;
+        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await
+            && (b == SOH || b == STX)
+        {
+            // Parse Block 0
+            let (name, size) = read_header_block(stream, b).await?;
+            if name.is_empty() {
+                // Empty header -> end of batch
+                stream.write_all(&[ACK]).await.ok();
+                stream.flush().await.ok();
+                return Ok((String::new(), Vec::new()));
             }
+            filename = name;
+            expected_size = size;
+            started = true;
+            break;
         }
     }
 
@@ -237,12 +237,12 @@ where
     }
 
     // 3. Read termination block 0
-    if let Ok(b) = read_byte_with_timeout(stream, Duration::from_millis(500)).await {
-        if b == SOH || b == STX {
-            let _ = read_header_block(stream, b).await;
-            stream.write_all(&[ACK]).await.ok();
-            stream.flush().await.ok();
-        }
+    if let Ok(b) = read_byte_with_timeout(stream, Duration::from_millis(500)).await
+        && (b == SOH || b == STX)
+    {
+        let _ = read_header_block(stream, b).await;
+        stream.write_all(&[ACK]).await.ok();
+        stream.flush().await.ok();
     }
 
     Ok((filename, received))

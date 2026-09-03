@@ -11,8 +11,7 @@
 <p align="center">
   <a href="https://github.com/metaneutrons/devserial/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/metaneutrons/devserial/ci.yml?branch=main&amp;event=push&amp;label=ci&amp;logo=github" alt="CI status on main" /></a>
   <a href="https://github.com/metaneutrons/devserial/releases/latest"><img src="https://img.shields.io/github/v/release/metaneutrons/devserial?label=release&amp;color=blue&amp;logo=github" alt="Latest release" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--only-blue" alt="License: GPL-3.0-only" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/rustc-1.85%2B-dea584?logo=rust&amp;logoColor=white" alt="Minimum supported Rust version 1.85" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms: macOS, Linux, Windows" />
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-server-6f4ee8" alt="Model Context Protocol server" /></a>
 </p>
@@ -68,12 +67,24 @@ brew install metaneutrons/tap/devserial
 ### Debian and Ubuntu
 
 ```bash
-sudo curl -fsSL https://deb.metaneutrons.cc/devserial-archive-keyring.gpg \
-  -o /usr/share/keyrings/devserial-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/devserial-archive-keyring.gpg] https://deb.metaneutrons.cc stable main" \
-  | sudo tee /etc/apt/sources.list.d/devserial.list
+sudo curl -fsSL https://deb.metaneutrons.cc/metaneutrons-archive-keyring.pgp \
+  -o /usr/share/keyrings/metaneutrons-archive-keyring.pgp
+sudo tee /etc/apt/sources.list.d/metaneutrons.sources >/dev/null <<'SOURCES'
+Types: deb
+URIs: https://deb.metaneutrons.cc/devserial
+Suites: rolling
+Components: main
+Signed-By: /usr/share/keyrings/metaneutrons-archive-keyring.pgp
+SOURCES
 sudo apt update && sudo apt install devserial
 ```
+
+The repository is not devserial's own. devserial builds the `.deb`, attests it
+and attaches it to its GitHub release; the archive at `deb.metaneutrons.cc`
+fetches it from there, verifies the attestation against this repository's
+workflow and signs the repository indices. devserial holds neither a signing key
+nor write access to the archive, so a compromised release workflow could not
+produce a validly signed index.
 
 The packages are built on Debian 12, so they install on Debian 12 and newer and
 on Ubuntu 22.04 and newer, for `amd64` and `arm64`. The GUI libraries are
@@ -103,6 +114,27 @@ Download an archive for your platform from [GitHub Releases](https://github.com/
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
+A checksum only proves the file is intact, not who built it. Every payload also
+carries a keyless [Sigstore](https://www.sigstore.dev) bundle and a GitHub build
+attestation, both bound to this repository's release workflow and to the exact
+tag. Verifying either one tells you the archive came from that workflow and not
+from someone who merely recomputed a checksum:
+
+```bash
+# Provenance, against GitHub's attestation store
+gh attestation verify devserial-<version>-<target>.tar.gz --repo metaneutrons/devserial
+
+# Or the Sigstore bundle, without gh
+cosign verify-blob \
+  --bundle devserial-<version>-<target>.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/metaneutrons/devserial/\.github/workflows/release\.yml@refs/tags/devserial-v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  devserial-<version>-<target>.tar.gz
+```
+
+Each payload additionally carries an SPDX software bill of materials as
+`<payload>.spdx.json`.
+
 | Platform | Targets |
 |----------|---------|
 | macOS | `aarch64-apple-darwin`, `x86_64-apple-darwin` |
@@ -125,7 +157,7 @@ The musl builds are statically linked. That is what makes them portable, and it 
 cargo install --path . --all-features
 ```
 
-Requires Rust 1.85 or newer (edition 2024). Building the GUI on Linux needs `libxcb-render0-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev` and `libxkbcommon-dev`.
+The toolchain is pinned in `rust-toolchain.toml` and rustup installs that version on its own, so there is nothing to choose. There is no supported-MSRV promise: devserial is not published to crates.io, so no consumer needs a documented floor, and the pinned toolchain is the only one it is built and tested against. Building the GUI on Linux needs `libxcb-render0-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev` and `libxkbcommon-dev`.
 
 ---
 
@@ -498,4 +530,13 @@ Architecture in one paragraph: `engine.rs` is the only place operations are carr
 
 ## License
 
-GPL-3.0-only. Copyright (C) 2026 Fabian Schmieder. See [LICENSE](LICENSE).
+GPL-3.0-or-later. Copyright (C) 2026 Fabian Schmieder. See [LICENSE](LICENSE) for the
+text of version 3.
+
+Releases 0.1.1 through 0.1.4 were distributed under GPL-3.0-only. That does not
+change retroactively: whoever received one of those versions keeps those terms
+for it. The `or later` option applies from the next release onwards.
+
+The GUI embeds five typefaces under OFL-1.1, UFL-1.0 and MIT. Their notices and
+licence texts travel with every binary, in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and [licenses/](licenses).

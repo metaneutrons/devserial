@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Fabian Schmieder
 #
 # Generate every package definition from the release artifacts.
@@ -27,7 +27,7 @@ PACKAGE=devserial
 REPOSITORY=${GITHUB_REPOSITORY:-metaneutrons/devserial}
 DESCRIPTION='MCP server bridging serial hardware to LLMs via SQLite-backed buffer'
 HOMEPAGE="https://github.com/${REPOSITORY}"
-LICENSE_ID='GPL-3.0-only'
+LICENSE_ID='GPL-3.0-or-later'
 
 version=''
 tag=''
@@ -135,6 +135,8 @@ class Devserial < Formula
 
   def install
     bin.install "${PACKAGE}"
+    # The binary embeds font software; its notices have to travel with it.
+    doc.install "THIRD-PARTY-NOTICES.md", "licenses"
   end
 
   test do
@@ -171,6 +173,10 @@ package() {
   install -Dm755 "\$srcdir/${PACKAGE}" "\$pkgdir/usr/bin/${PACKAGE}"
   install -Dm644 "\$srcdir/LICENSE" "\$pkgdir/usr/share/licenses/${PACKAGE}/LICENSE"
   install -Dm644 "\$srcdir/README.md" "\$pkgdir/usr/share/doc/${PACKAGE}/README.md"
+  # The binary embeds font software; its notices have to travel with it.
+  install -Dm644 "\$srcdir/THIRD-PARTY-NOTICES.md" \\
+    "\$pkgdir/usr/share/licenses/${PACKAGE}/THIRD-PARTY-NOTICES.md"
+  install -Dm644 -t "\$pkgdir/usr/share/licenses/${PACKAGE}/" "\$srcdir"/licenses/*.txt
 }
 PKGBUILD
 
@@ -222,6 +228,10 @@ package() {
   install -Dm755 "target/release/\$pkgname" "\$pkgdir/usr/bin/\$pkgname"
   install -Dm644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
   install -Dm644 README.md "\$pkgdir/usr/share/doc/\$pkgname/README.md"
+  # The binary embeds font software; its notices have to travel with it.
+  install -Dm644 THIRD-PARTY-NOTICES.md \\
+    "\$pkgdir/usr/share/licenses/\$pkgname/THIRD-PARTY-NOTICES.md"
+  install -Dm644 -t "\$pkgdir/usr/share/licenses/\$pkgname/" licenses/*.txt
 }
 SOURCEPKGBUILD
 

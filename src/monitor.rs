@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Native GUI serial monitor window using egui/eframe with multi-window support.
@@ -644,12 +644,11 @@ fn baud_controls(ui: &mut egui::Ui, id: &str, baud: &mut u32, custom: &mut Strin
         response.context_menu(|ui| {
             text_edit_context_menu(ui, custom);
         });
-        if response.changed() {
-            if let Ok(value) = custom.trim().parse::<u32>() {
-                if value > 0 {
-                    *baud = value;
-                }
-            }
+        if response.changed()
+            && let Ok(value) = custom.trim().parse::<u32>()
+            && value > 0
+        {
+            *baud = value;
         }
     });
 }
@@ -1103,10 +1102,10 @@ impl PortMonitorState {
 
     fn update_lines(&mut self) {
         if !self.paused {
-            if self.last_id == i64::MAX {
-                if let Ok(stats) = self.storage.get_stats() {
-                    self.last_id = i64::try_from(stats.total_lines).unwrap_or(0);
-                }
+            if self.last_id == i64::MAX
+                && let Ok(stats) = self.storage.get_stats()
+            {
+                self.last_id = i64::try_from(stats.total_lines).unwrap_or(0);
             }
 
             if let Ok(new_lines) = self.storage.read_lines(self.last_id + 1, 500) {
@@ -1384,10 +1383,10 @@ impl eframe::App for MultiMonitorApp {
             self.config_dialog.rescan();
         }
 
-        if platform::take_menu_request(MenuRequest::PortSettings) {
-            if let Some(mon) = self.monitors.iter_mut().find(|m| m.is_open) {
-                mon.show_settings_dialog = !mon.show_settings_dialog;
-            }
+        if platform::take_menu_request(MenuRequest::PortSettings)
+            && let Some(mon) = self.monitors.iter_mut().find(|m| m.is_open)
+        {
+            mon.show_settings_dialog = !mon.show_settings_dialog;
         }
 
         // Global shortcut: Cmd+O / Ctrl+O to open Connection Manager
@@ -1397,10 +1396,10 @@ impl eframe::App for MultiMonitorApp {
         }
 
         // Global shortcut: Cmd+Shift+P to open Port Settings
-        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::P)) {
-            if let Some(mon) = self.monitors.iter_mut().find(|m| m.is_open) {
-                mon.show_settings_dialog = !mon.show_settings_dialog;
-            }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::P))
+            && let Some(mon) = self.monitors.iter_mut().find(|m| m.is_open)
+        {
+            mon.show_settings_dialog = !mon.show_settings_dialog;
         }
 
         // Drain commands from other invocations.
@@ -1439,21 +1438,21 @@ impl eframe::App for MultiMonitorApp {
 
     #[allow(clippy::too_many_lines)]
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.icon_texture.is_none() {
-            if let Ok(img) = image::load_from_memory(crate::assets::ICON_PNG) {
-                let rgba = img.to_rgba8();
-                let (w, h) = rgba.dimensions();
-                #[allow(clippy::cast_possible_truncation)]
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    &rgba.into_raw(),
-                );
-                self.icon_texture = Some(ui.ctx().load_texture(
-                    "devserial_icon",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
+        if self.icon_texture.is_none()
+            && let Ok(img) = image::load_from_memory(crate::assets::ICON_PNG)
+        {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            #[allow(clippy::cast_possible_truncation)]
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &rgba.into_raw(),
+            );
+            self.icon_texture = Some(ui.ctx().load_texture(
+                "devserial_icon",
+                color_image,
+                egui::TextureOptions::LINEAR,
+            ));
         }
 
         let primary_idx = self.monitors.iter().position(|m| m.is_open);
@@ -1494,10 +1493,9 @@ impl eframe::App for MultiMonitorApp {
                         .show(ui, |ui| {
                             ui.set_max_width(520.0);
                             if let Some(action) = self.config_dialog.render_form(ui, &active_ports)
+                                && action
                             {
-                                if action {
-                                    connect_req = true;
-                                }
+                                connect_req = true;
                             }
                         });
                 });
@@ -1715,10 +1713,10 @@ impl PortMonitorState {
     }
 
     fn apply_reconfiguration(&mut self) {
-        if let Ok(value) = self.settings_custom_baud.trim().parse::<u32>() {
-            if value > 0 {
-                self.config.baudrate = value;
-            }
+        if let Ok(value) = self.settings_custom_baud.trim().parse::<u32>()
+            && value > 0
+        {
+            self.config.baudrate = value;
         }
         let config = self.current_config();
 
@@ -2591,10 +2589,9 @@ impl PortMonitorState {
                 .input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C))
                 && !user_selecting_in_buffer
                 && !self.lines.is_empty()
+                && let Some(last) = self.lines.back()
             {
-                if let Some(last) = self.lines.back() {
-                    ui.ctx().copy_text(last.payload.clone());
-                }
+                ui.ctx().copy_text(last.payload.clone());
             }
         }
 

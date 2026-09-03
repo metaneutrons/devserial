@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Owner of every open serial port.
@@ -463,17 +463,16 @@ pub fn available_ports() -> Vec<String> {
 /// Two names that map onto the same canonical name denote the same hardware.
 #[must_use]
 pub fn canonical_device(port: &str) -> String {
-    if cfg!(any(
+    if (cfg!(any(
         target_os = "macos",
         target_os = "ios",
         target_vendor = "apple"
     )) || cfg!(target_os = "freebsd")
         || cfg!(target_os = "netbsd")
-        || cfg!(target_os = "openbsd")
+        || cfg!(target_os = "openbsd"))
+        && let Some(name) = port.strip_prefix("/dev/tty.")
     {
-        if let Some(name) = port.strip_prefix("/dev/tty.") {
-            return format!("/dev/cu.{name}");
-        }
+        return format!("/dev/cu.{name}");
     }
     port.to_string()
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Newline-delimited JSON-RPC over the local [`crate::transport`].
@@ -98,10 +98,10 @@ impl IpcServer {
     ) -> Result<(), std::io::Error> {
         let mut listener = transport::Listener::bind(&self.endpoint).await?;
 
-        if let Some(parent) = self.pid_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = paths::create_private_dir(parent);
-            }
+        if let Some(parent) = self.pid_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = paths::create_private_dir(parent);
         }
         let pid = std::process::id();
         if let Err(e) = std::fs::write(&self.pid_path, pid.to_string()) {

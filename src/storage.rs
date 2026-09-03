@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 use std::path::{Path, PathBuf};
@@ -328,10 +328,10 @@ impl SqliteStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(archive) = archive_path {
-            if let Some(parent) = archive.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = archive.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
             }
             if archive.exists() {
                 return Err(StorageError::ArchiveExists(archive.to_path_buf()));

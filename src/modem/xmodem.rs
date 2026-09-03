@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! XMODEM protocol implementation (Standard, CRC, 1K).
@@ -143,24 +143,24 @@ where
             .map_err(|e| format!("XMODEM write error: {e}"))?;
         stream.flush().await.ok();
 
-        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await {
-            if b == SOH || b == STX || b == EOT || b == CAN {
-                started = true;
-                // Process this first byte
-                if b == EOT {
-                    stream.write_all(&[ACK]).await.ok();
-                    stream.flush().await.ok();
-                    return Ok(received);
-                }
-                if b == CAN {
-                    return Err("XMODEM cancelled by sender".to_string());
-                }
-                // Handle SOH / STX block
-                handle_incoming_block(stream, b, expected_block, use_crc, &mut received).await?;
-                expected_block = expected_block.wrapping_add(1);
-                on_progress(received.len());
-                break;
+        if let Ok(b) = read_byte_with_timeout(stream, Duration::from_secs(1)).await
+            && (b == SOH || b == STX || b == EOT || b == CAN)
+        {
+            started = true;
+            // Process this first byte
+            if b == EOT {
+                stream.write_all(&[ACK]).await.ok();
+                stream.flush().await.ok();
+                return Ok(received);
             }
+            if b == CAN {
+                return Err("XMODEM cancelled by sender".to_string());
+            }
+            // Handle SOH / STX block
+            handle_incoming_block(stream, b, expected_block, use_crc, &mut received).await?;
+            expected_block = expected_block.wrapping_add(1);
+            on_progress(received.len());
+            break;
         }
     }
 

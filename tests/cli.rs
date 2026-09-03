@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! CLI integration tests.
@@ -96,7 +96,7 @@ fn about_comes_from_the_manifest() {
         .arg("about")
         .assert()
         .success()
-        .stdout(predicate::str::contains("GPL-3.0-only"))
+        .stdout(predicate::str::contains("GPL-3.0-or-later"))
         .stdout(predicate::str::contains(env!("CARGO_PKG_REPOSITORY")));
 }
 

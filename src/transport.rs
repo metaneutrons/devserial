@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Local IPC transport.
@@ -59,10 +59,10 @@ mod unix {
         pub async fn bind(endpoint: &Path) -> io::Result<Self> {
             use std::os::unix::fs::MetadataExt;
 
-            if let Some(parent) = endpoint.parent() {
-                if !parent.as_os_str().is_empty() {
-                    crate::paths::create_private_dir(parent)?;
-                }
+            if let Some(parent) = endpoint.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                crate::paths::create_private_dir(parent)?;
             }
 
             // The lock makes the stale-socket check atomic. Without it two

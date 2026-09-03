@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! The one place where devserial operations are carried out.
@@ -333,10 +333,10 @@ impl CommandEngine {
 
     async fn close_port(&self, name: &str) -> Result<ResponsePayload, EngineError> {
         self.port_manager.close(name).await?;
-        if let Ok(db) = self.state_db.lock() {
-            if let Err(e) = db.port_closed(name) {
-                tracing::warn!(port = %name, error = %e, "could not update persisted state");
-            }
+        if let Ok(db) = self.state_db.lock()
+            && let Err(e) = db.port_closed(name)
+        {
+            tracing::warn!(port = %name, error = %e, "could not update persisted state");
         }
         Ok(ResponsePayload::PortClosed {
             name: name.to_string(),
@@ -344,10 +344,10 @@ impl CommandEngine {
     }
 
     fn remember_open_port(&self, name: &str, config: &PortConfig) {
-        if let Ok(db) = self.state_db.lock() {
-            if let Err(e) = db.port_opened(name, config) {
-                tracing::warn!(port = %name, error = %e, "could not persist port state");
-            }
+        if let Ok(db) = self.state_db.lock()
+            && let Err(e) = db.port_opened(name, config)
+        {
+            tracing::warn!(port = %name, error = %e, "could not persist port state");
         }
     }
 
@@ -947,13 +947,14 @@ fn validate_output_path(path: &Path) -> Result<(), EngineError> {
             "output path must not contain '..' components",
         ));
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            return Err(EngineError::invalid(format!(
-                "parent directory does not exist: {}",
-                parent.display()
-            )));
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        return Err(EngineError::invalid(format!(
+            "parent directory does not exist: {}",
+            parent.display()
+        )));
     }
     Ok(())
 }

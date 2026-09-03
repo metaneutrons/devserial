@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Hex encoding and decoding, used by every path that accepts `0x…` payloads.
@@ -26,7 +26,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>, HexError> {
         .unwrap_or(input);
     let digits: Vec<char> = stripped.chars().filter(|c| !c.is_whitespace()).collect();
 
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return Err(HexError::OddLength(digits.len()));
     }
 

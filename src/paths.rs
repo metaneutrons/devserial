@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
 //! Single source of truth for every path and file name devserial derives.
@@ -52,10 +52,10 @@ pub fn archive_timestamp() -> String {
 /// Platform default data directory, honouring [`ENV_DATA_DIR`].
 #[must_use]
 pub fn default_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os(ENV_DATA_DIR) {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = std::env::var_os(ENV_DATA_DIR)
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     platform_data_dir()
 }
@@ -130,10 +130,10 @@ fn home_dir() -> Option<PathBuf> {
 /// [`crate::transport`].
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    if let Some(sock) = std::env::var_os(ENV_SOCKET) {
-        if !sock.is_empty() {
-            return PathBuf::from(sock);
-        }
+    if let Some(sock) = std::env::var_os(ENV_SOCKET)
+        && !sock.is_empty()
+    {
+        return PathBuf::from(sock);
     }
     platform_socket_path()
 }
