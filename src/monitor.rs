@@ -1163,24 +1163,24 @@ impl PortMonitorState {
         }
 
         // Toolbar (top)
-        egui::Panel::top(format!("toolbar_{}", self.port_name)).show_inside(ui, |ui| {
+        egui::Panel::top(format!("toolbar_{}", self.port_name)).show(ui, |ui| {
             self.render_toolbar(ui);
         });
 
         // Input bar (bottom)
-        egui::Panel::bottom(format!("input_panel_{}", self.port_name)).show_inside(ui, |ui| {
+        egui::Panel::bottom(format!("input_panel_{}", self.port_name)).show(ui, |ui| {
             self.render_input(ui);
         });
 
         // Status bar (bottom)
         egui::Panel::bottom(format!("status_bar_{}", self.port_name))
             .max_size(22.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 self.render_status(ui);
             });
 
         // Main buffer (center)
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             self.render_buffer(ui);
         });
 
@@ -1474,7 +1474,7 @@ impl eframe::App for MultiMonitorApp {
                 .map(|m| m.port_name.clone())
                 .collect();
 
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(24.0);
                     if let Some(ref tex) = self.icon_texture {
@@ -1622,12 +1622,15 @@ impl eframe::App for MultiMonitorApp {
                     .with_icon(load_icon())
                     .with_inner_size([900.0, 600.0])
                     .with_min_inner_size([500.0, 350.0]),
-                |ctx, _class| {
-                    if ctx.input(|i| i.viewport().close_requested()) {
+                // egui 0.36 passes the viewport callback a `&mut Ui`, where
+                // 0.34 passed a `&Context`. The old parameter name still
+                // compiled against the new type, which would have quietly
+                // misled every later reader.
+                |viewport_ui, _class| {
+                    if viewport_ui.input(|i| i.viewport().close_requested()) {
                         mon.is_open = false;
                     }
-                    #[allow(deprecated)]
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(viewport_ui, |ui| {
                         mon.render_ui(ui, icon_tex_ref.as_ref());
                     });
                 },
