@@ -1,0 +1,75 @@
+name: Release Please
+
+# The only place a production tag comes from. It opens and maintains the release
+# pull request, and when that pull request is merged it creates the tag and the
+# draft release, then starts the release pipeline against that tag.
+#
+# The pipeline is deliberately a separate workflow with no tag trigger of its
+# own. A tag trigger there would mean two pipelines run for every tag.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain the release pull request
+    runs-on: ubuntu-latest
+    environment: release
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      # An app token, not GITHUB_TOKEN. GitHub suppresses workflow triggers for
+      # pushes made with GITHUB_TOKEN as a recursion guard, so the CI would
+      # never run on the release pull request, its required checks would hang
+      # and the pull request would not be mergeable. An app is a real actor.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        id: release
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # release-please's rust strategy writes the version into Cargo.toml and
+      # Cargo.lock together, verified against the 0.1.3 and 0.1.4 release
+      # commits, so no separate lockfile synchronisation step is needed here.
+
+  start-pipeline:
+    name: Start the release pipeline
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
+      # Actions loads a workflow file from the ref it is dispatched against, so
+      # the pipeline that runs is the one that belongs to this tag.
+      - name: Dispatch release.yml against the tag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref "$TAG" -f "tag=$TAG"
+          echo "dispatched release.yml against $TAG"
