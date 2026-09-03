@@ -1,0 +1,49 @@
+# cargo-deny. Prüft Advisories, Lizenzen, Duplikate und Registries.
+# Jeder Eintrag unter `ignore` braucht Begründung, betroffenes Crate und
+# die Bedingung, unter der er wieder entfernt wird.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 ist unmaintained und es gibt keine neuere Version; ausschliesslich ueber ratatui 0.29.0 gezogen; entfernen sobald ratatui auf 0.30 oder neuer steht, dort ist die Abhaengigkeit weg. Stand 3. September 2026." },
+]
+
+[licenses]
+version = 2
+# devserial ist eine Anwendung unter GPL-3.0-or-later, deshalb steht die eigene
+# Lizenz mit in der Liste; ohne sie schlaegt der Check am eigenen Crate fehl.
+# cargo-deny vergleicht die genaue SPDX-Kennung, "GPL-3.0" allein genuegt nicht.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Ueber error-code, gezogen von clipboard-win, arboard und egui-winit.
+    "BSL-1.0",
+    # Die Schriftarten in epaint_default_fonts. Der Ausdruck dort ist
+    # "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0", also muessen beide
+    # Font-Lizenzen erlaubt sein, nicht nur ein Zweig. Die Notices dazu stehen
+    # in THIRD-PARTY-NOTICES.md.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
