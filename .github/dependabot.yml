@@ -7,9 +7,10 @@
 # `cooldown` hält eine Version, die kurz nach Veröffentlichung zurückgezogen
 # wird, aus jedem Pull Request heraus. Zeiten ohne `timezone` sind UTC.
 #
-# Kein npm-Eintrag, das Projekt hat kein Node-Unterprojekt. Der Eintrag für
-# `package-ecosystem: rust-toolchain` fehlt bewusst, solange es keine
-# rust-toolchain.toml gibt; er kommt mit dieser Datei zusammen.
+# Kein npm-Eintrag, das Projekt hat kein Node-Unterprojekt.
+#
+# `rust-toolchain` fehlt in der Ökosystem-Tabelle der GitHub-Dokumentation,
+# steht aber im veröffentlichten Schema json.schemastore.org/dependabot-2.0.json.
 
 version: 2
 
@@ -28,6 +29,18 @@ updates:
       rust-minor-patch:
         patterns: ['*']
         update-types: [minor, patch]
+
+  # Ein eigener Eintrag, weil die Toolchain den ganzen Build betrifft und sich
+  # keinen Pull Request mit etwas anderem teilen soll.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '05:05'
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 14
 
   - package-ecosystem: github-actions
     directory: /
