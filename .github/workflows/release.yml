@@ -760,8 +760,14 @@ jobs:
           chown -R builder:builder "$work"
 
           su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
-          package=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)
-          test -n "$package"
+          # No `-print -quit`: that takes the first hit in directory order,
+          # so the choice turns random as soon as makepkg splits off a second
+          # package such as a -debug. Exactly one must be left here, and it
+          # has to be the main package.
+          package=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
+                      ! -name '*-debug-*' | sort)
+          test "$(printf '%s\n' "$package" | grep -c .)" -eq 1 \
+            || { echo "::error::expected exactly one package, got: $package"; exit 1; }
 
           # The packaged binary has to be the released one, byte for byte.
           mkdir /tmp/from-archive /tmp/from-package
@@ -809,8 +815,14 @@ jobs:
           # need to reach for pacman as a non-root user.
           su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
 
-          package=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)
-          test -n "$package"
+          # No `-print -quit`: that takes the first hit in directory order,
+          # so the choice turns random as soon as makepkg splits off a second
+          # package such as a -debug. Exactly one must be left here, and it
+          # has to be the main package.
+          package=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
+                      ! -name '*-debug-*' | sort)
+          test "$(printf '%s\n' "$package" | grep -c .)" -eq 1 \
+            || { echo "::error::expected exactly one package, got: $package"; exit 1; }
 
           # namcap warnings are advisory, an error is not.
           namcap "$work/PKGBUILD" "$package" | tee namcap.txt || true
