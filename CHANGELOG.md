@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.7...devserial-v0.1.8) (2026-09-05)
+
+
+### Bug Fixes
+
+* **ci:** der Homebrew-Schritt benennt Repository und Branch ausdruecklich ([#34](https://github.com/metaneutrons/devserial/issues/34)) ([5d4dc50](https://github.com/metaneutrons/devserial/commit/5d4dc5076c942417c887e72747a32302255c3ee8))
+
 ## [0.1.7](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.6...devserial-v0.1.7) (2026-09-05)
 
 
