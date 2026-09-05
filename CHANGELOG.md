@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.8...devserial-v0.1.9) (2026-09-05)
+
+
+### Bug Fixes
+
+* **ci:** auf den ersten Check des Taps warten, bevor darauf gewartet wird ([#36](https://github.com/metaneutrons/devserial/issues/36)) ([050859a](https://github.com/metaneutrons/devserial/commit/050859a87b77fb0380504d086251e2ae709be1f3))
+
 ## [0.1.8](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.7...devserial-v0.1.8) (2026-09-05)
 
 

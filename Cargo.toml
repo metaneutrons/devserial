@@ -1,6 +1,6 @@
 [package]
 name = "devserial"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 authors = ["Fabian Schmieder"]
 description = "MCP server bridging serial hardware to LLMs via SQLite-backed buffer"
