@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.6...devserial-v0.1.7) (2026-09-05)
+
+
+### Bug Fixes
+
+* **ci:** kein Debug-Paket aus dem AUR-Quellpaket, und eindeutige Auswahl ([#32](https://github.com/metaneutrons/devserial/issues/32)) ([b43a93a](https://github.com/metaneutrons/devserial/commit/b43a93a4da482576d3661a4afade3e3f7cd02544))
+
 ## [0.1.6](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.5...devserial-v0.1.6) (2026-09-05)
 
 
