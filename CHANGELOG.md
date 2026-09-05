@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.10...devserial-v0.1.11) (2026-09-05)
+
+
+### Bug Fixes
+
+* **ci:** dem AUR-Index zwanzig Minuten statt fuenf geben ([#40](https://github.com/metaneutrons/devserial/issues/40)) ([4dd7b4d](https://github.com/metaneutrons/devserial/commit/4dd7b4d2da20dc84a418cdce665aa1a70643ea2a))
+
 ## [0.1.10](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.9...devserial-v0.1.10) (2026-09-05)
 
 
