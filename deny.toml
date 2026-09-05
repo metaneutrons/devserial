@@ -8,9 +8,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 ist unmaintained und es gibt keine neuere Version; ausschliesslich ueber ratatui 0.29.0 gezogen; entfernen sobald ratatui auf 0.30 oder neuer steht, dort ist die Abhaengigkeit weg. Stand 3. September 2026." },
-]
+# Keine Ausnahmen. Der bisherige Eintrag fuer RUSTSEC-2024-0436 (paste
+# unmaintained) nannte als Bedingung "entfernen sobald ratatui auf 0.30 oder
+# neuer steht"; ratatui 0.30 zieht paste nicht mehr, und die Abhaengigkeit ist
+# aus dem Baum verschwunden.
+ignore = []
 
 [licenses]
 version = 2
