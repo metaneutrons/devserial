@@ -210,9 +210,9 @@ conflicts=('${PACKAGE}-bin')
 # LLVM bitcode, rustc links the resulting archive without an LTO plugin, and
 # every sqlite3 symbol comes out undefined. That failure is on record from the
 # pipeline run against devserial-v0.1.4-pipelinetest.2; disabling LTO is the
-# usual remedy for a Rust package with a vendored C library. The archlinux
-# image only runs emulated on the maintainer machine, so the fix itself is
-# proven by the next pipeline run rather than locally.
+# usual remedy for a Rust package with a vendored C library. The fix is proven
+# by the run against devserial-v0.1.4-pipelinetest.4, where "Build the AUR
+# source package" succeeded.
 options=('!lto')
 source=("\${pkgname}::git+${HOMEPAGE}.git#tag=${tag}")
 sha256sums=('SKIP')
