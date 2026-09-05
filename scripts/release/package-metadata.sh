@@ -213,7 +213,14 @@ conflicts=('${PACKAGE}-bin')
 # usual remedy for a Rust package with a vendored C library. The fix is proven
 # by the run against devserial-v0.1.4-pipelinetest.4, where "Build the AUR
 # source package" succeeded.
-options=('!lto')
+# !debug, because makepkg otherwise splits off a second package,
+# devserial-debug, whose build-id symlink points at ../../../../bin/devserial,
+# that is out of the debug package and into the main one. namcap reports that
+# as an error: "Symlink ... points to non-existing". The AUR does not
+# distribute debug packages anyway. Seen in the run against devserial-v0.1.6
+# after the Arch image had upgraded 46 packages at run time; the same job
+# passed against 0.1.5.
+options=('!lto' '!debug')
 source=("\${pkgname}::git+${HOMEPAGE}.git#tag=${tag}")
 sha256sums=('SKIP')
 
