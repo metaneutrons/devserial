@@ -708,13 +708,21 @@ jobs:
           # aur@aur.archlinux.org closes the session with a banner and a
           # non-zero status even when the key is accepted, so the outcome is
           # read from the banner rather than from the exit code.
-          out=$(ssh -i "$RUNNER_TEMP/ssh/key" \
+          #
+          # No command argument. `ssh ... help` runs the help command and
+          # prints only the command list, without the banner; the check then
+          # rejected a key the AUR had just accepted. Measured against the
+          # real host on 5 September 2026, and that is exactly how run
+          # 33960471567 failed on a valid key. Without a command the AUR
+          # answers "Welcome to AUR, <account>!", which proves both the
+          # authentication and which account it authenticated as.
+          out=$(ssh -T -i "$RUNNER_TEMP/ssh/key" \
                     -o IdentitiesOnly=yes -o BatchMode=yes \
                     -o StrictHostKeyChecking=yes \
                     -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-                    aur@aur.archlinux.org help 2>&1 || true)
+                    aur@aur.archlinux.org 2>&1 || true)
           printf '%s\n' "$out"
-          if ! printf '%s' "$out" | grep -Eq 'Interactive shell is disabled|Welcome to AUR'; then
+          if ! printf '%s' "$out" | grep -Eq '^Welcome to AUR, .+!'; then
             echo "::error::preflight-aur: aur.archlinux.org did not accept the key"
             exit 1
           fi
