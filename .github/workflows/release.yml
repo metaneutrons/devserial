@@ -1115,8 +1115,15 @@ jobs:
           gh pr checks "$pr" --repo "$TAP" --watch --fail-fast
           gh pr merge "$pr" --repo "$TAP" --squash --delete-branch
 
-          published=$(gh api "repos/${TAP}/contents/Formula/devserial.rb" --jq .content | base64 --decode)
-          if ! diff <(printf '%s' "$published") ../candidate/devserial.rb >/dev/null; then
+          # Through a file, not a command substitution. $(...) strips the
+          # trailing newline and printf '%s' does not put it back, so the
+          # comparison failed by exactly one byte every time: 1736 against
+          # 1735, "\ No newline at end of file". This read-back could never
+          # have succeeded. It first ran at all in run 33976400255, because
+          # until then a step before it always failed first.
+          gh api "repos/${TAP}/contents/Formula/devserial.rb" --jq .content \
+            | base64 --decode > published.rb
+          if ! cmp -s published.rb ../candidate/devserial.rb; then
             echo "::error::the formula in the tap differs from the one that was qualified"
             exit 1
           fi
