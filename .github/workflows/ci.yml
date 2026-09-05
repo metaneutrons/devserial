@@ -45,7 +45,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/lefthook"
           "$RUNNER_TEMP/lefthook" validate
 
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
           tool: cargo-deny
       # Advisories, licences, duplicate versions and unknown registries.
@@ -88,7 +88,7 @@ jobs:
 
       # cargo-llvm-cov only on the cell that measures coverage, so the other
       # seven do not pay for a tool they never call.
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
           tool: cargo-nextest${{ matrix.coverage && ',cargo-llvm-cov' || '' }}
 
