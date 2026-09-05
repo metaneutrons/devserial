@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.5](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.4...devserial-v0.1.5) (2026-09-05)
+
+
+### Features
+
+* rework the architecture, apply the repository standard and harden the release ([#6](https://github.com/metaneutrons/devserial/issues/6)) ([578da88](https://github.com/metaneutrons/devserial/commit/578da88b9d81ebe023f7e49178e1b779d5768dbd))
+
+
+### Bug Fixes
+
+* **ci:** accept both spellings file uses for a statically linked binary ([#16](https://github.com/metaneutrons/devserial/issues/16)) ([fbeb134](https://github.com/metaneutrons/devserial/commit/fbeb134dea72fdd9b3ad65773d7a647271d2f0c8))
+* **ci:** das App-Token ueber client-id statt app-id ausstellen ([#29](https://github.com/metaneutrons/devserial/issues/29)) ([4c969ea](https://github.com/metaneutrons/devserial/commit/4c969ea49b96a27077819d1aafeb667456a5eed1))
+* **ci:** put the AUR licences under $pkgname and disable LTO for the source build ([#17](https://github.com/metaneutrons/devserial/issues/17)) ([38fa49e](https://github.com/metaneutrons/devserial/commit/38fa49e661528ef48f90f5384234a71fc0b841b3))
+* **ci:** read the release state back without the field that does not exist ([#18](https://github.com/metaneutrons/devserial/issues/18)) ([bbea268](https://github.com/metaneutrons/devserial/commit/bbea268e84e20d178533e039b99099421c7fb96e))
+
 ## [0.1.4](https://github.com/metaneutrons/devserial-mcp/compare/devserial-v0.1.3...devserial-v0.1.4) (2026-08-23)
 
 
