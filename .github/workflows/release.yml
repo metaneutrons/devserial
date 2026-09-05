@@ -1190,16 +1190,29 @@ jobs:
           cmp aur/.SRCINFO readback/.SRCINFO
           echo "the AUR repository carries exactly what was pushed"
 
-          for attempt in {1..20}; do
+          # Twenty minutes at half the request rate, where this allowed five.
+          # The git read-back above already proves the repository content byte
+          # for byte; this loop additionally waits for the AUR's own index,
+          # which a package helper queries and which refreshes on the AUR's
+          # schedule rather than ours. In run 33978245930 devserial converged
+          # within the window while devserial-bin did not, and it had
+          # converged by the time the run was inspected minutes later.
+          #
+          # The bound still fails hard. An index that never picks the push up
+          # is a real problem, and calling that a success would hide it.
+          for attempt in {1..40}; do
             if curl --fail --silent --get \
               --data-urlencode 'v=5' --data-urlencode 'type=info' \
               --data-urlencode "arg[]=${PACKAGE}" https://aur.archlinux.org/rpc |
               jq -e --arg v "${VERSION}-1" '.resultcount == 1 and .results[0].Version == $v' >/dev/null; then
-              echo "the AUR reports ${PACKAGE} ${VERSION}-1"
+              echo "the AUR reports ${PACKAGE} ${VERSION}-1 after $(( attempt * 30 )) seconds"
               exit 0
             fi
-            [[ "$attempt" == 20 ]] && { echo "::error::the AUR did not converge to ${PACKAGE} ${VERSION}-1"; exit 1; }
-            sleep 15
+            if [[ "$attempt" == 40 ]]; then
+              echo "::error::the AUR did not converge to ${PACKAGE} ${VERSION}-1 within twenty minutes"
+              exit 1
+            fi
+            sleep 30
           done
 
   # ---------------------------------------------------------------- stage 9
