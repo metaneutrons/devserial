@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "devserial"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "assert_cmd",
  "cc",
