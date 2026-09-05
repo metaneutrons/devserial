@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.5...devserial-v0.1.6) (2026-09-05)
+
+
+### Bug Fixes
+
+* **ci:** der AUR-Preflight wies eine gueltige Credential ab ([#30](https://github.com/metaneutrons/devserial/issues/30)) ([ee29580](https://github.com/metaneutrons/devserial/commit/ee295801cc2b2f6c2eec5873aaecbab180376a2c))
+
 ## [0.1.5](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.4...devserial-v0.1.5) (2026-09-05)
 
 
