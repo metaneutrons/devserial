@@ -3,6 +3,6 @@
 # sonst gibt es zwei Wahrheiten. Dependabot haelt die Datei ueber
 # package-ecosystem: rust-toolchain aktuell.
 [toolchain]
-channel = "1.98.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
