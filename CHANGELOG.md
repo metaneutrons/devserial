@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.9...devserial-v0.1.10) (2026-09-05)
+
+
+### Bug Fixes
+
+* **ci:** die Ruecklesung der Formel vergleicht byteweise ([#38](https://github.com/metaneutrons/devserial/issues/38)) ([7418ab6](https://github.com/metaneutrons/devserial/commit/7418ab6f693348f02c48a8a048f217132cf6a1bc))
+
 ## [0.1.9](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.8...devserial-v0.1.9) (2026-09-05)
 
 
