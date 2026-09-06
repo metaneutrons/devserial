@@ -203,6 +203,174 @@ struct SessionParts {
     history: Vec<String>,
 }
 
+/// Acts on a port this process owns.
+///
+/// The graphical window forwarded Break, DTR, RTS and macros over stdout to
+/// the process that held the port. A window that holds its own port has no
+/// such counterpart, so `send_event` answered "this window owns the port and
+/// handles actions directly" and the four controls did nothing at all. The
+/// terminal interface never had them.
+///
+/// This closure is that missing counterpart, and both surfaces use it.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+pub type DirectActionFn = Arc<dyn Fn(&PortAction) -> Result<(), String> + Send + Sync>;
+
+/// Something a surface asks the hardware to do.
+///
+/// Its own vocabulary rather than the window's wire type: `gui_ipc` exists to
+/// talk to a parent process and is compiled only with the window, while this
+/// path serves the terminal as well.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortAction {
+    /// Hold the line low for a while.
+    Break { duration_ms: Option<u64> },
+    /// Set one or both control lines.
+    Signal {
+        dtr: Option<bool>,
+        rts: Option<bool>,
+    },
+    /// Run a configured macro by name.
+    Macro { name: String },
+}
+
+/// Build the closure that carries out hardware actions on an owned port.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn direct_action(
+    runtime: tokio::runtime::Handle,
+    slot: Arc<tokio::sync::Mutex<Option<crate::port_manager::SerialPortHandle>>>,
+    config_path: Option<&Path>,
+) -> DirectActionFn {
+    // The macro table is read once. Re-reading it per keystroke would let a
+    // half-written configuration file break an action mid-session.
+    let macros = crate::config::load_config(config_path).unwrap_or_default();
+
+    Arc::new(move |action| {
+        // The macro is resolved before the port is taken, so an unknown name
+        // never leaves a half-run sequence behind.
+        let steps = match action {
+            PortAction::Break { duration_ms } => {
+                let ms = duration_ms.unwrap_or(crate::serial_params::DEFAULT_BREAK_MS);
+                vec![BreakOrSteps::Break(ms)]
+            }
+            PortAction::Signal { dtr, rts } => {
+                let mut steps = Vec::new();
+                if let Some(value) = *dtr {
+                    steps.push(BreakOrSteps::Step(crate::config::MacroStep::Dtr { value }));
+                }
+                if let Some(value) = *rts {
+                    steps.push(BreakOrSteps::Step(crate::config::MacroStep::Rts { value }));
+                }
+                steps
+            }
+            PortAction::Macro { name } => macros
+                .macro_steps(name)
+                .ok_or_else(|| {
+                    format!(
+                        "unknown macro '{name}'; available: {}",
+                        macros.available_macros().join(", ")
+                    )
+                })?
+                .into_iter()
+                .map(BreakOrSteps::Step)
+                .collect(),
+        };
+
+        let slot = Arc::clone(&slot);
+        runtime.block_on(async move {
+            // Resolved per call rather than captured, so the action follows
+            // the port across a reconnect and says so plainly when the link
+            // is down instead of acting on a stale handle.
+            let port = slot
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| "the port is not connected".to_string())?;
+            for item in steps {
+                match item {
+                    BreakOrSteps::Break(ms) => {
+                        let guard = port.lock().await;
+                        guard
+                            .set_break(true)
+                            .map_err(|e| format!("BREAK error: {e}"))?;
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        guard
+                            .set_break(false)
+                            .map_err(|e| format!("BREAK error: {e}"))?;
+                    }
+                    BreakOrSteps::Step(step) => {
+                        run_macro_steps(&port, std::slice::from_ref(&step)).await?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    })
+}
+
+/// Macro names the configuration offers, for a surface that lists them.
+///
+/// Only the terminal numbers them; the window shows Reset and Bootloader as
+/// named buttons instead.
+#[cfg(feature = "tui")]
+fn macro_names(config_path: Option<&Path>) -> Vec<String> {
+    crate::config::load_config(config_path)
+        .unwrap_or_default()
+        .available_macros()
+}
+
+/// A macro step or a BREAK, which is not expressible as a step.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+enum BreakOrSteps {
+    Break(u64),
+    Step(crate::config::MacroStep),
+}
+
+/// Carry out one macro, aborting at the first step that fails.
+///
+/// Mirrors what the daemon does, so a macro behaves the same whether it was
+/// started from a window, a terminal or the command line.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+async fn run_macro_steps(
+    port: &crate::port_manager::SerialPortHandle,
+    steps: &[crate::config::MacroStep],
+) -> Result<(), String> {
+    use crate::config::MacroStep;
+
+    for step in steps {
+        match step {
+            MacroStep::Dtr { value } => port
+                .lock()
+                .await
+                .set_dtr(*value)
+                .map_err(|e| format!("DTR error: {e}"))?,
+            MacroStep::Rts { value } => port
+                .lock()
+                .await
+                .set_rts(*value)
+                .map_err(|e| format!("RTS error: {e}"))?,
+            MacroStep::Delay { ms } => {
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+            }
+            MacroStep::Write { value } => {
+                // An unreadable step aborts the macro rather than silently
+                // sending nothing, as it does in the daemon.
+                let bytes = if crate::hex::has_prefix(value) {
+                    crate::hex::decode(value).map_err(|e| format!("hex error: {e}"))?
+                } else {
+                    value.as_bytes().to_vec()
+                };
+                port.lock()
+                    .await
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| format!("write error: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Start a reader that can actually come back after the device disappears.
 ///
 /// `spawn_reader` uses `NoReconnect`, which still runs the reconnect state
@@ -290,8 +458,9 @@ pub fn open_standalone_session(
 
     let writer = TokioSerialWriter {
         handle: Arc::clone(&parts.writer_slot),
-        runtime,
+        runtime: runtime.clone(),
     };
+    let action = direct_action(runtime, Arc::clone(&parts.writer_slot), None);
 
     let reconfigure: crate::monitor::ReconfigureFn = {
         let writer = writer.clone();
@@ -342,6 +511,7 @@ pub fn open_standalone_session(
             Box::new(writer) as Box<dyn std::io::Write + Send>
         ))),
         Some(reconfigure),
+        Some(action),
         Some(config.clone()),
         Some(toggle),
         Some(parts.keepalive),
@@ -419,7 +589,15 @@ pub fn run_monitor_standalone(
                         &parts.shared_storage,
                         &port_handle,
                         &handle,
-                        parts.keepalive.link(),
+                        crate::tui::TuiContext {
+                            link: parts.keepalive.link(),
+                            action: Some(direct_action(
+                                handle.clone(),
+                                Arc::clone(&parts.writer_slot),
+                                config_path,
+                            )),
+                            macros: macro_names(config_path),
+                        },
                     ),
                     None => Err(CliError::msg("serial port is disconnected")),
                 }
@@ -473,8 +651,23 @@ pub fn run_tui_standalone(
         )
     };
     let link = Some(reader.state_rx.clone());
+    // The reader's factory swaps the port behind this handle on a reconnect,
+    // so a slot holding it stays correct for the whole run.
+    let slot = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&port_handle))));
+    let context = crate::tui::TuiContext {
+        link,
+        action: Some(direct_action(runtime.handle().clone(), slot, config_path)),
+        macros: macro_names(config_path),
+    };
 
-    let result = crate::tui::run_tui(port, config, &storage, &port_handle, runtime.handle(), link);
+    let result = crate::tui::run_tui(
+        port,
+        config,
+        &storage,
+        &port_handle,
+        runtime.handle(),
+        context,
+    );
     // Held until here on purpose: dropping the reader ends the task that fills
     // the buffer the interface above was reading from.
     drop(reader);

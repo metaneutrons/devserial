@@ -109,6 +109,27 @@ fn check_flash_request(
     Ok((path, baud))
 }
 
+/// The hardware action an event asks for, if it asks for one.
+///
+/// Writing and reconfiguring have their own direct paths, so only these three
+/// reach the action closure. `MonitorEvent` is the wire type for talking to a
+/// parent process; `PortAction` is what a surface asks of hardware it holds
+/// itself, and the terminal speaks it too.
+fn port_action_of(event: &MonitorEvent) -> Option<crate::standalone::PortAction> {
+    use crate::standalone::PortAction;
+    match event {
+        MonitorEvent::Break { duration_ms } => Some(PortAction::Break {
+            duration_ms: *duration_ms,
+        }),
+        MonitorEvent::Signal { dtr, rts } => Some(PortAction::Signal {
+            dtr: *dtr,
+            rts: *rts,
+        }),
+        MonitorEvent::Macro { name } => Some(PortAction::Macro { name: name.clone() }),
+        _ => None,
+    }
+}
+
 /// Reduce a tool's output to the one line that says what went wrong.
 ///
 /// The **last** line, not the first. espflash opens with timestamped notes and
@@ -505,6 +526,9 @@ fn run_monitor_inner(
         history,
         direct_port,
         direct_reconfigure,
+        // This entry point is the monitor subprocess, which forwards its
+        // actions to the process that owns the port.
+        None,
         None,
         None,
         keepalive,
@@ -1084,6 +1108,12 @@ pub struct PortMonitorState {
     connected: bool,
     pub direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
     pub direct_reconfigure: Option<ReconfigureFn>,
+    /// Carries out Break, DTR, RTS and macros when this window owns the port.
+    ///
+    /// Without it those four went through `send_event`, which refuses as soon
+    /// as the window holds the port itself. Every one of them therefore did
+    /// nothing at all in `devserial gui`.
+    pub direct_action: Option<crate::standalone::DirectActionFn>,
     show_transfer_dialog: bool,
     transfer_path: String,
     transfer_proto: crate::modem::FileTransferProtocol,
@@ -1134,6 +1164,7 @@ impl PortMonitorState {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1146,6 +1177,7 @@ impl PortMonitorState {
         history: Vec<String>,
         direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
         direct_reconfigure: Option<ReconfigureFn>,
+        direct_action: Option<crate::standalone::DirectActionFn>,
         initial_config: Option<PortConfig>,
         toggle_connect: Option<ToggleConnectFn>,
         keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
@@ -1175,6 +1207,7 @@ impl PortMonitorState {
             connected: true,
             direct_port,
             direct_reconfigure,
+            direct_action,
             show_transfer_dialog: false,
             transfer_path: String::new(),
             transfer_proto: crate::modem::FileTransferProtocol::Zmodem,
@@ -3325,11 +3358,18 @@ impl PortMonitorState {
         }
     }
 
-    /// Report a user action to the process that owns the port.
+    /// Report a user action to whoever owns the port.
     ///
-    /// Windows with a direct port handle act on their own; windows driven by a
-    /// parent process forward the typed event over stdout.
+    /// A window that owns the port carries the action out itself; one driven by
+    /// a parent process forwards the typed event over stdout. Before there was
+    /// a direct path, the first case simply returned an error, so Break, DTR,
+    /// RTS and the macro buttons were dead in `devserial gui`.
     fn send_event(&self, event: &MonitorEvent) -> Result<(), String> {
+        if let Some(act) = self.direct_action.as_ref()
+            && let Some(action) = port_action_of(event)
+        {
+            return act(&action);
+        }
         if self.direct_port.is_some() {
             return Err("this window owns the port and handles actions directly".to_string());
         }

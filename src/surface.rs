@@ -128,6 +128,10 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::ScrollBack, "auto_follow"),
     (Capability::FileTransfer, "InputMode::SendFile"),
     (Capability::About, "InputMode::About"),
+    (Capability::ClearBuffer, "\"Display cleared\""),
+    (Capability::Filter, "InputMode::Filter"),
+    (Capability::ControlLines, "enum ControlLine"),
+    (Capability::Macros, "fn handle_macros_key"),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.
@@ -137,8 +141,9 @@ pub const TUI: &[(Capability, &str)] = &[
 /// therefore fails the test until it is either built for the terminal too or
 /// written down here on purpose.
 ///
-/// Everything below was measured on 6 September 2026 and is debt, not design.
-/// A terminal can do all of it.
+/// Everything below is debt, not design; a terminal can do all of it. Four
+/// entries left this list on 6 September 2026: clearing the view, the filter,
+/// the control lines and the macros.
 #[cfg(all(feature = "monitor", feature = "tui"))]
 pub const KNOWN_GAPS: &[(Capability, &str)] = &[
     (
@@ -149,14 +154,10 @@ pub const KNOWN_GAPS: &[(Capability, &str)] = &[
         Capability::LineEnding,
         "the terminal always appends the configured ending, with no way to pick one",
     ),
-    (Capability::ControlLines, "no key sets DTR or RTS"),
-    (Capability::Macros, "no key runs a named macro"),
     (
         Capability::ToggleConnection,
         "the terminal holds its port for its whole run",
     ),
-    (Capability::Filter, "no key narrows the view"),
-    (Capability::ClearBuffer, "no key discards the buffer"),
     (Capability::Export, "no key writes the buffer out"),
     (
         Capability::TransferProtocol,
