@@ -79,11 +79,13 @@ pub fn run_tui(
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
     write_port: &SerialPortHandle,
     runtime: &tokio::runtime::Handle,
+    link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
 ) -> Result<(), CliError> {
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     run_app(
+        link,
         &mut terminal,
         port_name,
         config,
@@ -116,17 +118,31 @@ struct AppState {
     baud_index: usize,
     /// Show the capture time in front of every line.
     show_timestamps: bool,
+    /// What the reader reports about the hardware, when this window owns it.
+    ///
+    /// Without it the bar could only show what the user had asked for, and an
+    /// unplugged device left it claiming a connection that was long gone.
+    link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
     /// Render payloads as a hex dump instead of text.
     hex_view: bool,
 }
 
 impl AppState {
+    /// True while the reader says the hardware is not there.
+    fn link_is_down(&self) -> bool {
+        !matches!(
+            self.link.as_ref().map(|rx| rx.borrow().clone()),
+            Some(crate::reader::ConnectionState::Connected) | None
+        )
+    }
+
     fn new(port_name: &str, config: &PortConfig) -> Self {
         let baud_index = BAUD_PRESETS
             .iter()
             .position(|&b| b == config.baudrate)
             .unwrap_or(4);
         Self {
+            link: None,
             lines: std::collections::VecDeque::new(),
             last_id: 0,
             scroll_offset: 0,
@@ -167,6 +183,7 @@ impl AppState {
 
 #[allow(clippy::too_many_lines)]
 fn run_app(
+    link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     port_name: &str,
     config: &PortConfig,
@@ -175,6 +192,7 @@ fn run_app(
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), CliError> {
     let mut state = AppState::new(port_name, config);
+    state.link = link;
 
     loop {
         // Poll new lines from storage.
@@ -491,6 +509,50 @@ const fn next_flow_control(current: FlowControl) -> FlowControl {
     }
 }
 
+/// How the link reads in the status bar.
+///
+/// The same three states the graphical window shows, in the same words, so a
+/// report from one is understood by someone looking at the other.
+fn link_label(state: &AppState) -> String {
+    match state.link.as_ref().map(|rx| rx.borrow().clone()) {
+        Some(crate::reader::ConnectionState::Disconnected { attempts, .. }) => {
+            format!("Link lost, retrying ({attempts})")
+        }
+        Some(crate::reader::ConnectionState::Reconnecting) => "Reconnecting".to_string(),
+        // No reader means this window does not own the port; whoever does
+        // answers the question.
+        Some(crate::reader::ConnectionState::Connected) | None => "Connected".to_string(),
+    }
+}
+
+/// The one-line bar above the buffer.
+///
+/// The link state sits right behind the port name, and the whole bar turns red
+/// while the link is gone, so a device that vanished is noticed without
+/// reading the text.
+fn render_status_bar(
+    frame: &mut Frame,
+    state: &AppState,
+    area: ratatui::layout::Rect,
+    view: &str,
+    status_text: &str,
+    follow: &str,
+) {
+    let status = format!(
+        " {} | {} | {} | Lines: {} | View: {view} | {status_text}{follow}",
+        state.port_name,
+        link_label(state),
+        state.config.framing_summary(),
+        state.lines.len(),
+    );
+    let bar = if state.link_is_down() {
+        Style::default().bg(Color::Red)
+    } else {
+        Style::default().bg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(status).style(bar), area);
+}
+
 fn render(frame: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -518,16 +580,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         (false, true) => "hex",
         (false, false) => "raw",
     };
-    let status = format!(
-        " {} | {} | Lines: {} | View: {view} | {status_text}{follow}",
-        state.port_name,
-        state.config.framing_summary(),
-        state.lines.len(),
-    );
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().bg(Color::DarkGray)),
-        chunks[0],
-    );
+    render_status_bar(frame, state, chunks[0], view, &status_text, follow);
 
     let visible_height = chunks[1].height as usize;
     let end = (state.scroll_offset + visible_height).min(state.lines.len());

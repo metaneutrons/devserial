@@ -32,6 +32,7 @@ pub mod server;
 pub mod standalone;
 pub mod state;
 pub mod storage;
+pub mod surface;
 pub mod transport;
 #[cfg(feature = "tui")]
 pub mod tui;

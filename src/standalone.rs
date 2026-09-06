@@ -70,6 +70,29 @@ impl SessionKeepalive {
         *guard = reader;
     }
 
+    /// What the reader currently reports about the hardware.
+    ///
+    /// The windows used to show whether the user had pressed Disconnect, which
+    /// is not the same question. A device that is unplugged leaves that flag
+    /// untouched, so the indicator went on claiming a connection that had been
+    /// gone for minutes.
+    pub fn connection_state(&self) -> Option<crate::reader::ConnectionState> {
+        self.reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(crate::reader::PortReaderHandle::state)
+    }
+
+    /// Watch on what the reader reports, for a surface that shows it.
+    pub fn link(&self) -> Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>> {
+        self.reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|reader| reader.state_rx.clone())
+    }
+
     /// Runtime handle for blocking calls from the GUI thread.
     ///
     /// The monitor window also uses it to run espflash while the port is
@@ -180,6 +203,31 @@ struct SessionParts {
     history: Vec<String>,
 }
 
+/// Start a reader that can actually come back after the device disappears.
+///
+/// `spawn_reader` uses `NoReconnect`, which still runs the reconnect state
+/// machine but can never produce a port. A window using it reports rising
+/// attempt counts for as long as it is open and reconnects never. Measured
+/// against a real device unplugged and replugged: six attempts in fifteen
+/// seconds, none of which could have succeeded, while the daemon on the same
+/// device was back after six seconds.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn spawn_reconnecting_reader(
+    path: &str,
+    config: &PortConfig,
+    storage: &Arc<Mutex<SqliteStorage>>,
+    shared: crate::port_manager::SharedSerialPort,
+) -> crate::reader::PortReaderHandle {
+    let factory = crate::port_manager::SerialReconnectFactory::new(path, config, shared.handle());
+    crate::reader::spawn_reader_with_reconnect(
+        shared,
+        storage,
+        config,
+        crate::reader::FlushSettings::default(),
+        factory,
+    )
+}
+
 /// Open a port, start capturing, and return the pieces a GUI window needs.
 #[cfg(feature = "monitor")]
 fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<SessionParts, String> {
@@ -212,7 +260,7 @@ fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<Ses
         let writer_slot = Arc::new(tokio::sync::Mutex::new(Some(shared.handle())));
         (
             writer_slot,
-            crate::reader::spawn_reader(shared, &shared_storage, config),
+            spawn_reconnecting_reader(port, config, &shared_storage, shared),
         )
     };
 
@@ -274,7 +322,7 @@ pub fn open_standalone_session(
                 let shared = crate::port_manager::SharedSerialPort::new(serial);
                 (
                     shared.handle(),
-                    crate::reader::spawn_reader(shared, &storage, config),
+                    spawn_reconnecting_reader(&port, config, &storage, shared),
                 )
             };
             runtime.block_on(async {
@@ -371,6 +419,7 @@ pub fn run_monitor_standalone(
                         &parts.shared_storage,
                         &port_handle,
                         &handle,
+                        parts.keepalive.link(),
                     ),
                     None => Err(CliError::msg("serial port is disconnected")),
                 }
@@ -414,17 +463,22 @@ pub fn run_tui_standalone(
     // The reader handle is kept in scope for the whole session, which is what
     // keeps the reader task running. Opening the port needs the reactor too,
     // so both happen under the same guard.
-    let (port_handle, _reader) = {
+    let (port_handle, reader) = {
         let _guard = runtime.enter();
         let serial = crate::port_manager::open_serial_port_raw(port, config)?;
         let shared = crate::port_manager::SharedSerialPort::new(serial);
         (
             shared.handle(),
-            crate::reader::spawn_reader(shared, &storage, config),
+            spawn_reconnecting_reader(port, config, &storage, shared),
         )
     };
+    let link = Some(reader.state_rx.clone());
 
-    crate::tui::run_tui(port, config, &storage, &port_handle, runtime.handle())
+    let result = crate::tui::run_tui(port, config, &storage, &port_handle, runtime.handle(), link);
+    // Held until here on purpose: dropping the reader ends the task that fills
+    // the buffer the interface above was reading from.
+    drop(reader);
+    result
 }
 
 /// Protocol settings for a port configuration.

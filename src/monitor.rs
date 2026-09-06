@@ -2884,15 +2884,41 @@ impl PortMonitorState {
         }
     }
 
+    /// Colour and wording for the connection indicator.
+    ///
+    /// `self.connected` records what the user asked for. It says nothing about
+    /// the hardware: a device that is unplugged leaves it untouched, and the
+    /// indicator then claimed a connection that had been gone for minutes.
+    /// The reader knows better, so it is asked first and only overruled when
+    /// the user has deliberately disconnected.
+    fn link_status(&self) -> (egui::Color32, String) {
+        const GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 80);
+        const RED: egui::Color32 = egui::Color32::from_rgb(200, 60, 60);
+        const AMBER: egui::Color32 = egui::Color32::from_rgb(255, 180, 60);
+
+        if !self.connected {
+            return (RED, "Disconnected".to_string());
+        }
+        match self.keepalive.as_ref().and_then(|k| k.connection_state()) {
+            Some(crate::reader::ConnectionState::Disconnected { attempts, .. }) => {
+                (RED, format!("Link lost, retrying ({attempts})"))
+            }
+            Some(crate::reader::ConnectionState::Reconnecting) => {
+                (AMBER, "Reconnecting".to_string())
+            }
+            // No reader means this window does not own the port, and the
+            // question is answered by whoever does.
+            Some(crate::reader::ConnectionState::Connected) | None => {
+                (GREEN, "Connected".to_string())
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn render_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             // Group 1: Connection status indicator & Disconnect/Connect toggle
-            let (status_color, status_label) = if self.connected {
-                (egui::Color32::from_rgb(80, 200, 80), "Connected")
-            } else {
-                (egui::Color32::from_rgb(200, 60, 60), "Disconnected")
-            };
+            let (status_color, status_label) = self.link_status();
             ui.colored_label(status_color, format!("● {status_label}"));
 
             if self.connected {
