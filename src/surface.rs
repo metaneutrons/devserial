@@ -11,7 +11,11 @@
 //! This module is that comparison. Every capability is named once here, each
 //! surface declares which ones it offers, and the test below fails when the
 //! difference between them changes. Closing a gap and opening one both require
-//! editing [`KNOWN_GAPS`], so neither happens by accident.
+//! editing `KNOWN_GAPS`, so neither happens by accident.
+//!
+//! Written as plain text rather than a link: `KNOWN_GAPS` only exists when both
+//! surfaces are compiled in, and a link to it fails the documentation build for
+//! every other feature set.
 
 /// One thing a person can do with an open port.
 ///
