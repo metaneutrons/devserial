@@ -411,10 +411,29 @@ impl AsyncRead for SharedSerialPort {
 }
 
 /// Factory that reconnects to a real serial port.
-struct SerialReconnectFactory {
+///
+/// Public because the standalone sessions behind the GUI and the TUI need the
+/// same behaviour. Without it their reader still enters the reconnect loop and
+/// still reports rising attempt counts, but the factory can never hand back a
+/// port, so the loop runs for as long as the window is open and never
+/// succeeds. Measured against a real device: six attempts in the first fifteen
+/// seconds, none of which could have worked.
+pub struct SerialReconnectFactory {
     path: String,
     config: PortConfig,
     port_handle: SerialPortHandle,
+}
+
+impl SerialReconnectFactory {
+    /// Reopen `path` with `config` and publish the new port through `handle`.
+    #[must_use]
+    pub fn new(path: &str, config: &PortConfig, port_handle: SerialPortHandle) -> Self {
+        Self {
+            path: path.to_string(),
+            config: config.clone(),
+            port_handle,
+        }
+    }
 }
 
 impl ReaderFactory for SerialReconnectFactory {
@@ -739,11 +758,7 @@ fn open_real_port(
     let shared = SharedSerialPort::new(port);
     let port_handle = shared.handle();
 
-    let factory = SerialReconnectFactory {
-        path: name.to_string(),
-        config: config.clone(),
-        port_handle: Arc::clone(&port_handle),
-    };
+    let factory = SerialReconnectFactory::new(name, &config, Arc::clone(&port_handle));
 
     let reader_handle = spawn_reader_with_reconnect(shared, &storage, &config, flush, factory);
 

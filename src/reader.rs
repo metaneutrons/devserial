@@ -295,8 +295,22 @@ async fn reader_loop(
             result = reader.read(&mut buf) => {
                 match result {
                     Ok(0) => {
+                        // Zero bytes is the far end going away, not a quiet
+                        // moment. The ports here carry no read timeout, so
+                        // serial2_tokio parks on the reactor when nothing has
+                        // arrived rather than returning zero.
+                        //
+                        // Measured on macOS, a real USB device unplugged and
+                        // replugged takes the error arm below. This arm is the
+                        // belt to that pair of braces: without it the task
+                        // ends silently and the port goes on reporting itself
+                        // as connected for as long as anyone cares to ask.
                         flush_batch(&mut batch, &mut partial, line_tx).await;
-                        return false;
+                        state_tx.send_replace(ConnectionState::Disconnected {
+                            since_ms: 0,
+                            attempts: 0,
+                        });
+                        return true;
                     }
                     Ok(n) => {
                         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -434,6 +448,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_that_ends_counts_as_a_disconnect() {
+        let (mock, ctrl) = mock_serial(100);
+        let storage = test_storage();
+        // No factory here, so reconnecting is off; the question is only what
+        // the state says once the source is gone.
+        let mut config = test_config();
+        config.auto_reconnect = false;
+        let handle = spawn_reader(mock, &storage, &config);
+        assert_eq!(handle.state(), ConnectionState::Connected);
+
+        drop(ctrl);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            matches!(handle.state(), ConnectionState::Disconnected { .. }),
+            "a source at its end must not leave the port claiming to be connected, got {:?}",
+            handle.state()
+        );
+    }
+
+    #[tokio::test]
     async fn test_timestamps_monotonic() {
         let (mock, ctrl) = mock_serial(100);
         let storage = test_storage();
@@ -494,6 +529,13 @@ mod tests {
         struct TestFactory {
             count: Arc<AtomicU32>,
             ctrl: crate::testutil::mock_serial::MockSerialControl,
+            /// Keeps the reconnected mocks alive.
+            ///
+            /// Dropping the control closes the channel, and the fresh source
+            /// is then already at its end. The reader now treats that as a
+            /// disconnect, which is right and made this fixture's flaw
+            /// visible: handing back a dead source is not a reconnect.
+            issued: std::sync::Mutex<Vec<crate::testutil::mock_serial::MockSerialControl>>,
         }
 
         impl ReaderFactory for TestFactory {
@@ -502,7 +544,8 @@ mod tests {
                     let n = self.count.fetch_add(1, Ordering::SeqCst);
                     if n >= 1 {
                         self.ctrl.simulate_reconnect();
-                        let (new_mock, _) = mock_serial(100);
+                        let (new_mock, new_ctrl) = mock_serial(100);
+                        self.issued.lock().unwrap().push(new_ctrl);
                         Some(Box::new(new_mock) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)
                     } else {
                         None
@@ -524,6 +567,7 @@ mod tests {
         let factory = TestFactory {
             count: Arc::clone(&connect_count),
             ctrl: ctrl_clone,
+            issued: std::sync::Mutex::new(Vec::new()),
         };
 
         let handle =

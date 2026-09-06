@@ -1254,7 +1254,25 @@ mod tests {
     use crate::storage::SqliteStorage;
     use crate::testutil::mock_serial::mock_serial;
 
-    async fn setup() -> DevSerialServer {
+    /// A server whose mock port stays alive for as long as the test does.
+    ///
+    /// Dropping the control closes the mock's channel, and the port is then a
+    /// source at its end. The reader now calls that a disconnect, which is
+    /// right and made this fixture's flaw visible: every test here used to run
+    /// against a port that had died the moment setup returned.
+    struct TestServer {
+        server: DevSerialServer,
+        _ctrl: crate::testutil::mock_serial::MockSerialControl,
+    }
+
+    impl std::ops::Deref for TestServer {
+        type Target = DevSerialServer;
+        fn deref(&self) -> &Self::Target {
+            &self.server
+        }
+    }
+
+    async fn setup() -> TestServer {
         let pm = PortManagerHandle::new();
         let server = DevSerialServer::with_port_manager(pm);
         let (mock, ctrl) = mock_serial(4096);
@@ -1268,7 +1286,10 @@ mod tests {
         ctrl.feed_lines(&["[INFO] boot", "[ERROR] failure", "[INFO] done"])
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        server
+        TestServer {
+            server,
+            _ctrl: ctrl,
+        }
     }
 
     fn read_params(port: &str) -> ReadBufferParams {
