@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
+/// Copyright line shown wherever the program names itself.
+///
+/// The year lives here rather than at each site that prints it. `resources/`
+/// `macos.m` carries its own copy for the native About panel, which cannot
+/// read a Rust constant.
+pub const COPYRIGHT: &str = "\u{a9} 2026 Fabian Schmieder";
+
 pub mod assets;
 pub mod cli;
 pub mod config;
