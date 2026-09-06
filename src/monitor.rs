@@ -28,6 +28,111 @@ const MAX_DISPLAY_LINES: usize = 100_000;
 /// Upper bound on lines pulled into memory for one export.
 const MAX_EXPORT_LINES: u32 = 500_000;
 
+/// Everything the firmware dialog needs to keep between frames.
+///
+/// One struct rather than a dozen fields on the window, so the whole feature
+/// sits behind a single `cfg` and leaves no dead state when espflash support
+/// is compiled out.
+#[cfg(feature = "esp")]
+#[derive(Default)]
+struct FlashDialog {
+    open: bool,
+    /// Path to the firmware image, as typed.
+    path: String,
+    /// Empty means espflash picks its own flashing baud rate.
+    baud: String,
+    /// Whether espflash was found in `PATH`; `None` until the probe answers.
+    available: Option<bool>,
+    probing: bool,
+    /// Lines from the running tool, oldest first.
+    log: Vec<String>,
+    running: Option<RunningFlash>,
+    /// Outcome of the last run and whether it failed.
+    outcome: Option<(String, bool)>,
+    /// Second press needed before the flash is erased.
+    erase_armed: bool,
+}
+
+/// The channels of a flash or erase that is still running.
+#[cfg(feature = "esp")]
+struct RunningFlash {
+    lines: tokio::sync::mpsc::UnboundedReceiver<crate::esp::OutputLine>,
+    result: tokio::sync::oneshot::Receiver<Result<String, String>>,
+    /// What to call the operation in the outcome message.
+    what: &'static str,
+}
+
+/// Longest run of tool output the firmware dialog keeps.
+#[cfg(feature = "esp")]
+const MAX_FLASH_LOG_LINES: usize = 2000;
+
+/// Result of the one-off espflash probe, shared with the frame that asked.
+#[cfg(feature = "esp")]
+static ESPFLASH_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "esp")]
+const PROBE_FOUND: u8 = 1;
+#[cfg(feature = "esp")]
+const PROBE_MISSING: u8 = 2;
+
+/// Check what the dialog was asked to do before anything is released.
+///
+/// The port is disconnected as the first step of a run, so a request that was
+/// never going to work has to be rejected before that happens. Erasing needs
+/// no image, which is the only difference between the two operations here.
+///
+/// Returns the image path and the baud rate for espflash, where `None` leaves
+/// the choice to the tool.
+#[cfg(feature = "esp")]
+fn check_flash_request(
+    path: &str,
+    baud: &str,
+    erase: bool,
+) -> Result<(String, Option<u32>), String> {
+    let path = path.trim().to_string();
+    if !erase {
+        if path.is_empty() {
+            return Err("Name a firmware image first.".to_string());
+        }
+        if !std::path::Path::new(&path).is_file() {
+            return Err(format!("No file at '{path}'."));
+        }
+    }
+
+    let baud = match baud.trim() {
+        "" => None,
+        text => match text.parse::<u32>() {
+            Ok(value) if value > 0 => Some(value),
+            _ => return Err(format!("'{text}' is not a baud rate.")),
+        },
+    };
+
+    Ok((path, baud))
+}
+
+/// Reduce a tool's output to the one line that says what went wrong.
+///
+/// The **last** line, not the first. espflash opens with timestamped notes and
+/// sometimes a warning about an unrelated option, then prints the reason last
+/// inside a box-drawing frame. Taking the first line of a failed connection
+/// yields "Monitor options were provided", which explains nothing; taking the
+/// last yields "Failed to connect to the device", which is the answer.
+///
+/// The frame characters come off, because they are decoration around the words
+/// rather than part of them.
+#[cfg(feature = "esp")]
+fn failure_summary(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(['\u{2570}', '\u{2500}', '\u{25b6}', '\u{d7}', ' '])
+                .trim()
+        })
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+        .to_string()
+}
+
 /// Callback type for direct hardware reconfiguration in standalone mode.
 pub type ReconfigureFn = Arc<dyn Fn(&PortConfig) -> Result<(), String> + Send + Sync>;
 
@@ -1002,7 +1107,12 @@ pub struct PortMonitorState {
     pub toggle_connect: Option<ToggleConnectFn>,
     /// Keeps the session runtime and reader alive for as long as this window
     /// exists. Dropping it shuts both down in order.
-    _keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
+    ///
+    /// The firmware dialog also borrows its runtime to run espflash while the
+    /// port is released, so this is read as well as held.
+    keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
+    #[cfg(feature = "esp")]
+    flash: FlashDialog,
 }
 
 impl PortMonitorState {
@@ -1085,7 +1195,9 @@ impl PortMonitorState {
             open_port_dialog_requested: false,
             is_selecting_in_buffer: false,
             toggle_connect,
-            _keepalive: keepalive,
+            keepalive,
+            #[cfg(feature = "esp")]
+            flash: FlashDialog::default(),
         }
     }
 
@@ -1100,6 +1212,350 @@ impl PortMonitorState {
     /// Windows that only display a capture database, such as the monitor
     /// subprocess of the MCP server, do not own the port and say so instead of
     /// sending a command nobody handles.
+    /// Runtime the session runs on, if this window owns its port.
+    #[cfg(feature = "esp")]
+    fn session_runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.keepalive.as_ref().and_then(|k| k.handle())
+    }
+
+    /// Ask once whether espflash is installed, without blocking the frame.
+    #[cfg(feature = "esp")]
+    fn probe_espflash(&mut self, ctx: &egui::Context) {
+        if self.flash.available.is_some() || self.flash.probing {
+            return;
+        }
+        let Some(runtime) = self.session_runtime() else {
+            // No runtime means this window does not own the port, and the
+            // dialog will say so rather than pretend to look.
+            self.flash.available = Some(false);
+            return;
+        };
+        self.flash.probing = true;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            let _ = tx.send(crate::esp::is_available().await);
+        });
+        // The answer is picked up by the poll below; parking the receiver in
+        // the running slot would confuse it with an actual flash.
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Ok(found) = rx.blocking_recv() {
+                ESPFLASH_PROBE.store(
+                    if found { PROBE_FOUND } else { PROBE_MISSING },
+                    std::sync::atomic::Ordering::Release,
+                );
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Start espflash with the port released, and remember how to get it back.
+    ///
+    /// The window owns the port, so espflash cannot have it at the same time.
+    /// Releasing is therefore part of the operation rather than something the
+    /// user has to remember, and reconnecting happens whatever the outcome.
+    #[cfg(feature = "esp")]
+    fn start_flash_operation(&mut self, ctx: &egui::Context, erase: bool) {
+        let Some(runtime) = self.session_runtime() else {
+            self.flash.outcome = Some((
+                "This window does not own the port, so it cannot release it for espflash."
+                    .to_string(),
+                true,
+            ));
+            return;
+        };
+
+        let (path, baud) = match check_flash_request(&self.flash.path, &self.flash.baud, erase) {
+            Ok(request) => request,
+            Err(message) => {
+                self.flash.outcome = Some((message, true));
+                return;
+            }
+        };
+
+        // Release first. A failure here means espflash would have found the
+        // port busy, so the operation stops before it starts.
+        let config = self.current_config();
+        if self.connected
+            && let Some(toggle) = self.toggle_connect.clone()
+        {
+            if let Err(e) = toggle(false, &config) {
+                self.flash.outcome = Some((format!("Could not release the port: {e}"), true));
+                return;
+            }
+            self.connected = false;
+        }
+
+        let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let port = self.port_name.clone();
+        let repaint = ctx.clone();
+        runtime.spawn(async move {
+            let result = if erase {
+                crate::esp::erase_flash_with_progress(&port, Some(&line_tx)).await
+            } else {
+                crate::esp::flash_with_progress(&port, &path, baud, Some(&line_tx)).await
+            };
+            let _ = done_tx.send(result);
+            repaint.request_repaint();
+        });
+
+        self.flash.log.clear();
+        self.flash.outcome = None;
+        self.flash.erase_armed = false;
+        self.flash.running = Some(RunningFlash {
+            lines: line_rx,
+            result: done_rx,
+            what: if erase { "Erase" } else { "Flash" },
+        });
+    }
+
+    /// Move finished lines into the log and finish the run when it ends.
+    #[cfg(feature = "esp")]
+    fn poll_flash_operation(&mut self, ctx: &egui::Context) {
+        if self.flash.probing {
+            match ESPFLASH_PROBE.load(std::sync::atomic::Ordering::Acquire) {
+                PROBE_FOUND => {
+                    self.flash.available = Some(true);
+                    self.flash.probing = false;
+                }
+                PROBE_MISSING => {
+                    self.flash.available = Some(false);
+                    self.flash.probing = false;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(running) = self.flash.running.as_mut() else {
+            return;
+        };
+
+        while let Ok(line) = running.lines.try_recv() {
+            self.flash.log.push(line.text);
+        }
+        // A long flash prints thousands of lines. Keeping all of them would
+        // grow without bound for no benefit; the tail is what is being read.
+        if self.flash.log.len() > MAX_FLASH_LOG_LINES {
+            let excess = self.flash.log.len() - MAX_FLASH_LOG_LINES;
+            self.flash.log.drain(..excess);
+        }
+
+        let outcome = match running.result.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                return;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Err("the operation ended without an answer".to_string())
+            }
+        };
+
+        // Whatever happened, drain what is still queued before finishing, or
+        // the last lines of a failure are the ones that never appear.
+        while let Ok(line) = running.lines.try_recv() {
+            self.flash.log.push(line.text);
+        }
+        let what = running.what;
+        self.flash.running = None;
+
+        self.flash.outcome = Some(match &outcome {
+            Ok(_) => (format!("{what} finished."), false),
+            Err(e) => (format!("{what} failed: {}", failure_summary(e)), true),
+        });
+        if let Err(e) = &outcome {
+            self.flash.log.push(String::new());
+            self.flash.log.push(e.clone());
+        }
+
+        // Reconnect in both cases. A window left disconnected after a failed
+        // flash looks broken, and the port is free either way.
+        let config = self.current_config();
+        if let Some(toggle) = self.toggle_connect.clone() {
+            match toggle(true, &config) {
+                Ok(()) => self.connected = true,
+                Err(e) => {
+                    self.flash.outcome = Some((
+                        format!("{what} done, but the port did not come back: {e}"),
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "esp")]
+    #[allow(clippy::too_many_lines)]
+    fn render_flash_dialog(&mut self, ctx: &egui::Context) {
+        self.probe_espflash(ctx);
+        self.poll_flash_operation(ctx);
+
+        let mut is_open = self.flash.open;
+        let busy = self.flash.running.is_some();
+        let ready = self.flash.available == Some(true);
+
+        egui::Window::new(format!("Flash Firmware — {}", self.port_name))
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            // Centred, like the connection dialog. egui would otherwise place
+            // it in the top left corner, over the toolbar it was opened from.
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH + 120.0)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH + 120.0);
+
+                match self.flash.available {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Looking for espflash...");
+                        });
+                        return;
+                    }
+                    Some(false) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 60),
+                            "espflash was not found on this machine.",
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            "devserial drives espflash rather than talking to the chip \
+                             itself. Install it with `cargo install espflash`, then reopen \
+                             this window.",
+                        );
+                        return;
+                    }
+                    Some(true) => {}
+                }
+
+                ui.label(
+                    "The port is released while espflash runs and reconnected afterwards, \
+                     whether it worked or not.",
+                );
+                ui.add_space(8.0);
+
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.label(egui::RichText::new("Firmware image:").strong());
+                    let path_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.flash.path)
+                            .desired_width(FORM_WIDTH + 100.0)
+                            .hint_text("/path/to/firmware.bin or .elf"),
+                    );
+                    path_resp.context_menu(|ui| {
+                        text_edit_context_menu(ui, &mut self.flash.path);
+                    });
+
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Flashing baud rate:").strong());
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.flash.baud)
+                                .desired_width(96.0)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("default"),
+                        );
+                        ui.label(
+                            egui::RichText::new("empty leaves the choice to espflash")
+                                .color(egui::Color32::from_rgb(140, 140, 150)),
+                        );
+                    });
+                });
+
+                if busy || !self.flash.log.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for line in &self.flash.log {
+                                ui.label(egui::RichText::new(line).monospace().size(11.0));
+                            }
+                        });
+                }
+
+                if let Some((message, failed)) = &self.flash.outcome {
+                    ui.add_space(6.0);
+                    let colour = if *failed {
+                        egui::Color32::from_rgb(255, 90, 90)
+                    } else {
+                        egui::Color32::from_rgb(120, 220, 130)
+                    };
+                    ui.colored_label(colour, message);
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                let row_height = ui.spacing().interact_size.y.max(24.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let flash_btn = egui::Button::new(
+                            egui::RichText::new("Flash").strong().color(if busy {
+                                egui::Color32::from_rgb(140, 140, 140)
+                            } else {
+                                egui::Color32::from_rgb(255, 255, 255)
+                            }),
+                        )
+                        .fill(if busy {
+                            ui.visuals().widgets.inactive.bg_fill
+                        } else {
+                            egui::Color32::from_rgb(0, 122, 255)
+                        })
+                        .min_size(egui::vec2(84.0, 24.0));
+                        if ui.add_enabled(!busy && ready, flash_btn).clicked() {
+                            self.start_flash_operation(ctx, false);
+                        }
+
+                        ui.add_space(8.0);
+
+                        // Erasing destroys everything on the chip, so it takes
+                        // two presses and says so in between.
+                        let erase_label = if self.flash.erase_armed {
+                            "Erase everything?"
+                        } else {
+                            "Erase flash"
+                        };
+                        let erase = egui::Button::new(egui::RichText::new(erase_label).color(
+                            if self.flash.erase_armed {
+                                egui::Color32::from_rgb(255, 120, 120)
+                            } else {
+                                ui.visuals().text_color()
+                            },
+                        ))
+                        .min_size(egui::vec2(72.0, 24.0));
+                        if ui.add_enabled(!busy && ready, erase).clicked() {
+                            if self.flash.erase_armed {
+                                self.start_flash_operation(ctx, true);
+                            } else {
+                                self.flash.erase_armed = true;
+                            }
+                        }
+
+                        if busy {
+                            ui.add_space(8.0);
+                            ui.spinner();
+                            ui.label("running...");
+                        }
+                    },
+                );
+            });
+
+        // A run in flight keeps the window, otherwise closing it would orphan
+        // a released port with nothing left to reconnect it.
+        self.flash.open = is_open || busy;
+        if !self.flash.open {
+            self.flash.erase_armed = false;
+        }
+    }
+
     pub fn toggle_connection(&mut self) {
         let Some(toggle) = self.toggle_connect.clone() else {
             self.settings_status = Some((
@@ -1256,6 +1712,11 @@ impl PortMonitorState {
             self.render_transfer_dialog(ui.ctx());
         }
 
+        #[cfg(feature = "esp")]
+        if self.flash.open {
+            self.render_flash_dialog(ui.ctx());
+        }
+
         if self.show_export_dialog {
             self.render_export_dialog(ui.ctx());
         }
@@ -1358,6 +1819,17 @@ impl MultiMonitorApp {
     }
 
     /// Open a window for a port requested from outside.
+    /// Put the connection dialog away once a port has arrived.
+    ///
+    /// It is open from the start, because a window with no port is a window
+    /// asking for one. A port opened by another invocation answers that
+    /// question just as well as the dialog would, and leaving it up puts it
+    /// over the window it just produced.
+    fn dismiss_connect_dialog(&mut self) {
+        self.config_dialog.is_open = false;
+        self.config_dialog.error_message = None;
+    }
+
     fn open_requested_port(&mut self, request: OpenPortRequest) {
         if request.port_name.is_empty() {
             self.config_dialog.is_open = true;
@@ -1371,6 +1843,7 @@ impl MultiMonitorApp {
             .find(|m| crate::port_manager::same_device(&m.port_name, &request.port_name))
         {
             monitor.is_open = true;
+            self.dismiss_connect_dialog();
             return;
         }
 
@@ -1388,7 +1861,10 @@ impl MultiMonitorApp {
                     ..PortConfig::default()
                 };
                 match crate::standalone::open_standalone_session(&request.port_name, &config) {
-                    Ok(state) => self.monitors.push(state),
+                    Ok(state) => {
+                        self.monitors.push(state);
+                        self.dismiss_connect_dialog();
+                    }
                     Err(e) => {
                         self.config_dialog.error_message = Some(e);
                         self.config_dialog.is_open = true;
@@ -2518,6 +2994,15 @@ impl PortMonitorState {
                 self.show_transfer_dialog = !self.show_transfer_dialog;
             }
 
+            #[cfg(feature = "esp")]
+            if ui
+                .button("Flash ▾")
+                .on_hover_text("Write firmware to an ESP device with espflash")
+                .clicked()
+            {
+                self.flash.open = !self.flash.open;
+            }
+
             if ui
                 .button("Export ▾")
                 .on_hover_text("Export buffer to file (TXT / CSV / JSONL) or clipboard")
@@ -2998,5 +3483,93 @@ fn load_icon() -> egui::IconData {
                 height: 0,
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "esp"))]
+mod flash_tests {
+    use super::*;
+
+    #[test]
+    fn an_erase_needs_no_image() {
+        let (path, baud) = check_flash_request("", "", true).expect("erase needs no image");
+        assert!(path.is_empty());
+        assert_eq!(baud, None);
+    }
+
+    #[test]
+    fn a_flash_without_an_image_is_refused_before_the_port_is_released() {
+        assert!(check_flash_request("   ", "", false).is_err());
+    }
+
+    #[test]
+    fn a_path_that_names_nothing_is_refused() {
+        let err = check_flash_request("/nonexistent/firmware.bin", "", false)
+            .expect_err("the file does not exist");
+        assert!(err.contains("/nonexistent/firmware.bin"), "got: {err}");
+    }
+
+    #[test]
+    fn a_directory_is_not_an_image() {
+        // `is_file` rather than `exists`: espflash would fail on a directory,
+        // and it would fail after the port had already been released.
+        assert!(check_flash_request("/tmp", "", false).is_err());
+    }
+
+    #[test]
+    fn an_existing_file_is_accepted_and_trimmed() {
+        let file = std::env::temp_dir().join("devserial_flash_test.bin");
+        std::fs::write(&file, b"not really firmware").expect("write the fixture");
+        let typed = format!("  {}  ", file.display());
+        let (path, baud) = check_flash_request(&typed, "", false).expect("the file exists");
+        assert_eq!(path, file.display().to_string());
+        assert_eq!(baud, None);
+        std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn an_empty_baud_leaves_the_choice_to_the_tool() {
+        let (_, baud) = check_flash_request("", "   ", true).expect("erase needs no image");
+        assert_eq!(baud, None);
+    }
+
+    #[test]
+    fn a_baud_that_is_not_a_number_is_refused() {
+        for text in ["fast", "-1", "0", "115200 baud"] {
+            assert!(
+                check_flash_request("", text, true).is_err(),
+                "'{text}' should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_baud_is_passed_through() {
+        let (_, baud) = check_flash_request("", " 460800 ", true).expect("erase needs no image");
+        assert_eq!(baud, Some(460_800));
+    }
+
+    #[test]
+    fn a_failure_is_reduced_to_the_line_that_explains_it() {
+        // Measured output of espflash 4.5.0 against a port that is not an ESP.
+        // The first line is a warning about something else entirely.
+        let observed = "\
+[2026-09-06T08:50:22Z WARN ] Monitor options were provided, but `--monitor/-M` flag isn't set.
+[2026-09-06T08:50:22Z INFO ] Serial port: '/dev/cu.Bluetooth-Incoming-Port'
+[2026-09-06T08:50:22Z INFO ] Connecting...
+Error:   \u{d7} Error while connecting to device
+  \u{2570}\u{2500}\u{25b6} Failed to connect to the device
+";
+        assert_eq!(failure_summary(observed), "Failed to connect to the device");
+    }
+
+    #[test]
+    fn an_empty_failure_still_says_something() {
+        assert_eq!(failure_summary("   \n\n"), "no output");
+    }
+
+    #[test]
+    fn a_single_line_failure_is_itself() {
+        assert_eq!(failure_summary("permission denied"), "permission denied");
     }
 }

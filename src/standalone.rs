@@ -71,7 +71,10 @@ impl SessionKeepalive {
     }
 
     /// Runtime handle for blocking calls from the GUI thread.
-    fn handle(&self) -> Option<tokio::runtime::Handle> {
+    ///
+    /// The monitor window also uses it to run espflash while the port is
+    /// released, so it is visible outside this module.
+    pub fn handle(&self) -> Option<tokio::runtime::Handle> {
         let guard = self
             .runtime
             .lock()
