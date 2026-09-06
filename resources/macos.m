@@ -221,12 +221,18 @@ static void forward_edit_action(id target, unsigned short keyCode, NSString *cha
 - (void)openPort:(id)sender;
 - (void)showPortSettings:(id)sender;
 - (void)toggleConnect:(id)sender;
+- (void)zoomIn:(id)sender;
+- (void)zoomOut:(id)sender;
+- (void)zoomReset:(id)sender;
 @end
 
 static BOOL g_exportRequested = NO;
 static BOOL g_openPortRequested = NO;
 static BOOL g_portSettingsRequested = NO;
 static BOOL g_toggleConnectRequested = NO;
+static BOOL g_zoomInRequested = NO;
+static BOOL g_zoomOutRequested = NO;
+static BOOL g_zoomResetRequested = NO;
 
 @implementation DevSerialAboutHandler
 - (void)showAbout:(id)sender {
@@ -268,6 +274,21 @@ static BOOL g_toggleConnectRequested = NO;
     (void)sender;
     g_toggleConnectRequested = YES;
 }
+
+- (void)zoomIn:(id)sender {
+    (void)sender;
+    g_zoomInRequested = YES;
+}
+
+- (void)zoomOut:(id)sender {
+    (void)sender;
+    g_zoomOutRequested = YES;
+}
+
+- (void)zoomReset:(id)sender {
+    (void)sender;
+    g_zoomResetRequested = YES;
+}
 @end
 
 static DevSerialAboutHandler *g_aboutHandler = nil;
@@ -299,6 +320,30 @@ BOOL devserial_check_port_settings_requested(void) {
 BOOL devserial_check_toggle_connect_requested(void) {
     if (g_toggleConnectRequested) {
         g_toggleConnectRequested = NO;
+        return YES;
+    }
+    return NO;
+}
+
+BOOL devserial_check_zoom_in_requested(void) {
+    if (g_zoomInRequested) {
+        g_zoomInRequested = NO;
+        return YES;
+    }
+    return NO;
+}
+
+BOOL devserial_check_zoom_out_requested(void) {
+    if (g_zoomOutRequested) {
+        g_zoomOutRequested = NO;
+        return YES;
+    }
+    return NO;
+}
+
+BOOL devserial_check_zoom_reset_requested(void) {
+    if (g_zoomResetRequested) {
+        g_zoomResetRequested = NO;
         return YES;
     }
     return NO;
@@ -430,14 +475,13 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
         [fileMenuItem setSubmenu:fileMenu];
         [mainMenu addItem:fileMenuItem];
 
-        // New Window... (Cmd+N)
-        NSMenuItem *newWindowItem = [[NSMenuItem alloc] initWithTitle:@"New Window..."
-                                                               action:@selector(openPort:)
-                                                        keyEquivalent:@"n"];
-        [newWindowItem setTarget:g_aboutHandler];
-        [fileMenu addItem:newWindowItem];
-
         // Open Port... (Cmd+O)
+        //
+        // There used to be a second item called "New Window..." on Cmd+N with
+        // exactly this action. Two names for one thing, and neither of them
+        // true when the port is already open: the dialog raises that window
+        // instead of making a new one. Cmd+N still works, handled by the
+        // window itself so it also reaches the opening screen.
         NSMenuItem *openPortItem = [[NSMenuItem alloc] initWithTitle:@"Open Port..."
                                                               action:@selector(openPort:)
                                                        keyEquivalent:@"o"];
@@ -528,6 +572,32 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
         NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
         [viewMenuItem setSubmenu:viewMenu];
         [mainMenu addItem:viewMenuItem];
+
+        // Zoom In (Cmd++), Zoom Out (Cmd+-), Actual Size (Cmd+0).
+        //
+        // The menu claims Cmd+Plus, Cmd+Minus and Cmd+0, and AppKit consumes
+        // those before the window sees them. egui's own zoom shortcuts stay in
+        // place for everything the menu does not claim, notably Cmd+= , which
+        // is the same key without shift and what most people actually press.
+        NSMenuItem *zoomInItem = [[NSMenuItem alloc] initWithTitle:@"Zoom In"
+                                                            action:@selector(zoomIn:)
+                                                     keyEquivalent:@"+"];
+        [zoomInItem setTarget:g_aboutHandler];
+        [viewMenu addItem:zoomInItem];
+
+        NSMenuItem *zoomOutItem = [[NSMenuItem alloc] initWithTitle:@"Zoom Out"
+                                                             action:@selector(zoomOut:)
+                                                      keyEquivalent:@"-"];
+        [zoomOutItem setTarget:g_aboutHandler];
+        [viewMenu addItem:zoomOutItem];
+
+        NSMenuItem *actualSizeItem = [[NSMenuItem alloc] initWithTitle:@"Actual Size"
+                                                                action:@selector(zoomReset:)
+                                                         keyEquivalent:@"0"];
+        [actualSizeItem setTarget:g_aboutHandler];
+        [viewMenu addItem:actualSizeItem];
+
+        [viewMenu addItem:[NSMenuItem separatorItem]];
 
         // Toggle Full Screen (Cmd+Ctrl+F)
         NSMenuItem *fullScreenItem = [[NSMenuItem alloc] initWithTitle:@"Toggle Full Screen"

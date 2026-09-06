@@ -143,7 +143,7 @@ run in CI before they are pushed.
 
 ### Pre-built binaries
 
-Download an archive for your platform from [GitHub Releases](https://github.com/metaneutrons/devserial/releases). Every published binary is built with all features, so no download is missing a subcommand. Each release carries a `SHA256SUMS` file:
+Download an archive for your platform from [GitHub Releases](https://github.com/metaneutrons/devserial/releases). Every published binary carries the full feature set, so no download is missing a subcommand. Each release carries a `SHA256SUMS` file:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
@@ -191,7 +191,7 @@ The musl builds are statically linked. That is what makes them portable, and it 
 ### From source
 
 ```bash
-cargo install --path . --all-features
+cargo install --path . --no-default-features --features full
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` and rustup installs that version on its own, so there is nothing to choose. There is no supported-MSRV promise: devserial is not published to crates.io, so no consumer needs a documented floor, and the pinned toolchain is the only one it is built and tested against. Building the GUI on Linux needs `libxcb-render0-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev` and `libxkbcommon-dev`.
@@ -213,23 +213,31 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Windows and sessions.** All sessions live in one process with one Dock icon. A second `devserial monitor` invocation opens a window in the running instance instead of starting a second application. Ports already shown are marked and cannot be opened twice.
 
-**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS toggles, timestamp and hex views, pause and auto-follow, and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
+**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS toggles, timestamp and hex views, pause and auto-follow, clearing the view without touching the capture, and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
 
 **Runtime reconfiguration.** Baud rate, framing and flow control can be changed while the session is open, without losing the buffer. The change is recorded as a marker line in the capture.
 
 **Transfers and export.** File transfer over ZMODEM, YMODEM and XMODEM from a dialog, and export of the whole database, the visible buffer or a line range to TXT, CSV or JSONL, either to a file or to the clipboard.
 
+**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. Needs `espflash` on the `PATH`.
+
+**Interface scale.** View > Zoom In, Zoom Out and Actual Size, the same two steps and a readout at the right end of the status bar, and `Cmd+Plus`, `Cmd+Minus` and `Cmd+0` on the keyboard. The scale is remembered between runs. Off macOS there is no menu bar, so the keyboard and the status bar are the way there.
+
 **macOS integration.** Native menu bar, About panel, Dock icon, and the system text editing shortcuts. Menu commands:
 
 | Shortcut | Action |
 |----------|--------|
-| `Cmd+N` | New window |
-| `Cmd+O` | Open port |
+| `Cmd+O`, `Cmd+N` | Open a port in a window |
 | `Cmd+K` | Connect or disconnect |
 | `Cmd+Shift+P` | Port settings |
 | `Cmd+E` | Export buffer |
+| `Cmd+Plus`, `Cmd+Minus` | Enlarge or shrink the interface |
+| `Cmd+0` | Back to 100 % |
+| `Cmd+Ctrl+F` | Full screen |
 | `Cmd+W` | Close window |
 | `Cmd+Q` | Quit |
+
+Both keys for opening a port reach the same dialog, which raises the existing window when the port is already shown. The dialog offers a port that can actually be opened rather than the first one in the list.
 
 The buffer view is virtualized and keeps the most recent 100 000 lines on screen. The full history stays in the database and is reachable through search and export.
 
@@ -246,18 +254,27 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | Key | Action |
 |-----|--------|
 | `F1` | About |
-| `F2` or `Ctrl+P` | Port settings: baud, data bits, parity, stop bits, flow control |
+| `F2` | Port settings: baud, data bits, parity, stop bits, flow control, line ending |
+| `F3` | Set DTR and RTS |
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
-| `Ctrl+S` | Send a file over ZMODEM |
-| `Ctrl+R` | Receive a file over ZMODEM |
+| `F5` | Run a configured macro |
+| `F6` | Flash firmware to an ESP device |
+| `Ctrl+K` | Release the port, or take it back |
+| `Ctrl+F` | Filter the view, `Esc` clears the filter |
+| `Ctrl+L` | Clear the view; the capture on disk is untouched |
+| `Ctrl+E` | Export the capture, format chosen with `↑` `↓` |
+| `Ctrl+S` / `Ctrl+R` | Send or receive a file, protocol chosen with `↑` `↓` |
 | `Ctrl+T` | Show or hide timestamps |
 | `Ctrl+H` | Switch between text and hex dump |
+| `Ctrl+P` / `Ctrl+N` | Previous and next line of the send history |
 | `↑` `↓` `PgUp` `PgDn` `End` | Scroll, `End` returns to auto-follow |
-| `Enter` | Send the typed line with CR LF |
+| `Enter` | Send the typed line with the selected line ending |
 | `Esc` | Leave the current mode |
-| `Ctrl+C` or `q` | Exit |
+| `Ctrl+C`, or `q` on an empty input line | Exit |
 
-The status bar shows the active view. Timestamps and the hex dump work the same way as in the GUI and produce the same output for the same bytes.
+The status bar shows the active view and the keys. Timestamps and the hex dump work the same way as in the GUI and produce the same output for the same bytes.
+
+**The two monitors offer the same set.** Everything the window can do with a port, the terminal can do too. That is not a promise anybody keeps by hand: `src/surface.rs` names each capability once, both surfaces declare which ones they carry, and a test fails as soon as the two lists differ. Anything the window gains without the terminal has to be written into a ledger with a reason, and the ledger is currently empty. Interface scale is not in the list, because the size of a terminal belongs to the terminal.
 
 The terminal is restored even if the program is killed or panics.
 
@@ -489,6 +506,7 @@ Three environment variables override the defaults without a configuration file. 
 | IPC endpoint, macOS | `~/Library/Application Support/devserial/devserial.sock` |
 | IPC endpoint, Linux | `$XDG_RUNTIME_DIR/devserial/devserial.sock`, otherwise under `~/.local/state` |
 | IPC endpoint, Windows | `\\.\pipe\devserial` |
+| Window socket, so a second invocation opens a window in the running instance | `gui.sock` beside the IPC endpoint, `\\.\pipe\devserial-gui` on Windows |
 
 The databases are ordinary SQLite files in WAL mode. Nothing stops you from querying them directly while devserial is running.
 
@@ -533,9 +551,10 @@ devserial daemon
 | `esp` | yes | Flashing, chip info and flash erase through `espflash` |
 | `monitor` | no | The desktop GUI (`egui` and `eframe`) |
 | `tui` | no | The terminal monitor (`ratatui` and `crossterm`) |
+| `full` | no | `esp`, `monitor` and `tui` together: everything a release carries |
 | `testutil` | no | Mock serial ports and generators, for tests |
 
-Released binaries are built with `--all-features`. Building with fewer features removes the corresponding subcommands and MCP tools; the crate compiles and passes its tests with any combination, including `--no-default-features`.
+Released binaries are built with `--no-default-features --features full`, which is everything above except `testutil`. That used to be `--all-features`, which swept the test scaffolding into an artefact that carries a Developer ID signature; the switch keeps it out. Building with fewer features removes the corresponding subcommands and MCP tools; the crate compiles and passes its tests with any combination, including `--no-default-features`.
 
 ---
 
@@ -557,6 +576,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 # Every shipped feature combination has to compile
 cargo check --no-default-features
 cargo check --no-default-features --features esp,tui
+cargo check --no-default-features --features full
 ```
 
 Continuous integration runs lints, tests and documentation on Linux, macOS and Windows across four feature sets, plus a job that checks the declared minimum supported Rust version.

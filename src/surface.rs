@@ -16,6 +16,14 @@
 //! Written as plain text rather than a link: `KNOWN_GAPS` only exists when both
 //! surfaces are compiled in, and a link to it fails the documentation build for
 //! every other feature set.
+//!
+//! What the registry leaves out on purpose: a capability is something a person
+//! does *with the port*, and how a surface is drawn is not that. The two
+//! cannot meet there in any case, because the window scales itself while the
+//! size of a terminal belongs to the terminal and not to the program running
+//! inside it. Interface scale, window size and full screen are therefore
+//! absent from the list rather than recorded as gaps, which would claim the
+//! terminal still owes something it cannot deliver.
 
 /// One thing a person can do with an open port.
 ///

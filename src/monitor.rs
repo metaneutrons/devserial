@@ -350,6 +350,49 @@ fn text_edit_context_menu(ui: &mut egui::Ui, text: &mut String) {
     }
 }
 
+/// The scale control in the status bar.
+///
+/// Two steps and a readout, so the scale can be found without knowing the
+/// menu or the key combination. It sits in a layout that runs right to left,
+/// which is why the plus comes first: the widget added first is the one
+/// furthest right.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn render_zoom_control(ui: &mut egui::Ui) {
+    let factor = ui.ctx().zoom_factor();
+
+    if ui
+        .add_enabled(factor < MAX_ZOOM, egui::Button::new("+").small())
+        .on_hover_text("Enlarge the interface (Cmd+Plus)")
+        .clicked()
+    {
+        egui::gui_zoom::zoom_in(ui.ctx());
+    }
+
+    // A click on the readout returns to unscaled, the same thing Cmd+0 does.
+    let percent = (factor * 100.0).round() as i32;
+    if ui
+        .add(
+            egui::Label::new(
+                egui::RichText::new(format!("{percent} %"))
+                    .color(egui::Color32::from_rgb(160, 160, 160)),
+            )
+            .sense(egui::Sense::click()),
+        )
+        .on_hover_text("Back to 100 % (Cmd+0)")
+        .clicked()
+    {
+        ui.ctx().set_zoom_factor(1.0);
+    }
+
+    if ui
+        .add_enabled(factor > MIN_ZOOM, egui::Button::new("\u{2212}").small())
+        .on_hover_text("Shrink the interface (Cmd+Minus)")
+        .clicked()
+    {
+        egui::gui_zoom::zoom_out(ui.ctx());
+    }
+}
+
 /// Standard window options for a devserial GUI window.
 fn window_options(title: String, size: [f32; 2], min_size: [f32; 2]) -> eframe::NativeOptions {
     eframe::NativeOptions {
@@ -418,6 +461,12 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 4.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     ctx.set_global_style(style);
+
+    // The scale is part of how the interface is drawn, so it is restored with
+    // the fonts and the spacing rather than by each entry point separately.
+    if let Some(factor) = stored_zoom() {
+        ctx.set_zoom_factor(factor);
+    }
 }
 
 /// Start the GUI socket server if this platform supports multiplexing.
@@ -472,6 +521,7 @@ pub fn run_monitor_gui() -> Result<(), String> {
         config_dialog,
         connect_view_height: 0.0,
         grown_for_monitor: false,
+        last_zoom: stored_zoom().unwrap_or(1.0),
     };
 
     let options = window_options(
@@ -542,6 +592,7 @@ fn run_monitor_inner(
         config_dialog: PortConfigDialogState::new(),
         connect_view_height: 0.0,
         grown_for_monitor: false,
+        last_zoom: stored_zoom().unwrap_or(1.0),
     };
 
     let options = window_options(
@@ -739,6 +790,34 @@ const CONNECT_WINDOW_SIZE: [f32; 2] = [560.0, 620.0];
 /// Window size once a port is open and the monitor takes over.
 const MONITOR_WINDOW_SIZE: [f32; 2] = [920.0, 620.0];
 
+/// The range the interface scale may take.
+///
+/// The same bounds `egui::gui_zoom` enforces on its own steps, restated here
+/// because a value read back from the settings store has not been through
+/// them.
+const MIN_ZOOM: f32 = 0.2;
+const MAX_ZOOM: f32 = 5.0;
+
+/// Where the interface scale is kept between runs.
+const ZOOM_SETTING: &str = "ui.zoom";
+
+/// Read the interface scale from the last run.
+///
+/// A preference must never keep the window from opening, so every failure
+/// along the way, a missing database included, simply means the default.
+fn stored_zoom() -> Option<f32> {
+    let db = crate::state::StateDb::open(&crate::standalone::gui_data_dir()).ok()?;
+    let factor: f32 = db.setting(ZOOM_SETTING).ok()??.parse().ok()?;
+    factor.is_finite().then(|| factor.clamp(MIN_ZOOM, MAX_ZOOM))
+}
+
+/// Remember the interface scale for the next run.
+fn store_zoom(factor: f32) {
+    if let Ok(db) = crate::state::StateDb::open(&crate::standalone::gui_data_dir()) {
+        drop(db.set_setting(ZOOM_SETTING, &factor.to_string()));
+    }
+}
+
 fn baud_controls(ui: &mut egui::Ui, id: &str, baud: &mut u32, custom: &mut String) {
     // Both the connect dialog and the settings panel draw this row, so the
     // widgets inside it need ids that cannot collide.
@@ -867,18 +946,31 @@ impl PortConfigDialogState {
             is_open: false,
             error_message: None,
         };
-        state.rescan();
+        state.rescan(&[]);
         state
     }
 
     /// Refresh the list of offered ports.
-    pub fn rescan(&mut self) {
+    ///
+    /// Ports already shown in a window are skipped when choosing what to
+    /// preselect. Landing on one of them opened the dialog in a state nobody
+    /// asked for: a warning, and a primary button that cannot be pressed.
+    pub fn rescan(&mut self, active_ports: &[String]) {
         self.available_ports = crate::port_manager::available_ports();
-        if (self.selected_port.is_empty() || !self.available_ports.contains(&self.selected_port))
-            && !self.available_ports.is_empty()
-        {
-            self.selected_port = self.available_ports[0].clone();
+
+        let selection_still_works = !self.selected_port.is_empty()
+            && self.available_ports.contains(&self.selected_port)
+            && !is_active(active_ports, &self.selected_port);
+        if selection_still_works {
+            return;
         }
+
+        self.selected_port = self
+            .available_ports
+            .iter()
+            .find(|port| !is_active(active_ports, port))
+            .cloned()
+            .unwrap_or_default();
     }
 
     #[must_use]
@@ -987,7 +1079,7 @@ impl PortConfigDialogState {
                 .on_hover_text("Rescan available serial ports")
                 .clicked()
             {
-                self.rescan();
+                self.rescan(active_ports);
             }
         });
         ui.add_space(4.0);
@@ -1668,11 +1760,6 @@ impl PortMonitorState {
             self.toggle_connection();
         }
 
-        // Global shortcut: Cmd+N to open New Window
-        if ui.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::N)) {
-            self.open_port_dialog_requested = true;
-        }
-
         // Global shortcut: Cmd+E / Ctrl+E to open/toggle Export dialog
         if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
             self.show_export_dialog = !self.show_export_dialog;
@@ -1795,6 +1882,11 @@ struct MultiMonitorApp {
     /// once, at the moment the first port opens, and never resizes again so a
     /// size the user chose is left alone.
     grown_for_monitor: bool,
+    /// Interface scale as it was last written to the settings store.
+    ///
+    /// egui owns the live value; this is only what is on disk, so a scale the
+    /// user did not change costs no write.
+    last_zoom: f32,
 }
 
 impl MultiMonitorApp {
@@ -1831,10 +1923,28 @@ impl MultiMonitorApp {
         self.config_dialog.error_message = None;
     }
 
+    /// Ports currently shown in a window.
+    fn active_ports(&self) -> Vec<String> {
+        self.monitors
+            .iter()
+            .filter(|m| m.is_open)
+            .map(|m| m.port_name.clone())
+            .collect()
+    }
+
+    /// Open the connection form and offer a port that can actually be opened.
+    ///
+    /// Four places used to inline these two lines, and the rescan among them
+    /// did not know which ports were taken.
+    fn open_connect_dialog(&mut self) {
+        self.config_dialog.is_open = true;
+        let active = self.active_ports();
+        self.config_dialog.rescan(&active);
+    }
+
     fn open_requested_port(&mut self, request: OpenPortRequest) {
         if request.port_name.is_empty() {
-            self.config_dialog.is_open = true;
-            self.config_dialog.rescan();
+            self.open_connect_dialog();
             return;
         }
 
@@ -1934,8 +2044,7 @@ impl MultiMonitorApp {
 impl eframe::App for MultiMonitorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if platform::take_menu_request(MenuRequest::OpenPort) {
-            self.config_dialog.is_open = true;
-            self.config_dialog.rescan();
+            self.open_connect_dialog();
         }
 
         if platform::take_menu_request(MenuRequest::PortSettings)
@@ -1944,10 +2053,37 @@ impl eframe::App for MultiMonitorApp {
             mon.show_settings_dialog = !mon.show_settings_dialog;
         }
 
-        // Global shortcut: Cmd+O / Ctrl+O to open Connection Manager
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
-            self.config_dialog.is_open = true;
-            self.config_dialog.rescan();
+        // Interface scale. The menu items, the status-bar buttons and the
+        // keyboard all go through `egui::gui_zoom`, so a step is the same step
+        // whichever of them the user reaches for. The native menu claims
+        // Cmd+Plus, Cmd+Minus and Cmd+0 and swallows them before the window
+        // sees them; egui keeps Cmd+Equals, which is the same key without
+        // shift and what most people actually press.
+        if platform::take_menu_request(MenuRequest::ZoomIn) {
+            egui::gui_zoom::zoom_in(ctx);
+        }
+        if platform::take_menu_request(MenuRequest::ZoomOut) {
+            egui::gui_zoom::zoom_out(ctx);
+        }
+        if platform::take_menu_request(MenuRequest::ZoomReset) {
+            ctx.set_zoom_factor(1.0);
+        }
+
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.last_zoom).abs() > f32::EPSILON {
+            self.last_zoom = zoom;
+            store_zoom(zoom);
+        }
+
+        // Cmd+O and Cmd+N both open the connection form. They live here rather
+        // than in the monitor window so they also work on the opening screen,
+        // where there is no monitor to handle them.
+        if ctx.input(|i| {
+            i.modifiers.command
+                && !i.modifiers.shift
+                && (i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::N))
+        }) {
+            self.open_connect_dialog();
         }
 
         // Global shortcut: Cmd+Shift+P to open Port Settings
@@ -1964,12 +2100,12 @@ impl eframe::App for MultiMonitorApp {
         self.publish_open_ports();
 
         // Check if any active monitor requested opening a new port from its toolbar
+        let mut from_toolbar = false;
         for mon in &mut self.monitors {
-            if mon.open_port_dialog_requested {
-                mon.open_port_dialog_requested = false;
-                self.config_dialog.is_open = true;
-                self.config_dialog.rescan();
-            }
+            from_toolbar |= std::mem::take(&mut mon.open_port_dialog_requested);
+        }
+        if from_toolbar {
+            self.open_connect_dialog();
         }
 
         // Update lines for all open monitors
@@ -2022,7 +2158,7 @@ impl eframe::App for MultiMonitorApp {
         let Some(p_idx) = primary_idx else {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "devserial v{} — Connect Serial Device",
+                    "devserial v{} — Connect Serial Port",
                     env!("CARGO_PKG_VERSION")
                 )));
 
@@ -2181,6 +2317,11 @@ impl eframe::App for MultiMonitorApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .default_width(FORM_WIDTH)
                 .show(ui.ctx(), |ui| {
+                    // The same clamp the opening screen puts on the form.
+                    // Without it the dialog grew with the longest port name
+                    // while the opening screen wrapped, and the same form came
+                    // out two different widths.
+                    ui.set_max_width(FORM_WIDTH);
                     if let Some(action) = self.config_dialog.render_form(ui, &active_ports, true) {
                         if action {
                             connect_req = true;
@@ -2920,10 +3061,10 @@ impl PortMonitorState {
             }
             ui.separator();
 
-            // Group 2: New Window & Port Settings
+            // Group 2: Open Port & Port Settings
             if ui
-                .button("➕ New Window...")
-                .on_hover_text("Open another serial port in a new window (Cmd+N)")
+                .button("➕ Open Port...")
+                .on_hover_text("Open another serial port in a window (Cmd+O or Cmd+N)")
                 .clicked()
             {
                 self.open_port_dialog_requested = true;
@@ -3289,6 +3430,8 @@ impl PortMonitorState {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.auto_follow, "Auto-follow");
+                ui.separator();
+                render_zoom_control(ui);
             });
         });
     }
