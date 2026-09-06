@@ -36,7 +36,7 @@ fn resolve_data_dir(config_path: Option<&Path>) -> std::path::PathBuf {
 
 /// Data directory for sessions opened from inside the GUI.
 #[cfg(feature = "monitor")]
-fn gui_data_dir() -> std::path::PathBuf {
+pub(crate) fn gui_data_dir() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| resolve_data_dir(None)).clone()
 }

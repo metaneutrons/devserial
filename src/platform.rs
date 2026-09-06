@@ -40,6 +40,25 @@ pub enum MenuRequest {
     PortSettings,
     /// Connect or disconnect toggle requested.
     ToggleConnect,
+    /// Scale the interface up a step.
+    ZoomIn,
+    /// Scale the interface down a step.
+    ZoomOut,
+    /// Return the interface to its unscaled size.
+    ZoomReset,
+}
+
+impl MenuRequest {
+    /// Every request, so the tests can walk the whole set.
+    pub const ALL: &'static [Self] = &[
+        Self::Export,
+        Self::OpenPort,
+        Self::PortSettings,
+        Self::ToggleConnect,
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::ZoomReset,
+    ];
 }
 
 #[cfg(target_os = "macos")]
@@ -62,6 +81,9 @@ mod macos {
         fn devserial_check_open_port_requested() -> bool;
         fn devserial_check_port_settings_requested() -> bool;
         fn devserial_check_toggle_connect_requested() -> bool;
+        fn devserial_check_zoom_in_requested() -> bool;
+        fn devserial_check_zoom_out_requested() -> bool;
+        fn devserial_check_zoom_reset_requested() -> bool;
         fn devserial_update_edit_state(
             is_text_focused: bool,
             has_text_selection: bool,
@@ -110,6 +132,9 @@ mod macos {
                 MenuRequest::OpenPort => devserial_check_open_port_requested(),
                 MenuRequest::PortSettings => devserial_check_port_settings_requested(),
                 MenuRequest::ToggleConnect => devserial_check_toggle_connect_requested(),
+                MenuRequest::ZoomIn => devserial_check_zoom_in_requested(),
+                MenuRequest::ZoomOut => devserial_check_zoom_out_requested(),
+                MenuRequest::ZoomReset => devserial_check_zoom_reset_requested(),
             }
         }
     }
@@ -199,4 +224,94 @@ pub fn update_edit_state(state: EditState) {
 #[must_use]
 pub const fn has_native_menus() -> bool {
     cfg!(target_os = "macos")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MenuRequest;
+    use std::collections::BTreeSet;
+
+    const PLATFORM_SOURCE: &str = include_str!("platform.rs");
+    const MACOS_SOURCE: &str = include_str!("../resources/macos.m");
+
+    /// The native function that reports a request, and the selector the menu
+    /// item calls to raise it.
+    ///
+    /// The match has no catch-all, so a new variant does not compile until it
+    /// is named here and the tests below check that both ends exist. That is
+    /// the point of the table: a menu item without a reader, or a reader
+    /// without a menu item, is a control that silently does nothing.
+    const fn native(request: MenuRequest) -> (&'static str, &'static str) {
+        match request {
+            MenuRequest::Export => ("devserial_check_export_requested", "exportBuffer:"),
+            MenuRequest::OpenPort => ("devserial_check_open_port_requested", "openPort:"),
+            MenuRequest::PortSettings => (
+                "devserial_check_port_settings_requested",
+                "showPortSettings:",
+            ),
+            MenuRequest::ToggleConnect => {
+                ("devserial_check_toggle_connect_requested", "toggleConnect:")
+            }
+            MenuRequest::ZoomIn => ("devserial_check_zoom_in_requested", "zoomIn:"),
+            MenuRequest::ZoomOut => ("devserial_check_zoom_out_requested", "zoomOut:"),
+            MenuRequest::ZoomReset => ("devserial_check_zoom_reset_requested", "zoomReset:"),
+        }
+    }
+
+    #[test]
+    fn no_request_is_listed_twice() {
+        let unique: BTreeSet<_> = MenuRequest::ALL.iter().map(|r| native(*r).0).collect();
+        assert_eq!(unique.len(), MenuRequest::ALL.len(), "a duplicate in ALL");
+    }
+
+    #[test]
+    fn the_list_holds_every_variant() {
+        // One extern declaration per request. A variant that was added to the
+        // enum and to the FFI but forgotten in `ALL` shows up here as a count
+        // that no longer matches.
+        // Assembled rather than written out, because this file is its own
+        // haystack and a literal needle would match itself.
+        let needle = ["_requested() -> ", "bool;"].concat();
+        let declared = PLATFORM_SOURCE.matches(needle.as_str()).count();
+        assert_eq!(
+            declared,
+            MenuRequest::ALL.len(),
+            "{declared} native readers but {} requests listed",
+            MenuRequest::ALL.len()
+        );
+    }
+
+    #[test]
+    fn the_native_side_answers_every_request() {
+        for request in MenuRequest::ALL {
+            let (function, selector) = native(*request);
+            assert!(
+                MACOS_SOURCE.contains(&format!("BOOL {function}(void)")),
+                "macos.m has no {function}"
+            );
+            assert!(
+                MACOS_SOURCE.contains(&format!("@selector({selector})")),
+                "macos.m has no menu item calling {selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scale_items_carry_the_expected_keys() {
+        // A menu item whose key equivalent drifted still opens from the menu,
+        // so nothing else would notice. The declaration spans three lines, and
+        // the key is on the last of them.
+        for (title, key) in [("Zoom In", "+"), ("Zoom Out", "-"), ("Actual Size", "0")] {
+            let item = format!("initWithTitle:@\"{title}\"");
+            let position = MACOS_SOURCE
+                .find(&item)
+                .unwrap_or_else(|| panic!("macos.m has no {title} item"));
+            let declaration: String = MACOS_SOURCE[position..].lines().take(3).collect();
+            let expected = format!("keyEquivalent:@\"{key}\"");
+            assert!(
+                declaration.contains(&expected),
+                "{title} does not carry {expected}"
+            );
+        }
+    }
 }

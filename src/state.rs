@@ -5,6 +5,7 @@
 //!
 //! Stores:
 //! - Active port configurations (for auto-reopen on restart)
+//! - Interface preferences that outlive a single window
 
 use std::path::Path;
 
@@ -18,6 +19,10 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ports (
          name TEXT PRIMARY KEY,
          config_json TEXT NOT NULL,
          opened_at INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS settings (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL
      );";
 
 /// Pragmas for the file-backed state database.
@@ -124,6 +129,35 @@ impl StateDb {
         self.conn.execute("DELETE FROM ports", [])?;
         Ok(())
     }
+
+    /// Read an interface preference.
+    ///
+    /// Returns `None` when the key was never written.
+    ///
+    /// # Errors
+    /// Returns error on database failure.
+    pub fn setting(&self, key: &str) -> Result<Option<String>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write an interface preference.
+    ///
+    /// # Errors
+    /// Returns error on database failure.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), StateError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +178,35 @@ mod tests {
         db.port_closed("/dev/ttyUSB0").unwrap();
         let ports = db.active_ports().unwrap();
         assert!(ports.is_empty());
+    }
+
+    #[test]
+    fn a_setting_survives_a_write_and_comes_back_unchanged() {
+        let db = StateDb::open_memory().unwrap();
+
+        assert_eq!(db.setting("ui.zoom").unwrap(), None);
+
+        db.set_setting("ui.zoom", "1.25").unwrap();
+        assert_eq!(db.setting("ui.zoom").unwrap().as_deref(), Some("1.25"));
+
+        db.set_setting("ui.zoom", "0.9").unwrap();
+        assert_eq!(db.setting("ui.zoom").unwrap().as_deref(), Some("0.9"));
+    }
+
+    #[test]
+    fn settings_and_ports_do_not_share_a_namespace() {
+        // Both tables have a text primary key. A port named like a setting
+        // must not be able to overwrite it.
+        let db = StateDb::open_memory().unwrap();
+        db.set_setting("/dev/ttyUSB0", "a setting").unwrap();
+        db.port_opened("/dev/ttyUSB0", &PortConfig::default())
+            .unwrap();
+
+        assert_eq!(
+            db.setting("/dev/ttyUSB0").unwrap().as_deref(),
+            Some("a setting")
+        );
+        assert_eq!(db.active_ports().unwrap().len(), 1);
     }
 
     #[test]
