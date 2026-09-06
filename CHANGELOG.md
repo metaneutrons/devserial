@@ -9,7 +9,12 @@ which is why a link may lead somewhere that reads differently.
 
 ### Features
 
-* **gui:** Zoom fuer die Oberflaeche und eine einheitliche Verbindungsansicht ([#54](https://github.com/metaneutrons/devserial/issues/54)) ([40bb832](https://github.com/metaneutrons/devserial/commit/40bb8326fa98d0c6c79694d1578acda921a46685))
+* **gui:** scale the interface, from the View menu, the status bar or the keyboard ([#54](https://github.com/metaneutrons/devserial/issues/54)) ([40bb832](https://github.com/metaneutrons/devserial/commit/40bb8326fa98d0c6c79694d1578acda921a46685))
+
+
+### Bug Fixes
+
+* **gui:** the opening screen and the connect dialog are one view again ([#54](https://github.com/metaneutrons/devserial/issues/54)) ([40bb832](https://github.com/metaneutrons/devserial/commit/40bb8326fa98d0c6c79694d1578acda921a46685)). Added by hand: the same commit carries this, and its subject names it, but a `feat` subject files the whole of it under Features
 
 ## [0.1.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.12...devserial-v0.1.13) (2026-09-06)
 
