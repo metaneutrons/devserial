@@ -178,10 +178,11 @@ jobs:
 
       - name: Build
         shell: bash
-        # Every published binary carries every feature, so a downloaded archive
-        # is never missing a subcommand. --locked keeps the build reproducible
-        # from the committed Cargo.lock.
-        run: cargo build --release --locked --all-features --target ${{ matrix.target }}
+        # `full` rather than --all-features: every product feature, so a
+        # downloaded archive is never missing a subcommand, but not `testutil`,
+        # which is test scaffolding and has no business in a signed artefact.
+        # --locked keeps the build reproducible from the committed Cargo.lock.
+        run: cargo build --release --locked --no-default-features --features full --target ${{ matrix.target }}
 
       - name: Audit dynamic linkage
         if: runner.os != 'Windows'
@@ -326,7 +327,7 @@ jobs:
         with:
           key: deb-${{ matrix.arch }}
       - name: Build the binary
-        run: cargo build --release --locked --all-features
+        run: cargo build --release --locked --no-default-features --features full
       - name: Build the package
         env:
           VERSION: ${{ needs.metadata.outputs.version }}

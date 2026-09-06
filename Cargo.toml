@@ -86,9 +86,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [features]
 default = ["esp"]
 esp = []
-testutil = []
 monitor = ["eframe", "image"]
 tui = ["ratatui", "crossterm"]
+
+# Everything a released binary carries.
+#
+# The release used to build with --all-features, which also swept in
+# `testutil`: 394 lines of mock serial port and data generator, 49 KB in the
+# finished binary, unreachable from any subcommand and signed with a
+# Developer ID all the same. A new product feature belongs in this list, and
+# tests/features.rs fails if one is missing.
+full = ["esp", "monitor", "tui"]
+
+# Test scaffolding. Never part of `full`; the integration tests reach it
+# through the dev-dependency on this crate below.
+testutil = []
 
 [dev-dependencies]
 assert_cmd = "2"
