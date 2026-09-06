@@ -132,6 +132,9 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::Filter, "InputMode::Filter"),
     (Capability::ControlLines, "enum ControlLine"),
     (Capability::Macros, "fn handle_macros_key"),
+    (Capability::InputHistory, "fn history_back"),
+    (Capability::LineEnding, "state.line_ending.suffix()"),
+    (Capability::ToggleConnection, "fn toggle_connection"),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.
@@ -141,23 +144,13 @@ pub const TUI: &[(Capability, &str)] = &[
 /// therefore fails the test until it is either built for the terminal too or
 /// written down here on purpose.
 ///
-/// Everything below is debt, not design; a terminal can do all of it. Four
+/// Everything below is debt, not design; a terminal can do all of it. Seven
 /// entries left this list on 6 September 2026: clearing the view, the filter,
-/// the control lines and the macros.
+/// the control lines, the macros, the input history, the line ending and
+/// releasing the port. What is left are the two dialogs and the protocol
+/// choice that goes with one of them.
 #[cfg(all(feature = "monitor", feature = "tui"))]
 pub const KNOWN_GAPS: &[(Capability, &str)] = &[
-    (
-        Capability::InputHistory,
-        "Up and Down scroll the buffer there, so recall needs its own keys",
-    ),
-    (
-        Capability::LineEnding,
-        "the terminal always appends the configured ending, with no way to pick one",
-    ),
-    (
-        Capability::ToggleConnection,
-        "the terminal holds its port for its whole run",
-    ),
     (Capability::Export, "no key writes the buffer out"),
     (
         Capability::TransferProtocol,

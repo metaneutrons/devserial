@@ -46,13 +46,13 @@ fn gui_data_dir() -> std::path::PathBuf {
 /// Previously the reader was kept running by an endless `sleep` loop and the
 /// runtime was leaked with `std::mem::forget`, which meant no shutdown ever
 /// flushed pending writes.
-#[cfg(feature = "monitor")]
+#[cfg(any(feature = "monitor", feature = "tui"))]
 pub struct SessionKeepalive {
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     reader: Mutex<Option<crate::reader::PortReaderHandle>>,
 }
 
-#[cfg(feature = "monitor")]
+#[cfg(any(feature = "monitor", feature = "tui"))]
 impl SessionKeepalive {
     fn new(runtime: tokio::runtime::Runtime, reader: crate::reader::PortReaderHandle) -> Arc<Self> {
         Arc::new(Self {
@@ -108,7 +108,7 @@ impl SessionKeepalive {
     }
 }
 
-#[cfg(feature = "monitor")]
+#[cfg(any(feature = "monitor", feature = "tui"))]
 impl Drop for SessionKeepalive {
     fn drop(&mut self) {
         // Dropping the reader closes its shutdown channel, which ends the task.
@@ -194,8 +194,11 @@ impl TokioSerialWriter {
 }
 
 /// Everything one standalone session owns.
-#[cfg(feature = "monitor")]
+#[cfg(any(feature = "monitor", feature = "tui"))]
 struct SessionParts {
+    /// The window hands this to its monitor state; the terminal reads through
+    /// `shared_storage` instead and never needs it.
+    #[cfg(feature = "monitor")]
     storage: SqliteStorage,
     shared_storage: Arc<Mutex<SqliteStorage>>,
     writer_slot: Arc<tokio::sync::Mutex<Option<crate::port_manager::SerialPortHandle>>>,
@@ -214,6 +217,14 @@ struct SessionParts {
 /// This closure is that missing counterpart, and both surfaces use it.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 pub type DirectActionFn = Arc<dyn Fn(&PortAction) -> Result<(), String> + Send + Sync>;
+
+/// Releases the port or takes it back, with the settings to reopen it under.
+///
+/// Defined here rather than with the window: the closure is built from the
+/// session, and the terminal offers the same choice. Leaving it in `monitor.rs`
+/// meant `--features tui` alone no longer compiled.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+pub type ToggleConnectFn = Arc<dyn Fn(bool, &PortConfig) -> Result<(), String> + Send + Sync>;
 
 /// Something a surface asks the hardware to do.
 ///
@@ -371,6 +382,48 @@ async fn run_macro_steps(
     Ok(())
 }
 
+/// Release the port and take it back, for a surface that offers the choice.
+///
+/// Releasing stops the reader and empties the writer slot; taking it back
+/// reopens the port and starts a fresh reader on it. Both surfaces need this,
+/// so it is built once from the session rather than written out at each caller.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn connect_toggle(port: &str, parts: &SessionParts) -> ToggleConnectFn {
+    let port = port.to_string();
+    let slot = Arc::clone(&parts.writer_slot);
+    let storage = Arc::clone(&parts.shared_storage);
+    let keepalive = Arc::clone(&parts.keepalive);
+
+    Arc::new(move |connect: bool, config: &PortConfig| {
+        let runtime = keepalive
+            .handle()
+            .ok_or_else(|| "session runtime is gone".to_string())?;
+        if !connect {
+            keepalive.replace_reader(None);
+            runtime.block_on(async {
+                *slot.lock().await = None;
+            });
+            return Ok(());
+        }
+
+        let (handle, reader) = {
+            let _guard = runtime.enter();
+            let serial = crate::port_manager::open_serial_port_raw(&port, config)
+                .map_err(|e| format!("failed to open port '{port}': {e}"))?;
+            let shared = crate::port_manager::SharedSerialPort::new(serial);
+            (
+                shared.handle(),
+                spawn_reconnecting_reader(&port, config, &storage, shared),
+            )
+        };
+        runtime.block_on(async {
+            *slot.lock().await = Some(handle);
+        });
+        keepalive.replace_reader(Some(reader));
+        Ok(())
+    })
+}
+
 /// Start a reader that can actually come back after the device disappears.
 ///
 /// `spawn_reader` uses `NoReconnect`, which still runs the reconnect state
@@ -396,8 +449,12 @@ fn spawn_reconnecting_reader(
     )
 }
 
-/// Open a port, start capturing, and return the pieces a GUI window needs.
-#[cfg(feature = "monitor")]
+/// Open a port, start capturing, and return the pieces a surface needs.
+///
+/// Both the window and the terminal use this. The terminal used to open its
+/// own port and spawn its own reader, which meant two implementations of the
+/// same thing and no session to release the port through.
+#[cfg(any(feature = "monitor", feature = "tui"))]
 fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<SessionParts, String> {
     crate::paths::create_private_dir(data_dir)
         .map_err(|e| format!("failed to create data directory: {e}"))?;
@@ -433,6 +490,7 @@ fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<Ses
     };
 
     Ok(SessionParts {
+        #[cfg(feature = "monitor")]
         storage,
         shared_storage,
         writer_slot,
@@ -467,40 +525,7 @@ pub fn open_standalone_session(
         Arc::new(move |config: &PortConfig| writer.reconfigure(config))
     };
 
-    let toggle: crate::monitor::ToggleConnectFn = {
-        let port = port.to_string();
-        let slot = Arc::clone(&parts.writer_slot);
-        let storage = Arc::clone(&parts.shared_storage);
-        let keepalive = Arc::clone(&parts.keepalive);
-        Arc::new(move |connect: bool, config: &PortConfig| {
-            let runtime = keepalive
-                .handle()
-                .ok_or_else(|| "session runtime is gone".to_string())?;
-            if !connect {
-                keepalive.replace_reader(None);
-                runtime.block_on(async {
-                    *slot.lock().await = None;
-                });
-                return Ok(());
-            }
-
-            let (handle, reader) = {
-                let _guard = runtime.enter();
-                let serial = crate::port_manager::open_serial_port_raw(&port, config)
-                    .map_err(|e| format!("failed to open port '{port}': {e}"))?;
-                let shared = crate::port_manager::SharedSerialPort::new(serial);
-                (
-                    shared.handle(),
-                    spawn_reconnecting_reader(&port, config, &storage, shared),
-                )
-            };
-            runtime.block_on(async {
-                *slot.lock().await = Some(handle);
-            });
-            keepalive.replace_reader(Some(reader));
-            Ok(())
-        })
-    };
+    let toggle = connect_toggle(port, &parts);
 
     Ok(crate::monitor::PortMonitorState::new_with_reconfigure(
         port.to_string(),
@@ -597,6 +622,8 @@ pub fn run_monitor_standalone(
                                 config_path,
                             )),
                             macros: macro_names(config_path),
+                            toggle: Some(connect_toggle(port, &parts)),
+                            history: parts.history.clone(),
                         },
                     ),
                     None => Err(CliError::msg("serial port is disconnected")),
@@ -628,49 +655,41 @@ pub fn run_tui_standalone(
     config_path: Option<&Path>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(config_path);
-    crate::paths::create_private_dir(&data_dir)?;
-    let db_path = crate::paths::port_db_path(&data_dir, port);
+    let parts = start_session(port, config, &data_dir).map_err(CliError::msg)?;
+    let runtime = parts
+        .keepalive
+        .handle()
+        .ok_or_else(|| CliError::msg("session runtime is gone"))?;
 
-    let storage = Arc::new(Mutex::new(
-        SqliteStorage::open(&db_path).map_err(|e| CliError::msg(e.to_string()))?,
-    ));
+    let port_handle = {
+        let slot = Arc::clone(&parts.writer_slot);
+        runtime.block_on(async move { slot.lock().await.clone() })
+    }
+    .ok_or_else(|| CliError::msg("serial port is disconnected"))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    // The reader handle is kept in scope for the whole session, which is what
-    // keeps the reader task running. Opening the port needs the reactor too,
-    // so both happen under the same guard.
-    let (port_handle, reader) = {
-        let _guard = runtime.enter();
-        let serial = crate::port_manager::open_serial_port_raw(port, config)?;
-        let shared = crate::port_manager::SharedSerialPort::new(serial);
-        (
-            shared.handle(),
-            spawn_reconnecting_reader(port, config, &storage, shared),
-        )
-    };
-    let link = Some(reader.state_rx.clone());
-    // The reader's factory swaps the port behind this handle on a reconnect,
-    // so a slot holding it stays correct for the whole run.
-    let slot = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&port_handle))));
     let context = crate::tui::TuiContext {
-        link,
-        action: Some(direct_action(runtime.handle().clone(), slot, config_path)),
+        link: parts.keepalive.link(),
+        action: Some(direct_action(
+            runtime.clone(),
+            Arc::clone(&parts.writer_slot),
+            config_path,
+        )),
         macros: macro_names(config_path),
+        toggle: Some(connect_toggle(port, &parts)),
+        history: parts.history.clone(),
     };
 
     let result = crate::tui::run_tui(
         port,
         config,
-        &storage,
+        &parts.shared_storage,
         &port_handle,
-        runtime.handle(),
+        &runtime,
         context,
     );
-    // Held until here on purpose: dropping the reader ends the task that fills
-    // the buffer the interface above was reading from.
-    drop(reader);
+    // The session is held until here: dropping it shuts down the reader that
+    // fills the buffer the interface above was reading from.
+    drop(parts);
     result
 }
 

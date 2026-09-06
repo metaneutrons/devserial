@@ -21,6 +21,58 @@ pub const BAUD_PRESETS: [u32; 8] = [
     9600, 19200, 38400, 57600, 115_200, 230_400, 460_800, 921_600,
 ];
 
+/// What is appended to a typed line before it is sent.
+///
+/// Shared by both surfaces: a line typed in the terminal has to leave the
+/// machine as the same bytes as the same line typed in the window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LineEnding {
+    /// Send exactly what was typed.
+    None,
+    /// Unix.
+    Lf,
+    /// The usual choice for serial consoles, and the default here.
+    #[default]
+    CrLf,
+    /// Classic Mac and some bootloaders.
+    Cr,
+}
+
+impl LineEnding {
+    /// The bytes appended to the payload.
+    #[must_use]
+    pub const fn suffix(self) -> &'static [u8] {
+        match self {
+            Self::None => b"",
+            Self::Lf => b"\n",
+            Self::CrLf => b"\r\n",
+            Self::Cr => b"\r",
+        }
+    }
+
+    /// How it is written in either interface.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Lf => "LF",
+            Self::CrLf => "CRLF",
+            Self::Cr => "CR",
+        }
+    }
+
+    /// The next choice, for a surface that cycles rather than lists.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::CrLf => Self::Lf,
+            Self::Lf => Self::Cr,
+            Self::Cr => Self::None,
+            Self::None => Self::CrLf,
+        }
+    }
+}
+
 /// Default duration of an RS-232 BREAK pulse.
 pub const DEFAULT_BREAK_MS: u64 = 250;
 

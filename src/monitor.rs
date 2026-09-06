@@ -20,7 +20,9 @@ use crate::config::PortConfig;
 use crate::export::{self, ExportFormat};
 use crate::gui_ipc::{GuiCommand, MonitorEvent, OpenPortRequest};
 use crate::platform::{self, EditState, MenuRequest};
-use crate::serial_params::{BAUD_PRESETS, DEFAULT_BAUD, DataBits, FlowControl, Parity, StopBits};
+use crate::serial_params::{
+    BAUD_PRESETS, DEFAULT_BAUD, DataBits, FlowControl, LineEnding, Parity, StopBits,
+};
 
 /// Maximum lines kept in the display buffer.
 const MAX_DISPLAY_LINES: usize = 100_000;
@@ -156,9 +158,6 @@ fn failure_summary(text: &str) -> String {
 
 /// Callback type for direct hardware reconfiguration in standalone mode.
 pub type ReconfigureFn = Arc<dyn Fn(&PortConfig) -> Result<(), String> + Send + Sync>;
-
-/// Callback type for direct connection toggling (connect/disconnect) in standalone mode.
-pub type ToggleConnectFn = Arc<dyn Fn(bool, &PortConfig) -> Result<(), String> + Send + Sync>;
 
 // --- Public API (spawn/handle) ---
 
@@ -602,34 +601,6 @@ struct DisplayLine {
     timestamp_ns: i64,
     payload: String,
     is_sent: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LineEnding {
-    None,
-    Lf,
-    CrLf,
-    Cr,
-}
-
-impl LineEnding {
-    const fn suffix(self) -> &'static [u8] {
-        match self {
-            Self::None => b"",
-            Self::Lf => b"\n",
-            Self::CrLf => b"\r\n",
-            Self::Cr => b"\r",
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::None => "None",
-            Self::Lf => "LF",
-            Self::CrLf => "CRLF",
-            Self::Cr => "CR",
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1134,7 +1105,7 @@ pub struct PortMonitorState {
     pub is_open: bool,
     pub open_port_dialog_requested: bool,
     pub is_selecting_in_buffer: bool,
-    pub toggle_connect: Option<ToggleConnectFn>,
+    pub toggle_connect: Option<crate::standalone::ToggleConnectFn>,
     /// Keeps the session runtime and reader alive for as long as this window
     /// exists. Dropping it shuts both down in order.
     ///
@@ -1179,7 +1150,7 @@ impl PortMonitorState {
         direct_reconfigure: Option<ReconfigureFn>,
         direct_action: Option<crate::standalone::DirectActionFn>,
         initial_config: Option<PortConfig>,
-        toggle_connect: Option<ToggleConnectFn>,
+        toggle_connect: Option<crate::standalone::ToggleConnectFn>,
         keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
     ) -> Self {
         let config = initial_config.unwrap_or_default();
