@@ -388,8 +388,13 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
 
     match cli.command {
         None | Some(Command::Mcp) => {
-            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-            if interactive && !matches!(cli.command, Some(Command::Mcp)) {
+            // Without a command the transport decides: a pipe means an MCP
+            // client, a terminal means a person. A macOS bundle launched from
+            // the Finder is a third case that looks like the first one, since
+            // it has no terminal on stdin, so it is recognised by its own path.
+            let windowed =
+                std::io::IsTerminal::is_terminal(&std::io::stdin()) || launched_from_app_bundle();
+            if windowed && !matches!(cli.command, Some(Command::Mcp)) {
                 return interactive_default();
             }
             mcp::run_mcp(config_path.as_deref())
@@ -440,6 +445,40 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
 }
 
 /// What happens when the binary is started without arguments in a terminal.
+/// True when `path` is the executable of a macOS application bundle, so when it
+/// sits directly in `<name>.app/Contents/MacOS/`.
+///
+/// The bundle ships the same binary as the archives. Double-clicked in the
+/// Finder it gets no command and no terminal on stdin, which is exactly the
+/// shape of an MCP client, and it would start a server nobody can see. The
+/// three enclosing directory names are what tells the two apart.
+fn is_app_bundle_executable(path: &std::path::Path) -> bool {
+    fn name(dir: Option<&std::path::Path>) -> Option<&std::ffi::OsStr> {
+        dir.and_then(std::path::Path::file_name)
+    }
+
+    let mut ancestors = path.ancestors().skip(1);
+    let macos = ancestors.next();
+    let contents = ancestors.next();
+    let bundle = ancestors.next();
+
+    name(macos) == Some(std::ffi::OsStr::new("MacOS"))
+        && name(contents) == Some(std::ffi::OsStr::new("Contents"))
+        // The bundle directory is named by the user's filesystem, which on
+        // macOS is case-insensitive by default, so .APP is the same bundle.
+        && bundle
+            .and_then(std::path::Path::extension)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+/// Whether this process was started as the executable of an application bundle.
+///
+/// Only macOS has bundles, and only there does the question arise.
+fn launched_from_app_bundle() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::current_exe().is_ok_and(|exe| is_app_bundle_executable(&exe))
+}
+
 fn interactive_default() -> Result<(), CliError> {
     #[cfg(feature = "monitor")]
     {
@@ -464,6 +503,42 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_bundle_executable_is_recognised_by_its_path() {
+        for path in [
+            "/Applications/devserial.app/Contents/MacOS/devserial",
+            "/Users/x/Downloads/My App.app/Contents/MacOS/devserial",
+        ] {
+            assert!(
+                is_app_bundle_executable(std::path::Path::new(path)),
+                "{path} should be a bundle executable"
+            );
+        }
+    }
+
+    #[test]
+    fn everything_outside_a_bundle_is_not_one() {
+        for path in [
+            // The plain CLI, which must keep starting the MCP server.
+            "/opt/homebrew/bin/devserial",
+            "/usr/local/bin/devserial",
+            "./target/release/devserial",
+            "devserial",
+            // A bundle-shaped path that is not one: right names, wrong order,
+            // wrong depth, or no .app at all.
+            "/Applications/devserial.app/Contents/devserial",
+            "/Applications/devserial.app/Contents/MacOS/helpers/devserial",
+            "/Applications/devserial/Contents/MacOS/devserial",
+            "/Applications/devserial.app/MacOS/Contents/devserial",
+            "/Contents/MacOS/devserial",
+        ] {
+            assert!(
+                !is_app_bundle_executable(std::path::Path::new(path)),
+                "{path} should not be a bundle executable"
+            );
+        }
     }
 
     #[test]
