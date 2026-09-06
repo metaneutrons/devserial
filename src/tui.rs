@@ -82,6 +82,10 @@ pub struct TuiContext {
     pub action: Option<crate::standalone::DirectActionFn>,
     /// Macro names offered in the picker, in the order they are numbered.
     pub macros: Vec<String>,
+    /// Releases and retakes the port, when this process holds it.
+    pub toggle: Option<crate::standalone::ToggleConnectFn>,
+    /// Lines sent in earlier sessions on this port.
+    pub history: Vec<String>,
 }
 
 /// Run the TUI monitor.
@@ -145,6 +149,18 @@ struct AppState {
     show_timestamps: bool,
     /// Pattern the view is narrowed to; empty means everything is shown.
     filter: String,
+    /// What is appended to a typed line before sending.
+    line_ending: crate::serial_params::LineEnding,
+    /// Lines sent earlier, oldest first.
+    history: Vec<String>,
+    /// Position in the history while walking it; `None` means not walking.
+    history_idx: Option<usize>,
+    /// What was typed before the walk started, to come back to.
+    history_draft: String,
+    /// Whether the port is held; only meaningful with a toggle available.
+    connected: bool,
+    /// Releases and retakes the port, when this process holds it.
+    toggle: Option<crate::standalone::ToggleConnectFn>,
     /// Where DTR and RTS were last put from here.
     ///
     /// The hardware cannot be asked, so this records what was set rather than
@@ -180,6 +196,12 @@ impl AppState {
             .unwrap_or(4);
         Self {
             filter: String::new(),
+            line_ending: crate::serial_params::LineEnding::default(),
+            history: Vec::new(),
+            history_idx: None,
+            history_draft: String::new(),
+            connected: true,
+            toggle: None,
             dtr_state: false,
             rts_state: false,
             macro_names: Vec::new(),
@@ -212,6 +234,84 @@ impl AppState {
             .iter()
             .filter(|(_, payload)| payload.contains(&self.filter))
             .collect()
+    }
+
+    /// Put the line that was just sent into the history.
+    ///
+    /// A repeat of the previous line is not recorded, so holding Enter does
+    /// not fill the history with one entry many times over.
+    ///
+    /// The line is also written to the capture database, so the history
+    /// survives the session as it does in the window. Storage is optional
+    /// purely so the tests can exercise the recall without one.
+    fn remember_sent(&mut self, storage: Option<&Arc<std::sync::Mutex<SqliteStorage>>>) {
+        let line = self.input.clone();
+        if self.history.last().is_none_or(|last| *last != line) {
+            if let Some(storage) = storage {
+                storage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .append_send_history(&line)
+                    .ok();
+            }
+            self.history.push(line);
+        }
+        self.history_idx = None;
+        self.history_draft.clear();
+    }
+
+    /// Step back through the history, keeping what was typed.
+    fn history_back(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_idx {
+            // The first step remembers the draft, so coming forward again
+            // returns what was being written rather than losing it.
+            None => {
+                self.history_draft = self.input.clone();
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(index) => index - 1,
+        };
+        self.history_idx = Some(next);
+        self.input = self.history[next].clone();
+    }
+
+    /// Step forward, and past the newest entry back to the draft.
+    fn history_forward(&mut self) {
+        let Some(index) = self.history_idx else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            self.history_idx = Some(index + 1);
+            self.input = self.history[index + 1].clone();
+        } else {
+            self.history_idx = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
+    }
+
+    /// Release the port or take it back.
+    fn toggle_connection(&mut self, config: &PortConfig) {
+        let Some(toggle) = self.toggle.clone() else {
+            self.set_status("This terminal does not own the port");
+            return;
+        };
+        let wanted = !self.connected;
+        match toggle(wanted, config) {
+            Ok(()) => {
+                self.connected = wanted;
+                self.set_status(if wanted {
+                    "Port reconnected"
+                } else {
+                    "Port released"
+                });
+            }
+            // The flag is not moved on failure: the port did not change hands.
+            Err(e) => self.set_status(format!("Failed: {e}")),
+        }
     }
 
     /// Carry out a hardware action, or say why it cannot happen here.
@@ -259,6 +359,8 @@ fn run_app(
     state.link = context.link;
     state.action = context.action;
     state.macro_names = context.macros;
+    state.toggle = context.toggle;
+    state.history = context.history;
 
     loop {
         // Poll new lines from storage.
@@ -313,8 +415,21 @@ fn run_app(
                     state.set_status("Enter a directory to receive into (ZMODEM)");
                     continue;
                 }
-                KeyCode::Char('p') => {
-                    state.input_mode = toggle(&state.input_mode, InputMode::Configure);
+                KeyCode::Char('p') if state.input_mode == InputMode::Normal => {
+                    // Readline's keys, for the audience that lives in a
+                    // terminal. Up and Down scroll the log here, so the
+                    // history needs its own pair. Ctrl+P used to open the
+                    // settings, which F2 already does.
+                    state.history_back();
+                    continue;
+                }
+                KeyCode::Char('n') if state.input_mode == InputMode::Normal => {
+                    state.history_forward();
+                    continue;
+                }
+                KeyCode::Char('k') => {
+                    let config = state.config.clone();
+                    state.toggle_connection(&config);
                     continue;
                 }
                 KeyCode::Char('t') => {
@@ -444,7 +559,7 @@ fn run_app(
             KeyCode::Backspace => {
                 state.input.pop();
             }
-            KeyCode::Enter => handle_enter(&mut state, runtime, write_port),
+            KeyCode::Enter => handle_enter(&mut state, runtime, write_port, storage),
             KeyCode::Up => {
                 state.auto_follow = false;
                 state.scroll_offset = state.scroll_offset.saturating_sub(1);
@@ -579,15 +694,21 @@ fn send_break(runtime: &tokio::runtime::Handle, port: &SerialPortHandle) {
     });
 }
 
-fn handle_enter(state: &mut AppState, runtime: &tokio::runtime::Handle, port: &SerialPortHandle) {
+fn handle_enter(
+    state: &mut AppState,
+    runtime: &tokio::runtime::Handle,
+    port: &SerialPortHandle,
+    storage: &Arc<std::sync::Mutex<SqliteStorage>>,
+) {
     match state.input_mode {
         InputMode::Normal if !state.input.is_empty() => {
             let mut data = state.input.as_bytes().to_vec();
-            data.extend_from_slice(b"\r\n");
+            data.extend_from_slice(state.line_ending.suffix());
             let port = Arc::clone(port);
             runtime.block_on(async move {
                 let _ = port.lock().await.write_all(&data).await;
             });
+            state.remember_sent(Some(storage));
             state.input.clear();
         }
         InputMode::SendFile if !state.input.is_empty() => {
@@ -679,6 +800,13 @@ fn handle_configure_key(
         KeyCode::Char('f' | 'F') => {
             state.config.flow_control = next_flow_control(state.config.flow_control);
         }
+        KeyCode::Char('e' | 'E') => {
+            // Not part of the port settings the hardware is told about, so it
+            // takes effect at once and needs no Enter.
+            state.line_ending = state.line_ending.next();
+            let label = state.line_ending.label();
+            state.set_status(format!("Line ending: {label}"));
+        }
         KeyCode::Enter => {
             state.config.baudrate = BAUD_PRESETS[state.baud_index];
             let config = state.config.clone();
@@ -757,10 +885,11 @@ fn render_status_bar(
     follow: &str,
 ) {
     let status = format!(
-        " {} | {} | {} | Lines: {} | View: {view} | {status_text}{follow}",
+        " {} | {} | {} | {} | Lines: {} | View: {view} | {status_text}{follow}",
         state.port_name,
         link_label(state),
         state.config.framing_summary(),
+        state.line_ending.label(),
         state.shown().len(),
     );
     let bar = if state.link_is_down() {
@@ -843,7 +972,7 @@ fn render(frame: &mut Frame, state: &AppState) {
     let (prompt, title) = match state.input_mode {
         InputMode::Normal => (
             "> ",
-            " Enter send | F2 config | F3 signals | F5 macros | Ctrl+F filter | Ctrl+L clear | Ctrl+B break | Ctrl+S/R file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit ",
+            " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | Ctrl+F filter | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit ",
         ),
         InputMode::SendFile => (
             "Send File Path: ",
@@ -856,7 +985,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         InputMode::About => ("", " About devserial (Esc or F1 to close) "),
         InputMode::Configure => (
             "",
-            " Configure port settings (Enter to apply, Esc to cancel) ",
+            " Port settings: Enter applies, e cycles the line ending, Esc cancels ",
         ),
         InputMode::Filter => (
             "Filter: ",
@@ -1064,8 +1193,15 @@ fn render_configure_popup(frame: &mut Frame, state: &AppState) {
         ),
     ]));
     lines.push(Line::from(""));
+    // Cyan rather than green: the four above are told to the hardware when
+    // Enter is pressed, this one takes effect at once.
     lines.push(Line::from(Span::styled(
-        "Press [Enter] to apply, [Esc] to cancel",
+        format!("[E]nding: {}", state.line_ending.label()),
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press [Enter] to apply the port settings, [Esc] to cancel",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1349,5 +1485,130 @@ mod tests {
         handle_macros_key(&mut state, KeyCode::Char('1'));
         let (message, _) = state.status_msg.clone().expect("a status was set");
         assert!(message.contains("does not own the port"), "got: {message}");
+    }
+
+    #[test]
+    fn the_history_remembers_what_was_sent_once_each() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        for line in ["a", "b", "b", "c"] {
+            state.input = line.to_string();
+            state.remember_sent(None);
+        }
+        // The repeat is not recorded: holding Enter must not fill the history.
+        assert_eq!(state.history, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn walking_back_and_forward_returns_the_draft() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.history = vec!["first".into(), "second".into()];
+        state.input = "half typed".to_string();
+
+        state.history_back();
+        assert_eq!(state.input, "second");
+        state.history_back();
+        assert_eq!(state.input, "first");
+        // Already at the oldest entry, so it stays there.
+        state.history_back();
+        assert_eq!(state.input, "first");
+
+        state.history_forward();
+        assert_eq!(state.input, "second");
+        state.history_forward();
+        assert_eq!(state.input, "half typed", "the draft has to come back");
+        // Past the draft there is nothing to step to.
+        state.history_forward();
+        assert_eq!(state.input, "half typed");
+    }
+
+    #[test]
+    fn an_empty_history_leaves_the_input_alone() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.input = "typing".to_string();
+        state.history_back();
+        assert_eq!(state.input, "typing");
+    }
+
+    #[test]
+    fn the_line_ending_cycles_through_all_four() {
+        use crate::serial_params::LineEnding;
+        let mut ending = LineEnding::default();
+        assert_eq!(ending, LineEnding::CrLf, "a serial console wants CRLF");
+        let mut seen = vec![ending];
+        for _ in 0..3 {
+            ending = ending.next();
+            seen.push(ending);
+        }
+        assert_eq!(
+            seen,
+            [
+                LineEnding::CrLf,
+                LineEnding::Lf,
+                LineEnding::Cr,
+                LineEnding::None
+            ]
+        );
+        assert_eq!(ending.next(), LineEnding::CrLf, "and round again");
+    }
+
+    #[test]
+    fn every_line_ending_sends_the_bytes_it_names() {
+        use crate::serial_params::LineEnding;
+        assert_eq!(LineEnding::CrLf.suffix(), b"\r\n");
+        assert_eq!(LineEnding::Lf.suffix(), b"\n");
+        assert_eq!(LineEnding::Cr.suffix(), b"\r");
+        assert_eq!(LineEnding::None.suffix(), b"");
+    }
+
+    #[test]
+    fn releasing_the_port_without_a_toggle_says_so() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        let config = state.config.clone();
+        state.toggle_connection(&config);
+        let (message, _) = state.status_msg.clone().expect("a status was set");
+        assert!(message.contains("does not own the port"), "got: {message}");
+        assert!(state.connected, "a refused toggle must not change the flag");
+    }
+
+    #[test]
+    fn a_failed_toggle_leaves_the_flag_alone() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.toggle = Some(std::sync::Arc::new(|_, _| Err("no".to_string())));
+        let config = state.config.clone();
+        state.toggle_connection(&config);
+        assert!(state.connected, "the port did not change hands");
+    }
+
+    #[test]
+    fn a_successful_toggle_flips_the_flag_both_ways() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.toggle = Some(std::sync::Arc::new(|_, _| Ok(())));
+        let config = state.config.clone();
+        state.toggle_connection(&config);
+        assert!(!state.connected);
+        state.toggle_connection(&config);
+        assert!(state.connected);
+    }
+
+    #[test]
+    fn the_footer_names_every_key_it_binds() {
+        // The footer is the only place the keys are advertised. A binding that
+        // is not named there is a binding nobody finds.
+        let source = include_str!("tui.rs");
+        for key in [
+            "Ctrl+P/N history",
+            "F2 config",
+            "F3 signals",
+            "F5 macros",
+            "Ctrl+F filter",
+            "Ctrl+L clear",
+            "Ctrl+K connect",
+            "Ctrl+B break",
+            "Ctrl+T time",
+            "Ctrl+H hex",
+            "F1 about",
+        ] {
+            assert!(source.contains(key), "the footer does not name {key}");
+        }
     }
 }
