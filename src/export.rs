@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::StoredLine;
 
+/// Upper bound on lines pulled into memory for one export.
+///
+/// Shared by both surfaces, so a terminal export cannot quietly take more than
+/// the window would.
+pub const MAX_EXPORT_LINES: u32 = 500_000;
+
 /// Output format for exported capture data.
 #[derive(
     Debug,

@@ -27,9 +27,6 @@ use crate::serial_params::{
 /// Maximum lines kept in the display buffer.
 const MAX_DISPLAY_LINES: usize = 100_000;
 
-/// Upper bound on lines pulled into memory for one export.
-const MAX_EXPORT_LINES: u32 = 500_000;
-
 /// Everything the firmware dialog needs to keep between frames.
 ///
 /// One struct rather than a dozen fields on the window, so the whole feature
@@ -2373,33 +2370,13 @@ impl PortMonitorState {
                 ui.horizontal(|ui| {
                     ui.label("Protocol:");
                     egui::ComboBox::from_id_salt(format!("proto_combo_{}", self.port_name))
-                        .selected_text(format!("{:?}", self.transfer_proto))
+                        .selected_text(self.transfer_proto.label())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.transfer_proto,
-                                crate::modem::FileTransferProtocol::Zmodem,
-                                "ZMODEM (Streaming, 32-bit CRC)",
-                            );
-                            ui.selectable_value(
-                                &mut self.transfer_proto,
-                                crate::modem::FileTransferProtocol::Ymodem,
-                                "YMODEM (Batch, 1K CRC)",
-                            );
-                            ui.selectable_value(
-                                &mut self.transfer_proto,
-                                crate::modem::FileTransferProtocol::Xmodem1k,
-                                "XMODEM-1K (1024-byte blocks)",
-                            );
-                            ui.selectable_value(
-                                &mut self.transfer_proto,
-                                crate::modem::FileTransferProtocol::XmodemCrc,
-                                "XMODEM-CRC (128-byte blocks)",
-                            );
-                            ui.selectable_value(
-                                &mut self.transfer_proto,
-                                crate::modem::FileTransferProtocol::Xmodem,
-                                "XMODEM (Standard Checksum)",
-                            );
+                            // From the shared list, so the terminal offers the
+                            // same protocols under the same names.
+                            for proto in crate::modem::FileTransferProtocol::ALL {
+                                ui.selectable_value(&mut self.transfer_proto, proto, proto.label());
+                            }
                         });
                 });
 
@@ -2795,7 +2772,8 @@ impl PortMonitorState {
                     .storage
                     .line_count()
                     .map_err(|e| format!("database error: {e}"))?;
-                let count = u32::try_from(total.min(u64::from(MAX_EXPORT_LINES))).unwrap_or(1);
+                let count = u32::try_from(total.min(u64::from(crate::export::MAX_EXPORT_LINES)))
+                    .unwrap_or(1);
                 self.storage
                     .read_lines(1, count.max(1))
                     .map_err(|e| format!("database read error: {e}"))
@@ -2828,9 +2806,9 @@ impl PortMonitorState {
                     return Err("end ID is before start ID".to_string());
                 }
                 let span = end.saturating_sub(start).saturating_add(1);
-                let count = u32::try_from(span).unwrap_or(MAX_EXPORT_LINES);
+                let count = u32::try_from(span).unwrap_or(crate::export::MAX_EXPORT_LINES);
                 self.storage
-                    .read_lines(start, count.min(MAX_EXPORT_LINES))
+                    .read_lines(start, count.min(crate::export::MAX_EXPORT_LINES))
                     .map_err(|e| format!("database read error: {e}"))
             }
         }
