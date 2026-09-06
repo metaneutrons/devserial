@@ -40,6 +40,17 @@ squashes, and the PR title becomes the subject line on `main`, which is what
 release-please reads. The messages of individual commits on a feature branch are
 discarded by the squash.
 
+**English, everywhere a message is kept.** Commit subjects and bodies, pull
+request titles and bodies, branch names, changelog entries and release notes.
+The repository is the audience, not the author. A subject is frozen the moment
+it is pushed, and correcting it later means rewriting history, which moves every
+later commit, re-points every tag and breaks every changelog link.
+
+**One pull request carries changes of one kind.** The squash subject decides the
+changelog rubric, so a `feat` subject files a fix that travelled with it under
+Features, where nobody looks for it. Split the work and merge the parts one
+after the other.
+
 No AI attribution trailers. Specifically no `Co-authored-by:` naming Claude or
 Anthropic, no `Generated with Claude Code` line and no `noreply@anthropic.com`
 as author or committer. A real human co-author is welcome.
