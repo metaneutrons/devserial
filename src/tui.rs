@@ -69,6 +69,21 @@ fn install_panic_hook() {
     });
 }
 
+/// What the surrounding process hands the terminal beyond the port itself.
+///
+/// Bundled rather than passed one by one: the list grows every time the two
+/// surfaces are brought closer together, and a function with eight parameters
+/// invites the next one to be forgotten.
+#[derive(Default)]
+pub struct TuiContext {
+    /// Watch on what the reader says about the hardware.
+    pub link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
+    /// Carries out Break, DTR, RTS and macros when this process owns the port.
+    pub action: Option<crate::standalone::DirectActionFn>,
+    /// Macro names offered in the picker, in the order they are numbered.
+    pub macros: Vec<String>,
+}
+
 /// Run the TUI monitor.
 ///
 /// # Errors
@@ -79,13 +94,13 @@ pub fn run_tui(
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
     write_port: &SerialPortHandle,
     runtime: &tokio::runtime::Handle,
-    link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
+    context: TuiContext,
 ) -> Result<(), CliError> {
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     run_app(
-        link,
+        context,
         &mut terminal,
         port_name,
         config,
@@ -102,8 +117,18 @@ enum InputMode {
     RecvFile,
     About,
     Configure,
+    /// Typing a pattern that narrows the view.
+    Filter,
+    /// Setting the control lines by hand.
+    Signals,
+    /// Picking a macro from the configured list.
+    Macros,
 }
 
+// DTR and RTS join the view toggles here. They are separate switches with
+// separate meanings, so folding them into one type would obscure rather than
+// simplify.
+#[allow(clippy::struct_excessive_bools)]
 struct AppState {
     lines: std::collections::VecDeque<(String, String)>,
     last_id: i64,
@@ -118,6 +143,18 @@ struct AppState {
     baud_index: usize,
     /// Show the capture time in front of every line.
     show_timestamps: bool,
+    /// Pattern the view is narrowed to; empty means everything is shown.
+    filter: String,
+    /// Where DTR and RTS were last put from here.
+    ///
+    /// The hardware cannot be asked, so this records what was set rather than
+    /// claiming to read the lines back.
+    dtr_state: bool,
+    rts_state: bool,
+    /// Macros offered in the picker, in the order they are numbered.
+    macro_names: Vec<String>,
+    /// Carries out hardware actions when this process owns the port.
+    action: Option<crate::standalone::DirectActionFn>,
     /// What the reader reports about the hardware, when this window owns it.
     ///
     /// Without it the bar could only show what the user had asked for, and an
@@ -142,6 +179,11 @@ impl AppState {
             .position(|&b| b == config.baudrate)
             .unwrap_or(4);
         Self {
+            filter: String::new(),
+            dtr_state: false,
+            rts_state: false,
+            macro_names: Vec::new(),
+            action: None,
             link: None,
             lines: std::collections::VecDeque::new(),
             last_id: 0,
@@ -156,6 +198,28 @@ impl AppState {
             show_timestamps: true,
             hex_view: false,
         }
+    }
+
+    /// The lines the view currently shows.
+    ///
+    /// The buffer itself is never filtered. A filter narrows what is on screen
+    /// and is taken back by clearing it, so nothing captured is lost.
+    fn shown(&self) -> Vec<&(String, String)> {
+        if self.filter.is_empty() {
+            return self.lines.iter().collect();
+        }
+        self.lines
+            .iter()
+            .filter(|(_, payload)| payload.contains(&self.filter))
+            .collect()
+    }
+
+    /// Carry out a hardware action, or say why it cannot happen here.
+    fn act(&self, event: &crate::standalone::PortAction) -> Result<(), String> {
+        self.action.as_ref().map_or_else(
+            || Err("this window does not own the port".to_string()),
+            |action| action(event),
+        )
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -183,7 +247,7 @@ impl AppState {
 
 #[allow(clippy::too_many_lines)]
 fn run_app(
-    link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
+    context: TuiContext,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     port_name: &str,
     config: &PortConfig,
@@ -192,7 +256,9 @@ fn run_app(
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), CliError> {
     let mut state = AppState::new(port_name, config);
-    state.link = link;
+    state.link = context.link;
+    state.action = context.action;
+    state.macro_names = context.macros;
 
     loop {
         // Poll new lines from storage.
@@ -210,9 +276,9 @@ fn run_app(
             state.push_line(ts, line.payload);
         }
 
-        if state.auto_follow && !state.lines.is_empty() {
+        if state.auto_follow && !state.shown().is_empty() {
             let visible = terminal.size()?.height.saturating_sub(6) as usize;
-            state.scroll_offset = state.lines.len().saturating_sub(visible);
+            state.scroll_offset = state.shown().len().saturating_sub(visible);
         }
 
         terminal.draw(|frame| render(frame, &state))?;
@@ -260,6 +326,21 @@ fn run_app(
                     });
                     continue;
                 }
+                KeyCode::Char('l') => {
+                    // Only the view, exactly as the button in the window does.
+                    // The buffer on disk is the record and is left alone.
+                    state.lines.clear();
+                    state.scroll_offset = 0;
+                    state.auto_follow = true;
+                    state.set_status("Display cleared");
+                    continue;
+                }
+                KeyCode::Char('f') if state.input_mode == InputMode::Normal => {
+                    state.input_mode = InputMode::Filter;
+                    state.input = state.filter.clone();
+                    state.set_status("Type a pattern, Enter to apply");
+                    continue;
+                }
                 KeyCode::Char('h') => {
                     state.hex_view = !state.hex_view;
                     state.set_status(if state.hex_view {
@@ -282,6 +363,18 @@ fn run_app(
                 state.input_mode = toggle(&state.input_mode, InputMode::Configure);
                 continue;
             }
+            KeyCode::F(3) => {
+                state.input_mode = toggle(&state.input_mode, InputMode::Signals);
+                continue;
+            }
+            KeyCode::F(5) => {
+                if state.macro_names.is_empty() {
+                    state.set_status("No macros are configured");
+                } else {
+                    state.input_mode = toggle(&state.input_mode, InputMode::Macros);
+                }
+                continue;
+            }
             KeyCode::F(4) => {
                 send_break(runtime, write_port);
                 state.note(
@@ -291,9 +384,14 @@ fn run_app(
                 continue;
             }
             KeyCode::Esc => {
+                if state.input_mode == InputMode::Filter {
+                    state.filter.clear();
+                    state.set_status("Filter cleared");
+                } else {
+                    state.set_status("Ready");
+                }
                 state.input_mode = InputMode::Normal;
                 state.input.clear();
-                state.set_status("Ready");
                 continue;
             }
             _ => {}
@@ -301,6 +399,38 @@ fn run_app(
 
         if state.input_mode == InputMode::Configure {
             handle_configure_key(&mut state, key.code, runtime, write_port, storage);
+            continue;
+        }
+
+        if state.input_mode == InputMode::Signals {
+            handle_signals_key(&mut state, key.code);
+            continue;
+        }
+
+        if state.input_mode == InputMode::Macros {
+            handle_macros_key(&mut state, key.code);
+            continue;
+        }
+
+        if state.input_mode == InputMode::Filter {
+            match key.code {
+                KeyCode::Enter => {
+                    state.filter = state.input.trim().to_string();
+                    let note = if state.filter.is_empty() {
+                        "Filter cleared".to_string()
+                    } else {
+                        format!("Filtering on '{}'", state.filter)
+                    };
+                    state.input.clear();
+                    state.input_mode = InputMode::Normal;
+                    state.set_status(&note);
+                }
+                KeyCode::Char(c) => state.input.push(c),
+                KeyCode::Backspace => {
+                    state.input.pop();
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -321,7 +451,7 @@ fn run_app(
             }
             KeyCode::Down => {
                 let visible = terminal.size()?.height.saturating_sub(6) as usize;
-                let max = state.lines.len().saturating_sub(visible);
+                let max = state.shown().len().saturating_sub(visible);
                 state.scroll_offset = (state.scroll_offset + 1).min(max);
                 state.auto_follow = state.scroll_offset >= max;
             }
@@ -331,7 +461,7 @@ fn run_app(
             }
             KeyCode::PageDown => {
                 let visible = terminal.size()?.height.saturating_sub(6) as usize;
-                let max = state.lines.len().saturating_sub(visible);
+                let max = state.shown().len().saturating_sub(visible);
                 state.scroll_offset = (state.scroll_offset + 20).min(max);
                 state.auto_follow = state.scroll_offset >= max;
             }
@@ -348,6 +478,94 @@ fn toggle(current: &InputMode, target: InputMode) -> InputMode {
         InputMode::Normal
     } else {
         target
+    }
+}
+
+/// Set DTR or RTS from the signals screen.
+///
+/// The lines cannot be read back from the hardware, so the screen shows what
+/// was last set from here rather than claiming to know the pin.
+fn handle_signals_key(state: &mut AppState, key: KeyCode) {
+    let line = match key {
+        KeyCode::Char('d' | 'D') => ControlLine::Dtr,
+        KeyCode::Char('r' | 'R') => ControlLine::Rts,
+        _ => return,
+    };
+
+    let level = !line.level(state);
+    let event = line.event(level);
+    match state.act(&event) {
+        Ok(()) => {
+            line.record(state, level);
+            let level = if level { "HIGH" } else { "LOW" };
+            state.set_status(format!("{}={level}", line.label()));
+        }
+        // Nothing is recorded on failure: the line did not move.
+        Err(e) => state.set_status(format!("{} failed: {e}", line.label())),
+    }
+}
+
+/// One of the two control lines a person can set by hand.
+#[derive(Clone, Copy)]
+enum ControlLine {
+    Dtr,
+    Rts,
+}
+
+impl ControlLine {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dtr => "DTR",
+            Self::Rts => "RTS",
+        }
+    }
+
+    const fn level(self, state: &AppState) -> bool {
+        match self {
+            Self::Dtr => state.dtr_state,
+            Self::Rts => state.rts_state,
+        }
+    }
+
+    const fn record(self, state: &mut AppState, level: bool) {
+        match self {
+            Self::Dtr => state.dtr_state = level,
+            Self::Rts => state.rts_state = level,
+        }
+    }
+
+    const fn event(self, level: bool) -> crate::standalone::PortAction {
+        match self {
+            Self::Dtr => crate::standalone::PortAction::Signal {
+                dtr: Some(level),
+                rts: None,
+            },
+            Self::Rts => crate::standalone::PortAction::Signal {
+                dtr: None,
+                rts: Some(level),
+            },
+        }
+    }
+}
+
+/// Run the macro the pressed digit points at.
+fn handle_macros_key(state: &mut AppState, key: KeyCode) {
+    let KeyCode::Char(c @ '1'..='9') = key else {
+        return;
+    };
+    let index = c as usize - '1' as usize;
+    let Some(name) = state.macro_names.get(index).cloned() else {
+        state.set_status("No macro under that number");
+        return;
+    };
+
+    let event = crate::standalone::PortAction::Macro { name: name.clone() };
+    match state.act(&event) {
+        Ok(()) => {
+            state.set_status(format!("Ran '{name}'"));
+            state.input_mode = InputMode::Normal;
+        }
+        Err(e) => state.set_status(format!("'{name}' failed: {e}")),
     }
 }
 
@@ -543,7 +761,7 @@ fn render_status_bar(
         state.port_name,
         link_label(state),
         state.config.framing_summary(),
-        state.lines.len(),
+        state.shown().len(),
     );
     let bar = if state.link_is_down() {
         Style::default().bg(Color::Red)
@@ -583,9 +801,9 @@ fn render(frame: &mut Frame, state: &AppState) {
     render_status_bar(frame, state, chunks[0], view, &status_text, follow);
 
     let visible_height = chunks[1].height as usize;
-    let end = (state.scroll_offset + visible_height).min(state.lines.len());
-    let visible: Vec<Line> = state
-        .lines
+    let shown = state.shown();
+    let end = (state.scroll_offset + visible_height).min(shown.len());
+    let visible: Vec<Line> = shown
         .iter()
         .skip(state.scroll_offset)
         .take(end.saturating_sub(state.scroll_offset))
@@ -613,7 +831,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         chunks[1],
     );
 
-    let mut scrollbar_state = ScrollbarState::new(state.lines.len())
+    let mut scrollbar_state = ScrollbarState::new(shown.len())
         .position(state.scroll_offset)
         .viewport_content_length(visible_height);
     frame.render_stateful_widget(
@@ -625,7 +843,7 @@ fn render(frame: &mut Frame, state: &AppState) {
     let (prompt, title) = match state.input_mode {
         InputMode::Normal => (
             "> ",
-            " Enter send | F2 config | Ctrl+B break | Ctrl+S send file | Ctrl+R recv file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit ",
+            " Enter send | F2 config | F3 signals | F5 macros | Ctrl+F filter | Ctrl+L clear | Ctrl+B break | Ctrl+S/R file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit ",
         ),
         InputMode::SendFile => (
             "Send File Path: ",
@@ -640,6 +858,12 @@ fn render(frame: &mut Frame, state: &AppState) {
             "",
             " Configure port settings (Enter to apply, Esc to cancel) ",
         ),
+        InputMode::Filter => (
+            "Filter: ",
+            " Show only lines containing this text (Enter to apply, Esc to clear) ",
+        ),
+        InputMode::Signals => ("", " d toggles DTR, r toggles RTS (Esc to close) "),
+        InputMode::Macros => ("", " Press a number to run that macro (Esc to close) "),
     };
 
     frame.render_widget(
@@ -651,6 +875,8 @@ fn render(frame: &mut Frame, state: &AppState) {
     match state.input_mode {
         InputMode::About => render_about_popup(frame),
         InputMode::Configure => render_configure_popup(frame, state),
+        InputMode::Signals => render_signals_popup(frame, state),
+        InputMode::Macros => render_macros_popup(frame, state),
         _ => {}
     }
 }
@@ -683,6 +909,93 @@ fn severity_color(payload: &str) -> Color {
     } else {
         Color::White
     }
+}
+
+/// The control lines, with the levels last set from here.
+fn render_signals_popup(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(50, 35, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let row = |label: &str, level: bool, key: char| {
+        let text = if level { "HIGH" } else { "LOW" };
+        let colour = if level { Color::Green } else { Color::DarkGray };
+        Line::from(vec![
+            Span::styled(format!("  {key}  "), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{label}  "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::default().fg(colour)),
+        ])
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "⇅ Control Lines",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        row("DTR", state.dtr_state, 'd'),
+        row("RTS", state.rts_state, 'r'),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The levels shown are the ones last set from here.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "The hardware cannot be read back.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+
+/// The configured macros, numbered so a digit runs one.
+fn render_macros_popup(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(55, 45, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "▷ Macros",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    // Nine at most: the picker is driven by the digits 1 to 9, and an entry
+    // with no key would be an entry nobody can reach.
+    for (index, name) in state.macro_names.iter().take(9).enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}  ", index + 1),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(name.clone()),
+        ]));
+    }
+    if state.macro_names.len() > 9 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  … {} more, reachable from the command line",
+                state.macro_names.len() - 9
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
 }
 
 fn render_configure_popup(frame: &mut Frame, state: &AppState) {
@@ -927,5 +1240,114 @@ mod tests {
             toggle(&InputMode::Normal, InputMode::About),
             InputMode::About
         ));
+    }
+
+    fn with_lines(payloads: &[&str]) -> AppState {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        for (index, payload) in payloads.iter().enumerate() {
+            state.push_line(format!("00:00:{index:02}"), (*payload).to_string());
+        }
+        state
+    }
+
+    #[test]
+    fn without_a_filter_everything_is_shown() {
+        let state = with_lines(&["boot", "ready", "error 7"]);
+        assert_eq!(state.shown().len(), 3);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_view_without_touching_the_buffer() {
+        let mut state = with_lines(&["boot", "ready", "error 7", "error 9"]);
+        state.filter = "error".to_string();
+        let shown: Vec<&str> = state.shown().iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(shown, ["error 7", "error 9"]);
+        // The record is untouched, so clearing the filter brings it all back.
+        assert_eq!(state.lines.len(), 4);
+        state.filter.clear();
+        assert_eq!(state.shown().len(), 4);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_shows_nothing() {
+        let mut state = with_lines(&["boot", "ready"]);
+        state.filter = "nowhere".to_string();
+        assert!(state.shown().is_empty());
+    }
+
+    #[test]
+    fn the_filter_is_case_sensitive_like_the_window() {
+        let mut state = with_lines(&["ERROR", "error"]);
+        state.filter = "error".to_string();
+        assert_eq!(state.shown().len(), 1);
+    }
+
+    #[test]
+    fn clearing_the_view_keeps_nothing_and_follows_again() {
+        let mut state = with_lines(&["one", "two"]);
+        state.auto_follow = false;
+        state.scroll_offset = 1;
+        // The same three effects the key has.
+        state.lines.clear();
+        state.scroll_offset = 0;
+        state.auto_follow = true;
+        assert!(state.shown().is_empty());
+        assert_eq!(state.scroll_offset, 0);
+        assert!(state.auto_follow);
+    }
+
+    #[test]
+    fn a_control_line_toggles_and_reports_its_level() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        assert!(!ControlLine::Dtr.level(&state));
+        ControlLine::Dtr.record(&mut state, true);
+        assert!(ControlLine::Dtr.level(&state));
+        // The two lines are independent.
+        assert!(!ControlLine::Rts.level(&state));
+    }
+
+    #[test]
+    fn a_control_line_event_names_only_its_own_line() {
+        match ControlLine::Dtr.event(true) {
+            crate::standalone::PortAction::Signal { dtr, rts } => {
+                assert_eq!(dtr, Some(true));
+                assert_eq!(rts, None);
+            }
+            other => panic!("expected a signal, got {other:?}"),
+        }
+        match ControlLine::Rts.event(false) {
+            crate::standalone::PortAction::Signal { dtr, rts } => {
+                assert_eq!(dtr, None);
+                assert_eq!(rts, Some(false));
+            }
+            other => panic!("expected a signal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_signal_leaves_the_recorded_level_alone() {
+        // No action, so every attempt fails. The screen must not claim a level
+        // the hardware never took.
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        handle_signals_key(&mut state, KeyCode::Char('d'));
+        assert!(!state.dtr_state, "a refused action must not be recorded");
+    }
+
+    #[test]
+    fn a_macro_digit_beyond_the_list_says_so() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.macro_names = vec!["reset".to_string()];
+        handle_macros_key(&mut state, KeyCode::Char('9'));
+        let (message, _) = state.status_msg.clone().expect("a status was set");
+        assert!(message.contains("No macro"), "got: {message}");
+    }
+
+    #[test]
+    fn a_macro_without_an_owned_port_reports_why() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.macro_names = vec!["reset".to_string()];
+        handle_macros_key(&mut state, KeyCode::Char('1'));
+        let (message, _) = state.status_msg.clone().expect("a status was set");
+        assert!(message.contains("does not own the port"), "got: {message}");
     }
 }
