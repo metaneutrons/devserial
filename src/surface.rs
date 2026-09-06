@@ -51,7 +51,12 @@ pub enum Capability {
     Filter,
     /// Discard the buffer.
     ClearBuffer,
-    /// Write the buffer to a file or the clipboard.
+    /// Write the buffer out in a chosen format.
+    ///
+    /// The window additionally offers the clipboard. That is a convenience of
+    /// a graphical surface rather than a capability of its own: a terminal has
+    /// no portable clipboard, and claiming one would be a promise that breaks
+    /// on the first machine without a helper installed.
     Export,
     /// Send and receive files with a modem protocol.
     FileTransfer,
@@ -111,7 +116,7 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::ClearBuffer, "\"Clear\""),
     (Capability::Export, "\"Export ▾\""),
     (Capability::FileTransfer, "\"Transfer ▾\""),
-    (Capability::TransferProtocol, "FileTransferProtocol::Ymodem"),
+    (Capability::TransferProtocol, "FileTransferProtocol::ALL"),
     (Capability::FlashFirmware, "\"Flash ▾\""),
     (Capability::About, "show_about_dialog"),
 ];
@@ -135,6 +140,9 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::InputHistory, "fn history_back"),
     (Capability::LineEnding, "state.line_ending.suffix()"),
     (Capability::ToggleConnection, "fn toggle_connection"),
+    (Capability::TransferProtocol, "fn transfer_title"),
+    (Capability::Export, "fn run_export"),
+    (Capability::FlashFirmware, "fn start_flash"),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.
@@ -144,20 +152,18 @@ pub const TUI: &[(Capability, &str)] = &[
 /// therefore fails the test until it is either built for the terminal too or
 /// written down here on purpose.
 ///
-/// Everything below is debt, not design; a terminal can do all of it. Seven
-/// entries left this list on 6 September 2026: clearing the view, the filter,
-/// the control lines, the macros, the input history, the line ending and
-/// releasing the port. What is left are the two dialogs and the protocol
-/// choice that goes with one of them.
+/// **The list is empty.** It held ten entries on 6 September 2026 and was
+/// worked off the same day. Anything added here from now on is debt and should
+/// carry a reason worth reading, because the alternative is building it for
+/// both surfaces.
+///
+/// One limit of the mechanism, so nobody mistakes it for more than it is: the
+/// anchors are searched in the source text and cannot see `cfg` attributes.
+/// The ledger therefore describes a full build. `FlashFirmware` needs the
+/// `esp` feature in both surfaces, and a build without it has the capability
+/// in neither.
 #[cfg(all(feature = "monitor", feature = "tui"))]
-pub const KNOWN_GAPS: &[(Capability, &str)] = &[
-    (Capability::Export, "no key writes the buffer out"),
-    (
-        Capability::TransferProtocol,
-        "transfers are ZMODEM only, with no way to choose",
-    ),
-    (Capability::FlashFirmware, "no key starts espflash"),
-];
+pub const KNOWN_GAPS: &[(Capability, &str)] = &[];
 
 #[cfg(all(test, feature = "monitor", feature = "tui"))]
 mod tests {
@@ -229,6 +235,21 @@ mod tests {
         assert!(
             closed.is_empty(),
             "the terminal has {closed:?} now, so remove those from KNOWN_GAPS."
+        );
+    }
+
+    #[test]
+    fn the_terminal_does_everything_the_window_does() {
+        // The plain statement, so a reader of this file does not have to
+        // derive it from an empty ledger.
+        assert_eq!(
+            named(GUI),
+            named(TUI),
+            "the two surfaces have drifted apart again"
+        );
+        assert!(
+            KNOWN_GAPS.is_empty(),
+            "the ledger has entries but the surfaces agree, so remove them"
         );
     }
 
