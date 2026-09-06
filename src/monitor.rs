@@ -348,11 +348,13 @@ pub fn run_monitor_gui() -> Result<(), String> {
         _socket_server: socket_server,
         icon_texture: None,
         config_dialog,
+        connect_view_height: 0.0,
+        grown_for_monitor: false,
     };
 
     let options = window_options(
         format!("devserial v{}", env!("CARGO_PKG_VERSION")),
-        [920.0, 620.0],
+        CONNECT_WINDOW_SIZE,
         [520.0, 380.0],
     );
 
@@ -413,6 +415,8 @@ fn run_monitor_inner(
         _socket_server: socket_server,
         icon_texture: None,
         config_dialog: PortConfigDialogState::new(),
+        connect_view_height: 0.0,
+        grown_for_monitor: false,
     };
 
     let options = window_options(
@@ -562,42 +566,52 @@ impl<'a> MacosDialogButtons<'a> {
 
         let mut action = DialogAction::None;
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut primary_btn =
-                egui::Button::new(egui::RichText::new(self.primary_label).strong().color(
-                    if self.primary_enabled {
-                        egui::Color32::from_rgb(255, 255, 255)
-                    } else {
-                        egui::Color32::from_rgb(140, 140, 140)
-                    },
-                ))
-                .min_size(egui::vec2(84.0, 24.0));
+        // `with_layout` hands the child the whole remaining rectangle, and for a
+        // horizontal layout `Align::Center` is the vertical axis. The buttons
+        // then float in the middle of whatever space is left, and the enclosing
+        // group grows with them. Allocating one row's height pins them under
+        // the separator where they belong.
+        let row_height = ui.spacing().interact_size.y.max(24.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                let mut primary_btn =
+                    egui::Button::new(egui::RichText::new(self.primary_label).strong().color(
+                        if self.primary_enabled {
+                            egui::Color32::from_rgb(255, 255, 255)
+                        } else {
+                            egui::Color32::from_rgb(140, 140, 140)
+                        },
+                    ))
+                    .min_size(egui::vec2(84.0, 24.0));
 
-            if self.primary_enabled {
-                primary_btn = primary_btn.fill(egui::Color32::from_rgb(0, 122, 255));
-            }
-
-            let mut primary_resp = ui.add_enabled(self.primary_enabled, primary_btn);
-            if let Some(tt) = self.primary_tooltip {
-                primary_resp = primary_resp.on_hover_text(tt);
-            }
-            if primary_resp.clicked()
-                || (self.primary_enabled && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-            {
-                action = DialogAction::Primary;
-            }
-
-            ui.add_space(8.0);
-
-            if !self.cancel_label.is_empty() {
-                let cancel_btn =
-                    egui::Button::new(self.cancel_label).min_size(egui::vec2(72.0, 24.0));
-                let cancel_resp = ui.add(cancel_btn);
-                if cancel_resp.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    action = DialogAction::Cancel;
+                if self.primary_enabled {
+                    primary_btn = primary_btn.fill(egui::Color32::from_rgb(0, 122, 255));
                 }
-            }
-        });
+
+                let mut primary_resp = ui.add_enabled(self.primary_enabled, primary_btn);
+                if let Some(tt) = self.primary_tooltip {
+                    primary_resp = primary_resp.on_hover_text(tt);
+                }
+                if primary_resp.clicked()
+                    || (self.primary_enabled && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    action = DialogAction::Primary;
+                }
+
+                ui.add_space(8.0);
+
+                if !self.cancel_label.is_empty() {
+                    let cancel_btn =
+                        egui::Button::new(self.cancel_label).min_size(egui::vec2(72.0, 24.0));
+                    let cancel_resp = ui.add(cancel_btn);
+                    if cancel_resp.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        action = DialogAction::Cancel;
+                    }
+                }
+            },
+        );
 
         action
     }
@@ -619,37 +633,62 @@ fn is_active(active_ports: &[String], port: &str) -> bool {
 ///
 /// Used by the connection dialog and by the per-window settings dialog, which
 /// previously carried two copies of this list.
+/// Content width of the connection form, shared by both places that draw it.
+const FORM_WIDTH: f32 = 344.0;
+
+/// Window size while only the connection form is shown.
+const CONNECT_WINDOW_SIZE: [f32; 2] = [560.0, 620.0];
+
+/// Window size once a port is open and the monitor takes over.
+const MONITOR_WINDOW_SIZE: [f32; 2] = [920.0, 620.0];
+
 fn baud_controls(ui: &mut egui::Ui, id: &str, baud: &mut u32, custom: &mut String) {
-    ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt(format!("baud_combo_{id}"))
-            .selected_text(format!("{baud} baud"))
-            .width(130.0)
-            .show_ui(ui, |ui| {
+    // Both the connect dialog and the settings panel draw this row, so the
+    // widgets inside it need ids that cannot collide.
+    ui.push_id(id, |ui| {
+        ui.horizontal(|ui| {
+            // The field is the value. The menu beside it only writes into the
+            // field, so there is one place to read the baud rate instead of a
+            // dropdown and a text box showing the same number side by side.
+            let response = ui.add(
+                egui::TextEdit::singleline(custom)
+                    .desired_width(96.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            response.context_menu(|ui| {
+                text_edit_context_menu(ui, custom);
+            });
+            if response.changed()
+                && let Ok(value) = custom.trim().parse::<u32>()
+                && value > 0
+            {
+                *baud = value;
+            }
+
+            ui.menu_button("Presets ⏷", |ui| {
                 for preset in BAUD_PRESETS {
                     if ui
-                        .selectable_value(baud, preset, format!("{preset}"))
+                        .selectable_label(*baud == preset, preset.to_string())
                         .clicked()
                     {
+                        *baud = preset;
                         *custom = preset.to_string();
+                        ui.close();
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("Insert a common baud rate");
 
-        ui.label("Custom:");
-        let response = ui.add(
-            egui::TextEdit::singleline(custom)
-                .desired_width(90.0)
-                .font(egui::TextStyle::Monospace),
-        );
-        response.context_menu(|ui| {
-            text_edit_context_menu(ui, custom);
+            // A value the field cannot be parsed from is the one thing a reader
+            // has to be told about, because the dialog silently falls back.
+            if !custom.trim().parse::<u32>().is_ok_and(|value| value > 0) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 60),
+                    format!("using {baud}"),
+                );
+            }
         });
-        if response.changed()
-            && let Ok(value) = custom.trim().parse::<u32>()
-            && value > 0
-        {
-            *baud = value;
-        }
     });
 }
 
@@ -775,7 +814,31 @@ impl PortConfigDialogState {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn render_form(&mut self, ui: &mut egui::Ui, active_ports: &[String]) -> Option<bool> {
+    pub fn render_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        active_ports: &[String],
+        cancellable: bool,
+    ) -> Option<bool> {
+        // A form is read left to right. One caller wraps this in
+        // `vertical_centered`, and that Align::Center reaches in here: a lone
+        // label would be centred while `ui.horizontal` and the grid claim the
+        // full width and start at the left, so every heading floated above its
+        // own controls. Stating the layout here makes the form look the same
+        // whatever the caller does with it.
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            self.form_body(ui, active_ports, cancellable)
+        })
+        .inner
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn form_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        active_ports: &[String],
+        cancellable: bool,
+    ) -> Option<bool> {
         ui.add_space(4.0);
 
         // Port selection
@@ -829,9 +892,10 @@ impl PortConfigDialogState {
             {
                 self.rescan();
             }
-
-            ui.checkbox(&mut self.use_custom_port, "Custom path");
         });
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.use_custom_port, "Enter the device path by hand")
+            .on_hover_text("Type a path instead of picking a detected port");
 
         let eff_port = self.effective_port();
         let is_already_open = is_active(active_ports, &eff_port);
@@ -871,7 +935,7 @@ impl PortConfigDialogState {
 
         let has_port = !eff_port.is_empty() && !is_already_open;
         match MacosDialogButtons::new("🔌 Connect / Open Port")
-            .with_cancel("Cancel")
+            .with_cancel(if cancellable { "Cancel" } else { "" })
             .with_enabled(has_port)
             .with_tooltip("Open connection to serial port and start live monitoring")
             .show(ui)
@@ -1255,6 +1319,20 @@ struct MultiMonitorApp {
     _socket_server: Option<crate::gui_ipc::GuiSocketServer>,
     icon_texture: Option<egui::TextureHandle>,
     config_dialog: PortConfigDialogState,
+    /// Height the connect view took last frame, used to centre it vertically.
+    ///
+    /// egui lays out in one pass, so the height of a block is only known after
+    /// it has been drawn. The block is a fixed form, so last frame's height is
+    /// this frame's height and the value settles immediately.
+    connect_view_height: f32,
+    /// Whether the window has already been grown for the monitoring view.
+    ///
+    /// The connection form is a narrow card. Opening the window at monitoring
+    /// size would surround it with a field of empty grey, and opening the
+    /// monitor at dialog size would be unusable. The window therefore grows
+    /// once, at the moment the first port opens, and never resizes again so a
+    /// size the user chose is left alone.
+    grown_for_monitor: bool,
 }
 
 impl MultiMonitorApp {
@@ -1457,6 +1535,12 @@ impl eframe::App for MultiMonitorApp {
 
         let primary_idx = self.monitors.iter().position(|m| m.is_open);
 
+        if primary_idx.is_some() && !self.grown_for_monitor {
+            self.grown_for_monitor = true;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(MONITOR_WINDOW_SIZE.into()));
+        }
+
         // When no serial ports are open yet, display the Connection View directly in the main window!
         let Some(p_idx) = primary_idx else {
             ui.ctx()
@@ -1475,29 +1559,63 @@ impl eframe::App for MultiMonitorApp {
                 .collect();
 
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(24.0);
-                    if let Some(ref tex) = self.icon_texture {
-                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(64.0, 64.0)));
-                        ui.add_space(6.0);
-                    }
-                    ui.heading(egui::RichText::new("devserial").strong().size(22.0));
-                    ui.label(
-                        egui::RichText::new("Interactive serial hardware monitor & MCP bridge")
-                            .color(egui::Color32::from_rgb(170, 170, 180)),
-                    );
-                    ui.add_space(16.0);
+                // The window may be resized below the height of the form. Without
+                // a scroll area the primary button would then sit outside the
+                // window with no way to reach it.
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Centre the block in whatever height the window has, with a
+                    // floor so a short window keeps a margin instead of a negative
+                    // one. Without this the form sits against the top edge and the
+                    // whole window reads bottom-heavy.
+                    let leading =
+                        ((ui.available_height() - self.connect_view_height) * 0.5).max(16.0);
+                    // The space goes outside the measured block. Inside it, the
+                    // measurement would feed itself and the centre would settle at
+                    // a third of the free height instead of half of it.
+                    ui.add_space(leading);
+                    let block = ui.vertical_centered(|ui| {
+                        if let Some(ref tex) = self.icon_texture {
+                            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(64.0, 64.0)));
+                            ui.add_space(6.0);
+                        }
+                        ui.heading(egui::RichText::new("devserial").strong().size(22.0));
+                        ui.label(
+                            egui::RichText::new("Interactive serial hardware monitor & MCP bridge")
+                                .color(egui::Color32::from_rgb(170, 170, 180)),
+                        );
+                        ui.add_space(2.0);
+                        // Version, licence and copyright on one quiet line. Every
+                        // part but the year comes from the manifest, so none of it
+                        // can drift away from what was built.
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "v{}  \u{b7}  {}  \u{b7}  {}",
+                                env!("CARGO_PKG_VERSION"),
+                                env!("CARGO_PKG_LICENSE"),
+                                crate::COPYRIGHT,
+                            ))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(120, 120, 130)),
+                        );
+                        ui.add_space(16.0);
 
-                    egui::Frame::group(ui.style())
-                        .inner_margin(16.0)
-                        .show(ui, |ui| {
-                            ui.set_max_width(520.0);
-                            if let Some(action) = self.config_dialog.render_form(ui, &active_ports)
-                                && action
-                            {
-                                connect_req = true;
-                            }
-                        });
+                        egui::Frame::group(ui.style())
+                            .inner_margin(16.0)
+                            .show(ui, |ui| {
+                                // The widest row is the port selector, 260 for the
+                                // combo plus the rescan button. A panel wider than
+                                // that puts dead space to the right of every row
+                                // while the separators keep spanning it.
+                                ui.set_max_width(FORM_WIDTH);
+                                if let Some(action) =
+                                    self.config_dialog.render_form(ui, &active_ports, false)
+                                    && action
+                                {
+                                    connect_req = true;
+                                }
+                            });
+                    });
+                    self.connect_view_height = block.response.rect.height();
                 });
             });
 
@@ -1584,9 +1702,9 @@ impl eframe::App for MultiMonitorApp {
                 .resizable(false)
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .default_width(460.0)
+                .default_width(FORM_WIDTH)
                 .show(ui.ctx(), |ui| {
-                    if let Some(action) = self.config_dialog.render_form(ui, &active_ports) {
+                    if let Some(action) = self.config_dialog.render_form(ui, &active_ports, true) {
                         if action {
                             connect_req = true;
                         } else {
