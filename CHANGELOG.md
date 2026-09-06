@@ -4,6 +4,18 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.1.14](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.13...devserial-v0.1.14) (2026-09-06)
+
+
+### Features
+
+* **gui:** scale the interface, from the View menu, the status bar or the keyboard ([#54](https://github.com/metaneutrons/devserial/issues/54)) ([40bb832](https://github.com/metaneutrons/devserial/commit/40bb8326fa98d0c6c79694d1578acda921a46685))
+
+
+### Bug Fixes
+
+* **gui:** the opening screen and the connect dialog are one view again ([#54](https://github.com/metaneutrons/devserial/issues/54)) ([40bb832](https://github.com/metaneutrons/devserial/commit/40bb8326fa98d0c6c79694d1578acda921a46685)). Added by hand: the same commit carries this, and its subject names it, but a `feat` subject files the whole of it under Features
+
 ## [0.1.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.12...devserial-v0.1.13) (2026-09-06)
 
 
