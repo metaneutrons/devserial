@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.12](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.11...devserial-v0.1.12) (2026-09-06)
+
+
+### Features
+
+* **esp:** die Werkzeugausgabe zeilenweise waehrend des Laufs ([#45](https://github.com/metaneutrons/devserial/issues/45)) ([3acfd69](https://github.com/metaneutrons/devserial/commit/3acfd69c02e48655f47324310ee8dcd3990dfe68))
+* **macos:** ein notarisiertes App-Bundle neben dem CLI ([#42](https://github.com/metaneutrons/devserial/issues/42)) ([8f9cc2a](https://github.com/metaneutrons/devserial/commit/8f9cc2a1ed1e8b8dd81083d174b1135b6503286b))
+* **tui:** Anzeige leeren, Filter, Steuerleitungen und Makros ([#48](https://github.com/metaneutrons/devserial/issues/48)) ([c4915d9](https://github.com/metaneutrons/devserial/commit/c4915d9e14849dad3327d283bae2a376e47e4ff2))
+* **tui:** Eingabehistorie, Zeilenende und Port freigeben ([#49](https://github.com/metaneutrons/devserial/issues/49)) ([102deee](https://github.com/metaneutrons/devserial/commit/102deee57b0d5829c2f19737b78311d61b5e00e7))
+
+
+### Bug Fixes
+
+* die Oberflaechen merken und zeigen, wenn das Geraet verschwindet ([#47](https://github.com/metaneutrons/devserial/issues/47)) ([a3966ac](https://github.com/metaneutrons/devserial/commit/a3966ace55bbe3668200905a52e2639ec961de25))
+* **gui:** der Verbindungsbildschirm bekommt sein Layout in Ordnung ([#44](https://github.com/metaneutrons/devserial/issues/44)) ([7706c00](https://github.com/metaneutrons/devserial/commit/7706c00aeae7aae4fd58a786c59e09e35581dcad))
+
 ## [0.1.11](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.10...devserial-v0.1.11) (2026-09-05)
 
 
