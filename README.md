@@ -58,26 +58,61 @@ The port stays open and keeps recording after the command returns. Reboot the de
 
 ## Installation
 
-### Homebrew (macOS)
+### macOS
+
+The command line tool:
 
 ```bash
 brew install metaneutrons/tap/devserial
 ```
 
+The graphical monitor as an application, signed and notarized by Apple:
+
+```bash
+brew install --cask metaneutrons/tap/devserial-app
+```
+
+Two packages because they are two things. The formula puts `devserial` on your
+`PATH`; the cask puts `devserial.app` in `/Applications`, where double-clicking
+it opens the port manager instead of an MCP server. They can be installed side
+by side, and the bundle carries the same program as the archives, fused into one
+universal binary.
+
+The bundle is notarized and the ticket is stapled, so Gatekeeper accepts it
+without a network. The plain archives below are **not** notarized; on macOS
+either use Homebrew or clear the quarantine flag by hand.
+
 ### Debian and Ubuntu
 
 ```bash
-sudo curl -fsSL https://deb.metaneutrons.cc/metaneutrons-archive-keyring.pgp \
-  -o /usr/share/keyrings/metaneutrons-archive-keyring.pgp
-sudo tee /etc/apt/sources.list.d/metaneutrons.sources >/dev/null <<'SOURCES'
+curl -fsSL -o /tmp/metaneutrons-archive-keyring.pgp \
+  https://deb.metaneutrons.cc/metaneutrons-archive-keyring.pgp
+gpg --show-keys --with-fingerprint /tmp/metaneutrons-archive-keyring.pgp
+sudo install -m 0644 /tmp/metaneutrons-archive-keyring.pgp \
+  /usr/share/keyrings/metaneutrons-archive-keyring.pgp
+
+sudo tee /etc/apt/sources.list.d/deb.metaneutrons.cc.sources >/dev/null <<'SOURCES'
 Types: deb
-URIs: https://deb.metaneutrons.cc/devserial
+URIs: https://deb.metaneutrons.cc
 Suites: rolling
 Components: main
 Signed-By: /usr/share/keyrings/metaneutrons-archive-keyring.pgp
 SOURCES
 sudo apt update && sudo apt install devserial
 ```
+
+The keyring goes to a temporary file first so you can look at it before it
+becomes trusted. `gpg` has to print exactly these two fingerprints, the offline
+primary key and the signing subkey; anything else is not this archive.
+
+```
+1B7B 7941 7383 648B BFBE  282E 01AB 8296 EF0F CD76
+A0C2 1782 FC50 7CCB D666  F3ED 2420 72FE C8BE 54A4
+```
+
+The archive serves one shared root for every project of the domain, so the URI
+carries no `/devserial`, and the source declares no `Architectures`: the signed
+`Release` announces them and `apt` takes it from there.
 
 The repository is not devserial's own. devserial builds the `.deb`, attests it
 and attaches it to its GitHub release; the archive at `deb.metaneutrons.cc`
@@ -143,7 +178,9 @@ Each payload additionally carries an SPDX software bill of materials as
 | Windows | `aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc` |
 | Debian package | `devserial_<version>_amd64.deb`, `devserial_<version>_arm64.deb` |
 
-The binaries are not code-signed or notarized. On macOS, install through Homebrew or clear the quarantine flag after downloading:
+These archives are not code-signed or notarized; the notarized application is
+the cask above. On macOS, install through Homebrew or clear the quarantine flag
+after downloading:
 
 ```bash
 xattr -d com.apple.quarantine devserial

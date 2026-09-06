@@ -119,7 +119,10 @@ jobs:
             {"os":"ubuntu-latest","arch":"amd64"},
             {"os":"ubuntu-24.04-arm","arch":"arm64"}
           ]'
-          payloads=$(( $(printf '%s' "$targets" | jq 'length') + $(printf '%s' "$deb_arches" | jq 'length') ))
+          # Eight archives, two Debian packages and the one notarized macOS
+          # bundle fused from the two darwin archives.
+          payloads=$(( $(printf '%s' "$targets" | jq 'length') \
+                     + $(printf '%s' "$deb_arches" | jq 'length') + 1 ))
 
           {
             echo "tag=$TAG"
@@ -362,10 +365,174 @@ jobs:
           path: deb/*.deb
           if-no-files-found: error
 
+  macos-app:
+    name: Notarized macOS application bundle
+    needs: [metadata, build]
+    runs-on: macos-latest
+    # The Apple credentials are publication secrets, so they live in the
+    # protected environment like every other one. The job deliberately carries
+    # no prerelease condition: a channel step that only a production tag can
+    # reach is a step whose first execution is always a real release.
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: archive-*-apple-darwin
+          merge-multiple: true
+          path: archives
+
+      - name: Assemble the bundle from both published archives
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p bin dist
+          # The bundle ships exactly what the archives ship. Unpacking the
+          # published tarballs rather than rebuilding is what makes that true.
+          for arch in aarch64 x86_64; do
+            tar xzf "archives/devserial-${VERSION}-${arch}-apple-darwin.tar.gz" \
+              -C bin devserial
+            mv bin/devserial "bin/devserial-${arch}"
+          done
+          ./scripts/release/make-macos-app.sh --version "$VERSION" \
+            --arm64 bin/devserial-aarch64 --x86_64 bin/devserial-x86_64 \
+            --output-dir dist
+
+      - name: Import the Developer ID certificate into a throwaway keychain
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -base64 24)
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          # Never the login keychain: the runner is shared with nothing, but a
+          # named throwaway is what makes the cleanup below provable.
+          p12="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$CERT_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -P "$p12" 2>/dev/null || rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" >/dev/null
+          # Prepend, never replace: dropping the runner's own keychains from
+          # the search list breaks tools that come later in the job.
+          existing=()
+          while IFS= read -r entry; do
+            existing+=("${entry//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identity="Developer ID Application: Fabian Schmieder (${TEAM_ID})"
+          # The identity has to exist before signing claims it does.
+          security find-identity -v -p codesigning "$keychain" \
+            | grep -qF "$identity" || {
+              echo "::error::the throwaway keychain holds no $identity"
+              exit 1
+            }
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Sign with the hardened runtime
+        run: |
+          set -euo pipefail
+          # No --deep: it signs from the outside in and produces exactly the
+          # rejections notarization then reports. This bundle has no nested
+          # code, so the single outer signature is the whole job.
+          codesign --force --options runtime --timestamp \
+            --sign "$SIGNING_IDENTITY" --keychain "$SIGNING_KEYCHAIN" \
+            dist/devserial.app
+          codesign --verify --strict --verbose=2 dist/devserial.app
+          codesign --display --verbose=2 dist/devserial.app 2>&1 \
+            | grep -E 'Identifier=|Authority=|TeamIdentifier=|flags='
+
+      - name: Notarize and staple
+        env:
+          API_KEY_ID: ${{ vars.APPLE_API_KEY }}
+          API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/api.p8"
+          (umask 077; printf '%s' "$API_KEY_CONTENT" > "$key")
+          submission="$RUNNER_TEMP/submit.zip"
+          ditto -c -k --keepParent dist/devserial.app "$submission"
+
+          # On a rejected submission notarytool exits non-zero but prints only
+          # the status, never the reason. The log has to come out here, or the
+          # next run starts by rerunning the same submission by hand.
+          set +e
+          out=$(xcrun notarytool submit "$submission" --key "$key" \
+                  --key-id "$API_KEY_ID" --issuer "$API_ISSUER" --wait 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          id=$(printf '%s' "$out" | awk '/^  id: /{print $2; exit}')
+          if [[ "$rc" -ne 0 ]] || ! printf '%s' "$out" | grep -q 'status: Accepted'; then
+            [[ -n "$id" ]] && xcrun notarytool log "$id" --key "$key" \
+              --key-id "$API_KEY_ID" --issuer "$API_ISSUER" || true
+            rm -P "$key" 2>/dev/null || rm -f "$key"
+            echo "::error::Apple did not accept the bundle"
+            exit 1
+          fi
+          rm -P "$key" 2>/dev/null || rm -f "$key"
+
+          # Stapling is what makes the ticket work without a network.
+          xcrun stapler staple dist/devserial.app
+          xcrun stapler validate dist/devserial.app
+          ditto -c -k --keepParent dist/devserial.app \
+            "dist/devserial-${VERSION}-macos-universal.app.zip"
+          rm -rf dist/devserial.app
+
+      # Unpack what will actually be published, mark it as a browser download
+      # and let Gatekeeper judge that copy. Anything less proves the build, not
+      # the thing a person receives.
+      - name: Clean-room test of the notarized bundle
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          room=$(mktemp -d)
+          ditto -x -k "dist/devserial-${VERSION}-macos-universal.app.zip" "$room"
+          app="$room/devserial.app"
+          xattr -w com.apple.quarantine "0083;00000000;Safari;" "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute -vv "$app"
+          spctl --assess --type execute "$app" \
+            || { echo "::error::Gatekeeper rejects the published bundle"; exit 1; }
+          for arch in arm64 x86_64; do
+            lipo -archs "$app/Contents/MacOS/devserial" | tr ' ' '\n' \
+              | grep -qx "$arch" || {
+                echo "::error::the published bundle is missing $arch"; exit 1; }
+          done
+          "$app/Contents/MacOS/devserial" --version
+          echo "the bundle is notarized, stapled, universal and runnable"
+
+      - name: Destroy the signing keychain
+        if: always()
+        run: |
+          set -euo pipefail
+          [[ -n "${SIGNING_KEYCHAIN:-}" ]] || exit 0
+          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          test ! -f "$SIGNING_KEYCHAIN"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-app
+          path: dist/*.zip
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- stage 3
   sign:
     name: Sign, attest and describe every payload
-    needs: [metadata, build, deb]
+    needs: [metadata, build, deb, macos-app]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -383,6 +550,10 @@ jobs:
         with:
           pattern: deb-*
           merge-multiple: true
+          path: payloads
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-app
           path: payloads
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       # The action is used only to put syft on the runner. The documents
@@ -560,7 +731,8 @@ jobs:
           set -euo pipefail
           cd packaging
           identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
-          for definition in devserial.rb devserial.PKGBUILD devserial-bin.PKGBUILD; do
+          for definition in devserial.rb devserial-app.rb devserial.PKGBUILD \
+                            devserial-bin.PKGBUILD; do
             test -s "$definition"
             # A bundle but no SBOM: a package definition describes the payloads
             # rather than carrying dependencies of its own.
@@ -575,6 +747,7 @@ jobs:
         with:
           subject-path: |
             packaging/devserial.rb
+            packaging/devserial-app.rb
             packaging/devserial.PKGBUILD
             packaging/devserial-bin.PKGBUILD
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -614,7 +787,8 @@ jobs:
             echo "::error::stage 1 declared $EXPECTED_PAYLOADS payloads, $payloads are here"
             exit 1
           fi
-          definitions=3
+          # Formula, cask and the two PKGBUILDs.
+          definitions=4
           expected=$(( payloads * 3 + definitions * 2 ))
 
           # No SHA256SUMS yet, so the checksum file can never list itself.
@@ -842,7 +1016,7 @@ jobs:
           echo "source package builds, installs and runs"
 
   verify-homebrew:
-    name: Install the Homebrew formula (${{ matrix.os }})
+    name: Install the Homebrew formula and cask (${{ matrix.os }})
     needs: [metadata, candidate]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -871,6 +1045,7 @@ jobs:
           server=$!
           cleanup() {
             brew uninstall devserial >/dev/null 2>&1 || true
+            brew uninstall --cask "$tap/devserial-app" >/dev/null 2>&1 || true
             brew untap "$tap" >/dev/null 2>&1 || true
             kill "$server" 2>/dev/null || true
           }
@@ -894,6 +1069,35 @@ jobs:
           brew install "$tap/devserial"
           brew test "$tap/devserial"
           echo "formula audits, installs and passes its own test"
+
+          # The cask exists only on macOS, and on macOS it has to survive the
+          # same treatment: served from the candidate, installed for real, and
+          # judged by Gatekeeper where it lands.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cask="$(brew --repository "$tap")/Casks/devserial-app.rb"
+            mkdir -p "$(dirname "$cask")"
+            sed -E "s#https://github.com/[^\"]*/download/[^/\"]+#http://127.0.0.1:${port}#g" \
+              candidate/devserial-app.rb > "$cask"
+            test "$(grep -c "url \"http://127.0.0.1:${port}/" "$cask")" -eq 1
+
+            ruby -c "$cask"
+            brew style --cask "$tap/devserial-app"
+            brew install --cask "$tap/devserial-app"
+            app=/Applications/devserial.app
+            # Notarized and stapled means the ticket validates with no network
+            # and Gatekeeper accepts the copy that was actually installed.
+            xcrun stapler validate "$app"
+            spctl --assess --type execute -vv "$app"
+            for arch in arm64 x86_64; do
+              lipo -archs "$app/Contents/MacOS/devserial" | tr ' ' '\n' \
+                | grep -qx "$arch" || {
+                  echo "::error::the installed bundle is missing $arch"; exit 1; }
+            done
+            "$app/Contents/MacOS/devserial" --version
+            brew uninstall --cask "$tap/devserial-app"
+            test ! -e "$app"
+            echo "cask installs, passes Gatekeeper and uninstalls cleanly"
+          fi
 
   channel-qualify:
     name: Channel qualification
@@ -985,7 +1189,8 @@ jobs:
           shopt -s nullglob
           cd verify
           identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
-          for asset in *.tar.gz *.zip *.deb devserial.rb devserial.PKGBUILD devserial-bin.PKGBUILD; do
+          for asset in *.tar.gz *.zip *.deb devserial.rb devserial-app.rb \
+                       devserial.PKGBUILD devserial-bin.PKGBUILD; do
             cosign verify-blob \
               --bundle "${asset}.sigstore.json" \
               --certificate-identity-regexp "$identity" \
@@ -1023,7 +1228,7 @@ jobs:
 
   # ---------------------------------------------------------------- stage 8
   publish-homebrew:
-    name: Publish the Homebrew formula
+    name: Publish the Homebrew formula and cask
     needs: [metadata, stage]
     if: needs.metadata.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
@@ -1043,19 +1248,24 @@ jobs:
           gh auth setup-git
           gh repo clone "$TAP" tap -- --depth 1
           cd tap
-          mkdir -p Formula
-          if cmp -s ../candidate/devserial.rb Formula/devserial.rb; then
-            echo "the formula in the tap is already current, nothing to publish"
+          mkdir -p Formula Casks
+          if cmp -s ../candidate/devserial.rb Formula/devserial.rb \
+             && cmp -s ../candidate/devserial-app.rb Casks/devserial-app.rb; then
+            echo "formula and cask in the tap are already current, nothing to publish"
             exit 0
           fi
           base=$(gh repo view "$TAP" --json defaultBranchRef --jq .defaultBranchRef.name)
           branch="devserial-${VERSION}"
           git switch -c "$branch"
           install -m 0644 ../candidate/devserial.rb Formula/devserial.rb
+          # Formula and cask in one commit: the cask names the formula in its
+          # caveats, and a tap in which only one of them moved advertises a
+          # version pairing that was never qualified together.
+          install -m 0644 ../candidate/devserial-app.rb Casks/devserial-app.rb
 
           git config user.name 'devserial release automation'
           git config user.email 'devserial-release@users.noreply.github.com'
-          git add Formula/devserial.rb
+          git add Formula/devserial.rb Casks/devserial-app.rb
 
           # The tap regenerates its README from the formulas and rejects a
           # stale one in its own check "README matches formulas", which the
@@ -1121,13 +1331,20 @@ jobs:
           # 1735, "\ No newline at end of file". This read-back could never
           # have succeeded. It first ran at all in run 33976400255, because
           # until then a step before it always failed first.
-          gh api "repos/${TAP}/contents/Formula/devserial.rb" --jq .content \
-            | base64 --decode > published.rb
-          if ! cmp -s published.rb ../candidate/devserial.rb; then
-            echo "::error::the formula in the tap differs from the one that was qualified"
-            exit 1
-          fi
-          echo "tap updated through a pull request and verified byte for byte"
+          # Both definitions are read back, because a merge that carried only
+          # one of them looks exactly like a successful merge from here.
+          for pair in "Formula/devserial.rb:devserial.rb" \
+                      "Casks/devserial-app.rb:devserial-app.rb"; do
+            remote=${pair%%:*}
+            local=${pair##*:}
+            gh api "repos/${TAP}/contents/${remote}" --jq .content \
+              | base64 --decode > published
+            if ! cmp -s published "../candidate/${local}"; then
+              echo "::error::${remote} in the tap differs from what was qualified"
+              exit 1
+            fi
+          done
+          echo "tap updated through a pull request, both definitions verified byte for byte"
 
   publish-aur:
     name: Publish ${{ matrix.package }} to the AUR

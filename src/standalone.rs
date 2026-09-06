@@ -197,14 +197,20 @@ fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<Ses
         .build()
         .map_err(|e| format!("failed to build the async runtime: {e}"))?;
 
-    let serial = crate::port_manager::open_serial_port_raw(port, config)
-        .map_err(|e| format!("failed to open port '{port}': {e}"))?;
-    let shared = crate::port_manager::SharedSerialPort::new(serial);
-    let writer_slot = Arc::new(tokio::sync::Mutex::new(Some(shared.handle())));
-
-    let reader = {
+    // serial2_tokio registers the descriptor with the reactor while opening,
+    // not when it is first read, so the guard has to cover the open as well.
+    // Without that the GUI panicked on the first connect with "there is no
+    // reactor running".
+    let (writer_slot, reader) = {
         let _guard = runtime.enter();
-        crate::reader::spawn_reader(shared, &shared_storage, config)
+        let serial = crate::port_manager::open_serial_port_raw(port, config)
+            .map_err(|e| format!("failed to open port '{port}': {e}"))?;
+        let shared = crate::port_manager::SharedSerialPort::new(serial);
+        let writer_slot = Arc::new(tokio::sync::Mutex::new(Some(shared.handle())));
+        (
+            writer_slot,
+            crate::reader::spawn_reader(shared, &shared_storage, config),
+        )
     };
 
     Ok(SessionParts {
@@ -258,17 +264,19 @@ pub fn open_standalone_session(
                 return Ok(());
             }
 
-            let serial = crate::port_manager::open_serial_port_raw(&port, config)
-                .map_err(|e| format!("failed to open port '{port}': {e}"))?;
-            let shared = crate::port_manager::SharedSerialPort::new(serial);
-            let handle = shared.handle();
+            let (handle, reader) = {
+                let _guard = runtime.enter();
+                let serial = crate::port_manager::open_serial_port_raw(&port, config)
+                    .map_err(|e| format!("failed to open port '{port}': {e}"))?;
+                let shared = crate::port_manager::SharedSerialPort::new(serial);
+                (
+                    shared.handle(),
+                    crate::reader::spawn_reader(shared, &storage, config),
+                )
+            };
             runtime.block_on(async {
                 *slot.lock().await = Some(handle);
             });
-            let reader = {
-                let _guard = runtime.enter();
-                crate::reader::spawn_reader(shared, &storage, config)
-            };
             keepalive.replace_reader(Some(reader));
             Ok(())
         })
@@ -400,15 +408,17 @@ pub fn run_tui_standalone(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let serial = crate::port_manager::open_serial_port_raw(port, config)?;
-    let shared = crate::port_manager::SharedSerialPort::new(serial);
-    let port_handle = shared.handle();
-
-    // The handle is kept in scope for the whole session, which is what keeps
-    // the reader task running.
-    let _reader = {
+    // The reader handle is kept in scope for the whole session, which is what
+    // keeps the reader task running. Opening the port needs the reactor too,
+    // so both happen under the same guard.
+    let (port_handle, _reader) = {
         let _guard = runtime.enter();
-        crate::reader::spawn_reader(shared, &storage, config)
+        let serial = crate::port_manager::open_serial_port_raw(port, config)?;
+        let shared = crate::port_manager::SharedSerialPort::new(serial);
+        (
+            shared.handle(),
+            crate::reader::spawn_reader(shared, &storage, config),
+        )
     };
 
     crate::tui::run_tui(port, config, &storage, &port_handle, runtime.handle())
