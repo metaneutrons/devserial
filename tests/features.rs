@@ -6,8 +6,14 @@
 //! The release used to build with `--all-features`, which also enabled
 //! `testutil`. That feature exists for the integration tests and reaches them
 //! through the dev-dependency on this crate; it is 394 lines of mock serial
-//! port and data generator, and it added 49 KB to a binary that is signed with
-//! a Developer ID and notarized by Apple.
+//! port and data generator.
+//!
+//! Measured, the linker discards it, so this buys no bytes: no string from
+//! `testutil` survives in a binary built with `--all-features`. The reason is
+//! provenance rather than size. Test scaffolding has no business being
+//! compiled into an artefact that is signed with a Developer ID and notarized
+//! by Apple, and relying on the optimiser to drop it is a guarantee nobody
+//! wrote down.
 //!
 //! The release now builds `--features full`. These tests keep that honest: a
 //! new product feature missing from `full` would silently drop out of every

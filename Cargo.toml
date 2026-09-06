@@ -92,10 +92,17 @@ tui = ["ratatui", "crossterm"]
 # Everything a released binary carries.
 #
 # The release used to build with --all-features, which also swept in
-# `testutil`: 394 lines of mock serial port and data generator, 49 KB in the
-# finished binary, unreachable from any subcommand and signed with a
-# Developer ID all the same. A new product feature belongs in this list, and
-# tests/features.rs fails if one is missing.
+# `testutil`: 394 lines of mock serial port and data generator, compiled into
+# an artefact that is signed with a Developer ID and notarized by Apple.
+#
+# Measured afterwards, the linker discards it: no string from it survives in a
+# binary built with --all-features, and the binary is not measurably larger.
+# The reason to exclude it is therefore not size but provenance. Test
+# scaffolding has no business being compiled into something that is signed, and
+# relying on the optimiser to drop it is a guarantee nobody wrote down.
+#
+# A new product feature belongs in this list, and tests/features.rs fails if
+# one is missing.
 full = ["esp", "monitor", "tui"]
 
 # Test scaffolding. Never part of `full`; the integration tests reach it
