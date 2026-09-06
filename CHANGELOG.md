@@ -9,6 +9,7 @@
 * **macos:** ein notarisiertes App-Bundle neben dem CLI ([#42](https://github.com/metaneutrons/devserial/issues/42)) ([8f9cc2a](https://github.com/metaneutrons/devserial/commit/8f9cc2a1ed1e8b8dd81083d174b1135b6503286b))
 * **tui:** Anzeige leeren, Filter, Steuerleitungen und Makros ([#48](https://github.com/metaneutrons/devserial/issues/48)) ([c4915d9](https://github.com/metaneutrons/devserial/commit/c4915d9e14849dad3327d283bae2a376e47e4ff2))
 * **tui:** Eingabehistorie, Zeilenende und Port freigeben ([#49](https://github.com/metaneutrons/devserial/issues/49)) ([102deee](https://github.com/metaneutrons/devserial/commit/102deee57b0d5829c2f19737b78311d61b5e00e7))
+* **gui:** Firmware aus dem Monitorfenster flashen ([a3966ac](https://github.com/metaneutrons/devserial/commit/a3966ace55bbe3668200905a52e2639ec961de25)). Von Hand ergaenzt: die Aenderung kam im Commit zu [#47](https://github.com/metaneutrons/devserial/issues/47) mit, dessen Betreff sie nicht nennt, und waere sonst unsichtbar geblieben
 
 
 ### Bug Fixes
