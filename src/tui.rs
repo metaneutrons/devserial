@@ -127,6 +127,11 @@ enum InputMode {
     Signals,
     /// Picking a macro from the configured list.
     Macros,
+    /// Naming a file to write the buffer to.
+    Export,
+    /// Naming a firmware image and watching espflash run.
+    #[cfg(feature = "esp")]
+    Flash,
 }
 
 // DTR and RTS join the view toggles here. They are separate switches with
@@ -149,6 +154,18 @@ struct AppState {
     show_timestamps: bool,
     /// Pattern the view is narrowed to; empty means everything is shown.
     filter: String,
+    /// Which modem protocol a transfer uses.
+    transfer_proto: FileTransferProtocol,
+    /// Lines espflash has written so far, oldest first.
+    #[cfg(feature = "esp")]
+    flash_log: Vec<String>,
+    /// The channels of a run that is still going.
+    #[cfg(feature = "esp")]
+    flash_running: Option<RunningFlash>,
+    /// The format an export is written in.
+    export_format: crate::export::ExportFormat,
+    /// Whether an export covers the whole capture or only what is on screen.
+    export_all: bool,
     /// What is appended to a typed line before sending.
     line_ending: crate::serial_params::LineEnding,
     /// Lines sent earlier, oldest first.
@@ -196,6 +213,13 @@ impl AppState {
             .unwrap_or(4);
         Self {
             filter: String::new(),
+            transfer_proto: FileTransferProtocol::Zmodem,
+            #[cfg(feature = "esp")]
+            flash_log: Vec::new(),
+            #[cfg(feature = "esp")]
+            flash_running: None,
+            export_format: crate::export::ExportFormat::default(),
+            export_all: true,
             line_ending: crate::serial_params::LineEnding::default(),
             history: Vec::new(),
             history_idx: None,
@@ -234,6 +258,25 @@ impl AppState {
             .iter()
             .filter(|(_, payload)| payload.contains(&self.filter))
             .collect()
+    }
+
+    /// A destination filename nobody has to invent.
+    ///
+    /// Same shape as the window's suggestion, so an export made in one is
+    /// recognisable next to one made in the other.
+    fn suggested_export_path(&self) -> String {
+        let port = crate::paths::sanitize_port_name(&self.port_name);
+        let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        // The extension is appended, not applied through
+        // `with_format_extension`. That function replaces everything after the
+        // last dot, and a sanitised port name carries one: `/dev/cu.usbmodem1`
+        // becomes `_dev_cu.usbmodem1`, so the timestamp would be taken for an
+        // extension and thrown away. On a name that already ends in one, which
+        // this does, the function then behaves.
+        format!(
+            "devserial_export_{port}_{now}.{}",
+            self.export_format.extension()
+        )
     }
 
     /// Put the line that was just sent into the history.
@@ -383,6 +426,10 @@ fn run_app(
             state.scroll_offset = state.shown().len().saturating_sub(visible);
         }
 
+        // A running flash reports between key presses, not because of them.
+        #[cfg(feature = "esp")]
+        poll_flash(&mut state);
+
         terminal.draw(|frame| render(frame, &state))?;
 
         if !event::poll(Duration::from_millis(50))? {
@@ -450,6 +497,12 @@ fn run_app(
                     state.set_status("Display cleared");
                     continue;
                 }
+                KeyCode::Char('e') if state.input_mode == InputMode::Normal => {
+                    state.input_mode = InputMode::Export;
+                    state.input = state.suggested_export_path();
+                    state.set_status("Up/Down picks the format, Tab the scope");
+                    continue;
+                }
                 KeyCode::Char('f') if state.input_mode == InputMode::Normal => {
                     state.input_mode = InputMode::Filter;
                     state.input = state.filter.clone();
@@ -480,6 +533,17 @@ fn run_app(
             }
             KeyCode::F(3) => {
                 state.input_mode = toggle(&state.input_mode, InputMode::Signals);
+                continue;
+            }
+            #[cfg(feature = "esp")]
+            KeyCode::F(6) => {
+                if runtime.block_on(crate::esp::is_available()) {
+                    state.input_mode = toggle(&state.input_mode, InputMode::Flash);
+                } else {
+                    state.set_status(
+                        "espflash was not found; install it with cargo install espflash",
+                    );
+                }
                 continue;
             }
             KeyCode::F(5) => {
@@ -524,6 +588,61 @@ fn run_app(
 
         if state.input_mode == InputMode::Macros {
             handle_macros_key(&mut state, key.code);
+            continue;
+        }
+
+        // The file prompt appends and trims text, it has no cursor, so the
+        // arrows are free there to pick the protocol.
+        if matches!(state.input_mode, InputMode::SendFile | InputMode::RecvFile)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            state.transfer_proto = if key.code == KeyCode::Up {
+                state.transfer_proto.previous()
+            } else {
+                state.transfer_proto.next()
+            };
+            continue;
+        }
+
+        #[cfg(feature = "esp")]
+        if state.input_mode == InputMode::Flash {
+            // While espflash runs the panel only reports; Esc closes it and
+            // leaves the run alone, because the reconnect still has to happen.
+            if state.flash_running.is_none() {
+                match key.code {
+                    KeyCode::Enter => start_flash(&mut state, runtime),
+                    KeyCode::Char(c) => state.input.push(c),
+                    KeyCode::Backspace => {
+                        state.input.pop();
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if state.input_mode == InputMode::Export {
+            match key.code {
+                // The arrows pick the format, Tab the scope: the prompt has no
+                // cursor, so both are free here.
+                KeyCode::Up | KeyCode::Down => {
+                    state.export_format = if key.code == KeyCode::Up {
+                        previous_export_format(state.export_format)
+                    } else {
+                        next_export_format(state.export_format)
+                    };
+                    state.input = state.suggested_export_path();
+                }
+                KeyCode::Tab => {
+                    state.export_all = !state.export_all;
+                }
+                KeyCode::Enter => run_export(&mut state, storage),
+                KeyCode::Char(c) => state.input.push(c),
+                KeyCode::Backspace => {
+                    state.input.pop();
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -618,6 +737,116 @@ fn handle_signals_key(state: &mut AppState, key: KeyCode) {
         // Nothing is recorded on failure: the line did not move.
         Err(e) => state.set_status(format!("{} failed: {e}", line.label())),
     }
+}
+
+/// Longest run of espflash output the panel keeps.
+#[cfg(feature = "esp")]
+const MAX_FLASH_LOG_LINES: usize = 500;
+
+/// Start espflash with the port released, and remember how to get it back.
+///
+/// Same shape as the window: releasing is part of the operation rather than
+/// something to remember, and reconnecting happens whatever the outcome.
+#[cfg(feature = "esp")]
+fn start_flash(state: &mut AppState, runtime: &tokio::runtime::Handle) {
+    let path = state.input.trim().to_string();
+    if path.is_empty() {
+        state.set_status("Name a firmware image first");
+        return;
+    }
+    if !std::path::Path::new(&path).is_file() {
+        state.set_status(format!("No file at '{path}'"));
+        return;
+    }
+    if state.toggle.is_none() {
+        state.set_status("This terminal does not own the port, so it cannot release it");
+        return;
+    }
+
+    // Release first: a failure here means espflash would have found the port
+    // busy, so the operation stops before it starts.
+    let config = state.config.clone();
+    if state.connected {
+        state.toggle_connection(&config);
+        if state.connected {
+            return; // toggle_connection has already said why
+        }
+    }
+
+    let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let port = state.port_name.clone();
+    runtime.spawn(async move {
+        let result = crate::esp::flash_with_progress(&port, &path, None, Some(&line_tx)).await;
+        let _ = done_tx.send(result);
+    });
+
+    state.flash_log.clear();
+    state.flash_running = Some(RunningFlash {
+        lines: line_rx,
+        result: done_rx,
+    });
+    state.set_status("Flashing...");
+}
+
+/// Move finished lines into the log and finish the run when it ends.
+#[cfg(feature = "esp")]
+fn poll_flash(state: &mut AppState) {
+    let Some(running) = state.flash_running.as_mut() else {
+        return;
+    };
+
+    let mut fresh = Vec::new();
+    while let Ok(line) = running.lines.try_recv() {
+        fresh.push(line.text);
+    }
+    let outcome = match running.result.try_recv() {
+        Ok(result) => Some(result),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            Some(Err("the operation ended without an answer".to_string()))
+        }
+    };
+    // Drain again after the result: the last lines of a failure are the ones
+    // that would otherwise never appear.
+    if outcome.is_some() {
+        while let Ok(line) = running.lines.try_recv() {
+            fresh.push(line.text);
+        }
+    }
+
+    state.flash_log.extend(fresh);
+    // A long flash writes thousands of lines and the head is not read.
+    if state.flash_log.len() > MAX_FLASH_LOG_LINES {
+        let excess = state.flash_log.len() - MAX_FLASH_LOG_LINES;
+        state.flash_log.drain(..excess);
+    }
+
+    let Some(outcome) = outcome else {
+        return;
+    };
+    state.flash_running = None;
+
+    match &outcome {
+        Ok(_) => state.set_status("Flash finished"),
+        Err(e) => {
+            state.flash_log.push(String::new());
+            state.flash_log.push(e.clone());
+            state.set_status("Flash failed, see the panel");
+        }
+    }
+
+    // Reconnect in both cases: the port is free either way, and a terminal
+    // left disconnected after a failed flash looks broken.
+    let config = state.config.clone();
+    state.toggle_connection(&config);
+}
+
+/// The channels of an espflash run that has not finished.
+#[cfg(feature = "esp")]
+struct RunningFlash {
+    lines: tokio::sync::mpsc::UnboundedReceiver<crate::esp::OutputLine>,
+    result: tokio::sync::oneshot::Receiver<Result<String, String>>,
 }
 
 /// One of the two control lines a person can set by hand.
@@ -730,15 +959,17 @@ fn handle_enter(
                 }
             };
 
-            state.set_status(format!("Sending '{path}' via ZMODEM..."));
+            let proto = state.transfer_proto;
+            let label = proto.label();
+            state.set_status(format!("Sending '{path}' via {label}..."));
             let port = Arc::clone(port);
             let result = runtime.block_on(async move {
                 let mut guard = port.lock().await;
-                crate::modem::send(&mut *guard, FileTransferProtocol::Zmodem, &name, &data).await
+                crate::modem::send(&mut *guard, proto, &name, &data).await
             });
             match result {
-                Ok(bytes) => state.set_status(format!("Sent {bytes} bytes via ZMODEM")),
-                Err(e) => state.set_status(format!("ZMODEM send failed: {e}")),
+                Ok(bytes) => state.set_status(format!("Sent {bytes} bytes via {label}")),
+                Err(e) => state.set_status(format!("{label} send failed: {e}")),
             }
         }
         InputMode::RecvFile => {
@@ -748,12 +979,14 @@ fn handle_enter(
                 std::mem::take(&mut state.input)
             };
             state.input_mode = InputMode::Normal;
-            state.set_status(format!("Receiving into '{dir}' via ZMODEM..."));
+            let proto = state.transfer_proto;
+            let label = proto.label();
+            state.set_status(format!("Receiving into '{dir}' via {label}..."));
 
             let port = Arc::clone(port);
             let result = runtime.block_on(async move {
                 let mut guard = port.lock().await;
-                crate::modem::receive(&mut *guard, FileTransferProtocol::Zmodem).await
+                crate::modem::receive(&mut *guard, proto).await
             });
             match result {
                 Ok((name, data)) => {
@@ -853,6 +1086,220 @@ const fn next_flow_control(current: FlowControl) -> FlowControl {
         FlowControl::Software => FlowControl::Hardware,
         FlowControl::Hardware => FlowControl::None,
     }
+}
+
+/// The input line and the title that says what the current mode expects.
+fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+    // Every title is owned: two of them carry the chosen protocol.
+    let (prompt, title): (&str, String) = match state.input_mode {
+        InputMode::Normal => (
+            "> ",
+            " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit "
+                .to_string(),
+        ),
+        InputMode::SendFile => ("Send File Path: ", transfer_title(state, "transmit")),
+        InputMode::RecvFile => ("Recv Output Dir: ", transfer_title(state, "receive into")),
+        InputMode::About => ("", " About devserial (Esc or F1 to close) ".to_string()),
+        InputMode::Configure => (
+            "",
+            " Port settings: Enter applies, e cycles the line ending, Esc cancels ".to_string(),
+        ),
+        InputMode::Filter => (
+            "Filter: ",
+            " Show only lines containing this text (Enter to apply, Esc to clear) ".to_string(),
+        ),
+        InputMode::Signals => ("", " d toggles DTR, r toggles RTS (Esc to close) ".to_string()),
+        InputMode::Macros => (
+            "",
+            " Press a number to run that macro (Esc to close) ".to_string(),
+        ),
+        InputMode::Export => ("Export to: ", export_title(state)),
+        #[cfg(feature = "esp")]
+        InputMode::Flash => ("Firmware: ", flash_title(state)),
+    };
+
+    frame.render_widget(
+        Paragraph::new(format!("{prompt}{}", state.input))
+            .block(Block::default().borders(Borders::TOP).title(title)),
+        area,
+    );
+}
+
+/// The title of the firmware prompt.
+#[cfg(feature = "esp")]
+fn flash_title(state: &AppState) -> String {
+    if state.flash_running.is_some() {
+        " espflash is running \u{2014} the port comes back when it ends ".to_string()
+    } else {
+        " Path to a firmware image (Enter flashes, Esc cancels) ".to_string()
+    }
+}
+
+/// What espflash has said so far.
+#[cfg(feature = "esp")]
+fn render_flash_popup(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(75, 60, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            if state.flash_running.is_some() {
+                "\u{26a1} Flashing"
+            } else {
+                "\u{26a1} Flash Firmware"
+            },
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The port is released while espflash runs and reconnected afterwards,",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "whether it worked or not.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    // The tail is what is being read; the head of a long flash is not.
+    let visible = area.height.saturating_sub(9) as usize;
+    let skip = state.flash_log.len().saturating_sub(visible.max(1));
+    for line in state.flash_log.iter().skip(skip) {
+        lines.push(Line::from(Span::styled(
+            line.clone(),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+
+/// The title of the export prompt, naming the format and the scope.
+fn export_title(state: &AppState) -> String {
+    let scope = if state.export_all {
+        "everything captured"
+    } else {
+        "what is on screen"
+    };
+    format!(
+        " Write {scope} as {} (Up/Down format, Tab scope, Esc cancels) ",
+        export_format_label(state.export_format)
+    )
+}
+
+/// How a format is written in the prompt.
+const fn export_format_label(format: crate::export::ExportFormat) -> &'static str {
+    use crate::export::ExportFormat;
+    match format {
+        ExportFormat::Txt => "TXT",
+        ExportFormat::Csv => "CSV",
+        ExportFormat::Jsonl => "JSONL",
+    }
+}
+
+/// The next format, for a surface that cycles rather than lists.
+const fn next_export_format(format: crate::export::ExportFormat) -> crate::export::ExportFormat {
+    use crate::export::ExportFormat;
+    match format {
+        ExportFormat::Txt => ExportFormat::Csv,
+        ExportFormat::Csv => ExportFormat::Jsonl,
+        ExportFormat::Jsonl => ExportFormat::Txt,
+    }
+}
+
+/// The previous format.
+const fn previous_export_format(
+    format: crate::export::ExportFormat,
+) -> crate::export::ExportFormat {
+    use crate::export::ExportFormat;
+    match format {
+        ExportFormat::Txt => ExportFormat::Jsonl,
+        ExportFormat::Csv => ExportFormat::Txt,
+        ExportFormat::Jsonl => ExportFormat::Csv,
+    }
+}
+
+/// Write the export the prompt describes.
+///
+/// The scope is either the whole capture or exactly what the view shows, so an
+/// export can be narrowed with the filter first.
+fn run_export(state: &mut AppState, storage: &Arc<std::sync::Mutex<SqliteStorage>>) {
+    let path = state.input.trim().to_string();
+    if path.is_empty() {
+        state.set_status("Name a destination file first");
+        return;
+    }
+
+    let lines = match gather_export_lines(state, storage) {
+        Ok(lines) => lines,
+        Err(e) => {
+            state.set_status(e);
+            return;
+        }
+    };
+
+    let count = lines.len();
+    let path = crate::export::with_format_extension(&path, state.export_format);
+    match crate::export::to_string(&lines, state.export_format)
+        .map_err(|e| e.to_string())
+        .and_then(|data| std::fs::write(&path, data).map_err(|e| e.to_string()))
+    {
+        Ok(()) => {
+            state.input.clear();
+            state.input_mode = InputMode::Normal;
+            state.set_status(format!("Wrote {count} lines to {path}"));
+        }
+        Err(e) => state.set_status(format!("Export failed: {e}")),
+    }
+}
+
+/// The lines an export covers.
+fn gather_export_lines(
+    state: &AppState,
+    storage: &Arc<std::sync::Mutex<SqliteStorage>>,
+) -> Result<Vec<crate::storage::StoredLine>, String> {
+    if !state.export_all {
+        // The view keeps formatted timestamps rather than the original
+        // nanoseconds, so a screen export carries no usable time.
+        return Ok(state
+            .shown()
+            .iter()
+            .enumerate()
+            .map(|(index, (_, payload))| crate::storage::StoredLine {
+                id: i64::try_from(index + 1).unwrap_or(i64::MAX),
+                timestamp_ns: 0,
+                payload: payload.clone(),
+            })
+            .collect());
+    }
+
+    let guard = storage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = guard
+        .line_count()
+        .map_err(|e| format!("Database error: {e}"))?;
+    let count = u32::try_from(total.min(u64::from(crate::export::MAX_EXPORT_LINES))).unwrap_or(1);
+    guard
+        .read_lines(1, count.max(1))
+        .map_err(|e| format!("Database read error: {e}"))
+}
+
+/// The title of the file prompt, naming the protocol and how to change it.
+///
+/// The only place the choice is advertised. Without it the arrows would be a
+/// key nobody presses.
+fn transfer_title(state: &AppState, verb: &'static str) -> String {
+    format!(
+        " Path to {verb} \u{2014} {} (Up/Down changes it, Esc cancels) ",
+        state.transfer_proto.label()
+    )
 }
 
 /// How the link reads in the status bar.
@@ -969,43 +1416,15 @@ fn render(frame: &mut Frame, state: &AppState) {
         &mut scrollbar_state,
     );
 
-    let (prompt, title) = match state.input_mode {
-        InputMode::Normal => (
-            "> ",
-            " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | Ctrl+F filter | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit ",
-        ),
-        InputMode::SendFile => (
-            "Send File Path: ",
-            " Enter a file path to transmit (Esc to cancel) ",
-        ),
-        InputMode::RecvFile => (
-            "Recv Output Dir: ",
-            " Enter a directory to save the received file in (Esc to cancel) ",
-        ),
-        InputMode::About => ("", " About devserial (Esc or F1 to close) "),
-        InputMode::Configure => (
-            "",
-            " Port settings: Enter applies, e cycles the line ending, Esc cancels ",
-        ),
-        InputMode::Filter => (
-            "Filter: ",
-            " Show only lines containing this text (Enter to apply, Esc to clear) ",
-        ),
-        InputMode::Signals => ("", " d toggles DTR, r toggles RTS (Esc to close) "),
-        InputMode::Macros => ("", " Press a number to run that macro (Esc to close) "),
-    };
-
-    frame.render_widget(
-        Paragraph::new(format!("{prompt}{}", state.input))
-            .block(Block::default().borders(Borders::TOP).title(title)),
-        chunks[2],
-    );
+    render_prompt(frame, state, chunks[2]);
 
     match state.input_mode {
         InputMode::About => render_about_popup(frame),
         InputMode::Configure => render_configure_popup(frame, state),
         InputMode::Signals => render_signals_popup(frame, state),
         InputMode::Macros => render_macros_popup(frame, state),
+        #[cfg(feature = "esp")]
+        InputMode::Flash => render_flash_popup(frame, state),
         _ => {}
     }
 }
@@ -1609,6 +2028,105 @@ mod tests {
             "F1 about",
         ] {
             assert!(source.contains(key), "the footer does not name {key}");
+        }
+    }
+
+    #[test]
+    fn the_export_format_cycles_through_all_three() {
+        use crate::export::ExportFormat;
+        let mut format = ExportFormat::default();
+        assert_eq!(format, ExportFormat::Txt);
+        let mut seen = vec![format];
+        for _ in 0..2 {
+            format = next_export_format(format);
+            seen.push(format);
+        }
+        assert_eq!(
+            seen,
+            [ExportFormat::Txt, ExportFormat::Csv, ExportFormat::Jsonl]
+        );
+        assert_eq!(next_export_format(format), ExportFormat::Txt);
+        // And the other way round, so Up and Down agree.
+        assert_eq!(
+            previous_export_format(ExportFormat::Txt),
+            ExportFormat::Jsonl
+        );
+        assert_eq!(previous_export_format(ExportFormat::Csv), ExportFormat::Txt);
+    }
+
+    #[test]
+    fn the_suggested_path_carries_the_port_and_the_format() {
+        let mut state = AppState::new("/dev/cu.usbmodem1", &PortConfig::default());
+        state.export_format = crate::export::ExportFormat::Csv;
+        let path = state.suggested_export_path();
+        // The suggestion is built here, so the case is known; comparing the
+        // extension as a path component keeps clippy from reading this as a
+        // user-supplied name.
+        assert_eq!(
+            std::path::Path::new(&path)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("csv"),
+            "got: {path}"
+        );
+        assert!(path.contains("usbmodem1"), "got: {path}");
+        assert!(
+            !path.contains('/'),
+            "a suggestion must not be a device path: {path}"
+        );
+        // The timestamp survives. A sanitised port name carries a dot, and
+        // applying the extension through `with_format_extension` would take
+        // everything after it for an extension and throw the timestamp away.
+        assert!(
+            path.matches('_').count() >= 4,
+            "the timestamp was eaten: {path}"
+        );
+    }
+
+    #[test]
+    fn a_screen_export_follows_the_filter() {
+        let mut state = with_lines(&["boot", "error 7", "ready", "error 9"]);
+        state.export_all = false;
+        state.filter = "error".to_string();
+        let storage = std::sync::Arc::new(std::sync::Mutex::new(
+            SqliteStorage::open_memory().expect("in-memory database"),
+        ));
+        let lines = gather_export_lines(&state, &storage).expect("the screen is always readable");
+        let payloads: Vec<&str> = lines.iter().map(|l| l.payload.as_str()).collect();
+        assert_eq!(payloads, ["error 7", "error 9"]);
+    }
+
+    #[test]
+    fn a_full_export_ignores_the_filter_and_reads_the_capture() {
+        let state = {
+            let mut state = with_lines(&["only on screen"]);
+            state.filter = "nothing matches".to_string();
+            state.export_all = true;
+            state
+        };
+        let storage = std::sync::Arc::new(std::sync::Mutex::new(
+            SqliteStorage::open_memory().expect("in-memory database"),
+        ));
+        let lines = gather_export_lines(&state, &storage).expect("an empty capture is readable");
+        // The capture is empty here, and the screen contents must not leak in.
+        assert!(lines.is_empty(), "got: {lines:?}");
+    }
+
+    #[test]
+    fn every_export_format_produces_something() {
+        use crate::export::ExportFormat;
+        let lines = vec![crate::storage::StoredLine {
+            id: 1,
+            timestamp_ns: 0,
+            payload: "hello".to_string(),
+        }];
+        for format in [ExportFormat::Txt, ExportFormat::Csv, ExportFormat::Jsonl] {
+            let text = crate::export::to_string(&lines, format).expect("the format writes");
+            assert!(
+                text.contains("hello"),
+                "{} lost the payload",
+                export_format_label(format)
+            );
         }
     }
 }

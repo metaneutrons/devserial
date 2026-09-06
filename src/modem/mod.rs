@@ -87,6 +87,54 @@ impl FileTransferProtocol {
         }
     }
 
+    /// Every protocol, in the order a surface offers them.
+    ///
+    /// ZMODEM first because it is the one to reach for; the XMODEM variants
+    /// last because they exist for devices that know nothing newer.
+    pub const ALL: [Self; 5] = [
+        Self::Zmodem,
+        Self::Ymodem,
+        Self::Xmodem1k,
+        Self::XmodemCrc,
+        Self::Xmodem,
+    ];
+
+    /// How it is written in either interface.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Xmodem => "XMODEM",
+            Self::XmodemCrc => "XMODEM-CRC",
+            Self::Xmodem1k => "XMODEM-1K",
+            Self::Ymodem => "YMODEM",
+            Self::Zmodem => "ZMODEM",
+        }
+    }
+
+    /// The next choice, for a surface that cycles rather than lists.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Zmodem => Self::Ymodem,
+            Self::Ymodem => Self::Xmodem1k,
+            Self::Xmodem1k => Self::XmodemCrc,
+            Self::XmodemCrc => Self::Xmodem,
+            Self::Xmodem => Self::Zmodem,
+        }
+    }
+
+    /// The previous choice.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Zmodem => Self::Xmodem,
+            Self::Ymodem => Self::Zmodem,
+            Self::Xmodem1k => Self::Ymodem,
+            Self::XmodemCrc => Self::Xmodem1k,
+            Self::Xmodem => Self::XmodemCrc,
+        }
+    }
+
     /// Whether the protocol transmits 1024-byte blocks.
     #[must_use]
     pub const fn uses_1k_blocks(self) -> bool {
