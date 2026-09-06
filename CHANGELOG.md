@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.12...devserial-v0.1.13) (2026-09-06)
+
+
+### Features
+
+* **tui:** Protokollwahl, Export und Firmware flashen ([#50](https://github.com/metaneutrons/devserial/issues/50)) ([32bbf1c](https://github.com/metaneutrons/devserial/commit/32bbf1cf4214daa3b0e94f3d32a57fdde7421dd3))
+
+
+### Bug Fixes
+
+* **release:** kein Testgeruest im ausgelieferten Binary ([#51](https://github.com/metaneutrons/devserial/issues/51)) ([f5b0af3](https://github.com/metaneutrons/devserial/commit/f5b0af3c8028d4e21d2279a396c08f2e9bd24f38))
+
 ## [0.1.12](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.11...devserial-v0.1.12) (2026-09-06)
 
 
