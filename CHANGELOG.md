@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.1.14](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.13...devserial-v0.1.14) (2026-09-06)
+
+
+### Features
+
+* **gui:** Zoom fuer die Oberflaeche und eine einheitliche Verbindungsansicht ([#54](https://github.com/metaneutrons/devserial/issues/54)) ([40bb832](https://github.com/metaneutrons/devserial/commit/40bb8326fa98d0c6c79694d1578acda921a46685))
+
 ## [0.1.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.12...devserial-v0.1.13) (2026-09-06)
 
 
