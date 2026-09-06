@@ -1,75 +1,79 @@
 # Changelog
 
+The entries up to 0.1.13 were written in German and translated afterwards. The
+commits and pull requests they link to still carry their original subjects,
+which is why a link may lead somewhere that reads differently.
+
 ## [0.1.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.12...devserial-v0.1.13) (2026-09-06)
 
 
 ### Features
 
-* **tui:** Protokollwahl, Export und Firmware flashen ([#50](https://github.com/metaneutrons/devserial/issues/50)) ([32bbf1c](https://github.com/metaneutrons/devserial/commit/32bbf1cf4214daa3b0e94f3d32a57fdde7421dd3))
+* **tui:** protocol choice, export and firmware flashing ([#50](https://github.com/metaneutrons/devserial/issues/50)) ([32bbf1c](https://github.com/metaneutrons/devserial/commit/32bbf1cf4214daa3b0e94f3d32a57fdde7421dd3))
 
 
 ### Bug Fixes
 
-* **release:** kein Testgeruest im ausgelieferten Binary ([#51](https://github.com/metaneutrons/devserial/issues/51)) ([f5b0af3](https://github.com/metaneutrons/devserial/commit/f5b0af3c8028d4e21d2279a396c08f2e9bd24f38))
+* **release:** no test scaffolding in the shipped binary ([#51](https://github.com/metaneutrons/devserial/issues/51)) ([f5b0af3](https://github.com/metaneutrons/devserial/commit/f5b0af3c8028d4e21d2279a396c08f2e9bd24f38))
 
 ## [0.1.12](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.11...devserial-v0.1.12) (2026-09-06)
 
 
 ### Features
 
-* **esp:** die Werkzeugausgabe zeilenweise waehrend des Laufs ([#45](https://github.com/metaneutrons/devserial/issues/45)) ([3acfd69](https://github.com/metaneutrons/devserial/commit/3acfd69c02e48655f47324310ee8dcd3990dfe68))
-* **macos:** ein notarisiertes App-Bundle neben dem CLI ([#42](https://github.com/metaneutrons/devserial/issues/42)) ([8f9cc2a](https://github.com/metaneutrons/devserial/commit/8f9cc2a1ed1e8b8dd81083d174b1135b6503286b))
-* **tui:** Anzeige leeren, Filter, Steuerleitungen und Makros ([#48](https://github.com/metaneutrons/devserial/issues/48)) ([c4915d9](https://github.com/metaneutrons/devserial/commit/c4915d9e14849dad3327d283bae2a376e47e4ff2))
-* **tui:** Eingabehistorie, Zeilenende und Port freigeben ([#49](https://github.com/metaneutrons/devserial/issues/49)) ([102deee](https://github.com/metaneutrons/devserial/commit/102deee57b0d5829c2f19737b78311d61b5e00e7))
-* **gui:** Firmware aus dem Monitorfenster flashen ([a3966ac](https://github.com/metaneutrons/devserial/commit/a3966ace55bbe3668200905a52e2639ec961de25)). Von Hand ergaenzt: die Aenderung kam im Commit zu [#47](https://github.com/metaneutrons/devserial/issues/47) mit, dessen Betreff sie nicht nennt, und waere sonst unsichtbar geblieben
+* **esp:** the tool output line by line while it runs ([#45](https://github.com/metaneutrons/devserial/issues/45)) ([3acfd69](https://github.com/metaneutrons/devserial/commit/3acfd69c02e48655f47324310ee8dcd3990dfe68))
+* **macos:** a notarized app bundle beside the CLI ([#42](https://github.com/metaneutrons/devserial/issues/42)) ([8f9cc2a](https://github.com/metaneutrons/devserial/commit/8f9cc2a1ed1e8b8dd81083d174b1135b6503286b))
+* **tui:** clear the view, filter, control lines and macros ([#48](https://github.com/metaneutrons/devserial/issues/48)) ([c4915d9](https://github.com/metaneutrons/devserial/commit/c4915d9e14849dad3327d283bae2a376e47e4ff2))
+* **tui:** input history, line ending and releasing the port ([#49](https://github.com/metaneutrons/devserial/issues/49)) ([102deee](https://github.com/metaneutrons/devserial/commit/102deee57b0d5829c2f19737b78311d61b5e00e7))
+* **gui:** flash firmware from the monitor window ([a3966ac](https://github.com/metaneutrons/devserial/commit/a3966ace55bbe3668200905a52e2639ec961de25)). Added by hand: the change travelled in the commit for [#47](https://github.com/metaneutrons/devserial/issues/47), whose subject does not name it, and would otherwise have stayed invisible
 
 
 ### Bug Fixes
 
-* die Oberflaechen merken und zeigen, wenn das Geraet verschwindet ([#47](https://github.com/metaneutrons/devserial/issues/47)) ([a3966ac](https://github.com/metaneutrons/devserial/commit/a3966ace55bbe3668200905a52e2639ec961de25))
-* **gui:** der Verbindungsbildschirm bekommt sein Layout in Ordnung ([#44](https://github.com/metaneutrons/devserial/issues/44)) ([7706c00](https://github.com/metaneutrons/devserial/commit/7706c00aeae7aae4fd58a786c59e09e35581dcad))
+* the surfaces notice and show when the device disappears ([#47](https://github.com/metaneutrons/devserial/issues/47)) ([a3966ac](https://github.com/metaneutrons/devserial/commit/a3966ace55bbe3668200905a52e2639ec961de25))
+* **gui:** the connection screen gets its layout in order ([#44](https://github.com/metaneutrons/devserial/issues/44)) ([7706c00](https://github.com/metaneutrons/devserial/commit/7706c00aeae7aae4fd58a786c59e09e35581dcad))
 
 ## [0.1.11](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.10...devserial-v0.1.11) (2026-09-05)
 
 
 ### Bug Fixes
 
-* **ci:** dem AUR-Index zwanzig Minuten statt fuenf geben ([#40](https://github.com/metaneutrons/devserial/issues/40)) ([4dd7b4d](https://github.com/metaneutrons/devserial/commit/4dd7b4d2da20dc84a418cdce665aa1a70643ea2a))
+* **ci:** give the AUR index twenty minutes instead of five ([#40](https://github.com/metaneutrons/devserial/issues/40)) ([4dd7b4d](https://github.com/metaneutrons/devserial/commit/4dd7b4d2da20dc84a418cdce665aa1a70643ea2a))
 
 ## [0.1.10](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.9...devserial-v0.1.10) (2026-09-05)
 
 
 ### Bug Fixes
 
-* **ci:** die Ruecklesung der Formel vergleicht byteweise ([#38](https://github.com/metaneutrons/devserial/issues/38)) ([7418ab6](https://github.com/metaneutrons/devserial/commit/7418ab6f693348f02c48a8a048f217132cf6a1bc))
+* **ci:** the formula read-back compares byte by byte ([#38](https://github.com/metaneutrons/devserial/issues/38)) ([7418ab6](https://github.com/metaneutrons/devserial/commit/7418ab6f693348f02c48a8a048f217132cf6a1bc))
 
 ## [0.1.9](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.8...devserial-v0.1.9) (2026-09-05)
 
 
 ### Bug Fixes
 
-* **ci:** auf den ersten Check des Taps warten, bevor darauf gewartet wird ([#36](https://github.com/metaneutrons/devserial/issues/36)) ([050859a](https://github.com/metaneutrons/devserial/commit/050859a87b77fb0380504d086251e2ae709be1f3))
+* **ci:** wait for the tap's first check to exist before waiting on it ([#36](https://github.com/metaneutrons/devserial/issues/36)) ([050859a](https://github.com/metaneutrons/devserial/commit/050859a87b77fb0380504d086251e2ae709be1f3))
 
 ## [0.1.8](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.7...devserial-v0.1.8) (2026-09-05)
 
 
 ### Bug Fixes
 
-* **ci:** der Homebrew-Schritt benennt Repository und Branch ausdruecklich ([#34](https://github.com/metaneutrons/devserial/issues/34)) ([5d4dc50](https://github.com/metaneutrons/devserial/commit/5d4dc5076c942417c887e72747a32302255c3ee8))
+* **ci:** the Homebrew step names repository and branch explicitly ([#34](https://github.com/metaneutrons/devserial/issues/34)) ([5d4dc50](https://github.com/metaneutrons/devserial/commit/5d4dc5076c942417c887e72747a32302255c3ee8))
 
 ## [0.1.7](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.6...devserial-v0.1.7) (2026-09-05)
 
 
 ### Bug Fixes
 
-* **ci:** kein Debug-Paket aus dem AUR-Quellpaket, und eindeutige Auswahl ([#32](https://github.com/metaneutrons/devserial/issues/32)) ([b43a93a](https://github.com/metaneutrons/devserial/commit/b43a93a4da482576d3661a4afade3e3f7cd02544))
+* **ci:** no debug package from the AUR source package, and an unambiguous selection ([#32](https://github.com/metaneutrons/devserial/issues/32)) ([b43a93a](https://github.com/metaneutrons/devserial/commit/b43a93a4da482576d3661a4afade3e3f7cd02544))
 
 ## [0.1.6](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.5...devserial-v0.1.6) (2026-09-05)
 
 
 ### Bug Fixes
 
-* **ci:** der AUR-Preflight wies eine gueltige Credential ab ([#30](https://github.com/metaneutrons/devserial/issues/30)) ([ee29580](https://github.com/metaneutrons/devserial/commit/ee295801cc2b2f6c2eec5873aaecbab180376a2c))
+* **ci:** the AUR preflight rejected a valid credential ([#30](https://github.com/metaneutrons/devserial/issues/30)) ([ee29580](https://github.com/metaneutrons/devserial/commit/ee295801cc2b2f6c2eec5873aaecbab180376a2c))
 
 ## [0.1.5](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.4...devserial-v0.1.5) (2026-09-05)
 
@@ -82,7 +86,7 @@
 ### Bug Fixes
 
 * **ci:** accept both spellings file uses for a statically linked binary ([#16](https://github.com/metaneutrons/devserial/issues/16)) ([fbeb134](https://github.com/metaneutrons/devserial/commit/fbeb134dea72fdd9b3ad65773d7a647271d2f0c8))
-* **ci:** das App-Token ueber client-id statt app-id ausstellen ([#29](https://github.com/metaneutrons/devserial/issues/29)) ([4c969ea](https://github.com/metaneutrons/devserial/commit/4c969ea49b96a27077819d1aafeb667456a5eed1))
+* **ci:** issue the app token through client-id instead of app-id ([#29](https://github.com/metaneutrons/devserial/issues/29)) ([4c969ea](https://github.com/metaneutrons/devserial/commit/4c969ea49b96a27077819d1aafeb667456a5eed1))
 * **ci:** put the AUR licences under $pkgname and disable LTO for the source build ([#17](https://github.com/metaneutrons/devserial/issues/17)) ([38fa49e](https://github.com/metaneutrons/devserial/commit/38fa49e661528ef48f90f5384234a71fc0b841b3))
 * **ci:** read the release state back without the field that does not exist ([#18](https://github.com/metaneutrons/devserial/issues/18)) ([bbea268](https://github.com/metaneutrons/devserial/commit/bbea268e84e20d178533e039b99099421c7fb96e))
 
