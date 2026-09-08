@@ -55,6 +55,16 @@ No AI attribution trailers. Specifically no `Co-authored-by:` naming Claude or
 Anthropic, no `Generated with Claude Code` line and no `noreply@anthropic.com`
 as author or committer. A real human co-author is welcome.
 
+## Plans for substantial changes
+
+A feature that needs several independently reviewable pull requests gets a plan
+in `docs/plans/`, an epic issue as its entry point and one issue per milestone.
+The plan owns the requirements and the acceptance criteria; the issues own the
+execution state. Neither duplicates the other, and a requirement changes through
+a reviewed change to the plan rather than through an edit to an issue.
+
+One bounded fix or a small feature needs only an issue and a pull request.
+
 ## Branches
 
 `<type>/<short-description>`, with the same types as the commit messages, for
