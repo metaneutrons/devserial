@@ -1,6 +1,6 @@
 # Initiative plan: REST interface
 
-Epic: pending, created after this plan is reviewed
+Epic: <https://github.com/metaneutrons/devserial/issues/62>
 Decision state: accepted. The design was reviewed and every open question
 answered on 8 and 9 September 2026; the decisions are recorded under
 [Design and decisions](#design-and-decisions).
@@ -112,7 +112,7 @@ requirements and do not track progress.
 
 ### M1: every monitor attaches to the daemon
 
-Execution: pending
+Execution: <https://github.com/metaneutrons/devserial/issues/63>
 Dependencies: none
 
 - M1-A1: `devserial monitor PORT` and `devserial tui PORT` open the port through
@@ -135,7 +135,7 @@ Dependencies: none
 
 ### M2: one export format at full precision
 
-Execution: pending
+Execution: <https://github.com/metaneutrons/devserial/issues/64>
 Dependencies: M1 is not required; M2 may run in parallel or first.
 
 - M2-A1: `export::format_timestamp` renders nine fractional digits. Verified by a
@@ -150,7 +150,7 @@ Dependencies: M1 is not required; M2 may run in parallel or first.
 
 ### M3: the server and its switch
 
-Execution: pending
+Execution: <https://github.com/metaneutrons/devserial/issues/65>
 Dependencies: M1, M2
 
 - M3-A1: `[rest]` in the configuration file with `enabled`, `bind`, `port` and an
@@ -182,7 +182,7 @@ Dependencies: M1, M2
 
 ### M4: reading over HTTP
 
-Execution: pending
+Execution: <https://github.com/metaneutrons/devserial/issues/66>
 Dependencies: M3
 
 - M4-A1: `GET /v1/ports`, `PUT` and `DELETE /v1/ports/{port}`,
@@ -205,7 +205,7 @@ Dependencies: M3
 
 ### M5: streaming
 
-Execution: pending
+Execution: <https://github.com/metaneutrons/devserial/issues/67>
 Dependencies: M4
 
 - M5-A1: `GET /v1/ports/{port}/lines/stream` emits one event per line with the
@@ -219,7 +219,7 @@ Dependencies: M4
 
 ### M6: driving the device, and the specification
 
-Execution: pending
+Execution: <https://github.com/metaneutrons/devserial/issues/68>
 Dependencies: M5
 
 - M6-A1: `write`, `break`, `signals`, `macros/{name}` and `transfers` answer and
