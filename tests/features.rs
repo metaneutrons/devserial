@@ -21,6 +21,7 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
+const PACKAGE_METADATA: &str = include_str!("../scripts/release/package-metadata.sh");
 
 /// The features declared in `[features]`, with what each pulls in.
 fn declared_features() -> Vec<(String, String)> {
@@ -94,4 +95,28 @@ fn the_release_builds_from_full_and_not_from_all_features() {
             "a release build does not ask for `full`: {line}"
         );
     }
+}
+
+/// The Homebrew `desc` and the AUR `pkgdesc` come from a hand-written copy of
+/// the package description in `scripts/release/package-metadata.sh`. Nothing
+/// reads one from the other, so a change on one side leaves the packages
+/// describing a program that no longer matches the one they install.
+#[test]
+fn the_packaging_description_matches_the_manifest() {
+    let manifest = MANIFEST
+        .lines()
+        .find_map(|line| line.strip_prefix("description = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("Cargo.toml has no description");
+
+    let packaged = PACKAGE_METADATA
+        .lines()
+        .find_map(|line| line.strip_prefix("DESCRIPTION='"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .expect("package-metadata.sh has no DESCRIPTION");
+
+    assert_eq!(
+        manifest, packaged,
+        "the packaged description has drifted from Cargo.toml"
+    );
 }

@@ -5,7 +5,7 @@
 <h1 align="center">devserial</h1>
 
 <p align="center">
-  <strong>One binary that turns a serial port into a queryable, always-on log: for AI agents over MCP, for scripts over a CLI, and for humans in a GUI or terminal monitor.</strong>
+  <strong>Serial terminal for developers with SQLite-buffered output and a CLI, TUI, GUI and MCP interface. One binary to rule them all. ;)</strong>
 </p>
 
 <p align="center">
@@ -20,9 +20,9 @@
 
 ## What it is
 
-A serial terminal forgets everything the moment you close it, and it can only be read by the person sitting in front of it. `devserial` captures the port into a SQLite database instead, then hands that capture to whoever needs it.
+A serial terminal usually forgets everything the moment you close it, and only the person sitting in front of it can read it. `devserial` captures the port into a SQLite database instead, then hands that capture to whoever needs it.
 
-A background daemon owns the open ports and writes every line with a nanosecond timestamp. Four front ends read from the same capture and drive the same hardware.
+Every line is written with a nanosecond timestamp. Four front ends read from the same capture and drive the same hardware.
 
 | Front end | For | Started with |
 |-----------|-----|--------------|
@@ -31,7 +31,9 @@ A background daemon owns the open ports and writes every line with a nanosecond 
 | GUI monitor | interactive work on the desktop | `devserial`, or `devserial monitor PORT` |
 | TUI monitor | interactive work over SSH | `devserial tui PORT` |
 
-All four go through one execution core, so a command behaves identically no matter which one issued it. Unplugging a device does not lose the log, and reconnecting resumes into the same buffer.
+**Who holds the port depends on how you start it.** The CLI and the MCP server talk to a background daemon, which keeps the port open after the command returns and shares one execution core, so a command behaves identically whichever of them issued it. `devserial monitor PORT` and `devserial tui PORT` open the port themselves and run no daemon; they carry out the same actions on their own path, mirroring what the daemon does. Either way the capture lands in the same database for that port, so a monitor window and a `devserial read` see the same lines.
+
+Unplugging a device does not lose the log, and reconnecting resumes into the same buffer.
 
 ---
 
@@ -581,7 +583,7 @@ cargo check --no-default-features --features full
 
 Continuous integration runs lints, tests and documentation on Linux, macOS and Windows across four feature sets, plus a job that checks the declared minimum supported Rust version.
 
-Architecture in one paragraph: `engine.rs` is the only place operations are carried out. `protocol.rs` holds the vocabulary of requests and responses. The CLI, the IPC daemon and the MCP server are transports over that vocabulary and contain no operation logic, which is what keeps their behaviour identical. `port_manager.rs` owns the open ports, `storage.rs` the SQLite layer, `transport.rs` the platform-specific IPC.
+Architecture in one paragraph: `engine.rs` is the only place a daemon-side operation is carried out. `protocol.rs` holds the vocabulary of requests and responses. The CLI, the IPC daemon and the MCP server are transports over that vocabulary and contain no operation logic, which is what keeps their behaviour identical. `port_manager.rs` owns those ports, `storage.rs` the SQLite layer, `transport.rs` the platform-specific IPC. `standalone.rs` is the exception and says so in its own header: a monitor started on a port owns that port itself, so it carries out BREAK, the control lines and the macros on a path of its own that mirrors the engine. `surface.rs` keeps the window and the terminal from drifting apart.
 
 ---
 
