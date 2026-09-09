@@ -27,7 +27,10 @@ PACKAGE=devserial
 # In CI this is the repository the workflow runs in, so a rename cannot leave
 # the package sources pointing at a redirect.
 REPOSITORY=${GITHUB_REPOSITORY:-metaneutrons/devserial}
-DESCRIPTION='MCP server bridging serial hardware to LLMs via SQLite-backed buffer'
+# Kept in step with the package description by a test in tests/features.rs,
+# because this is a hand-written copy of it and nothing else would notice a
+# change on one side only.
+DESCRIPTION='Serial terminal for developers with SQLite-buffered output and a CLI, TUI, GUI and MCP interface'
 HOMEPAGE="https://github.com/${REPOSITORY}"
 LICENSE_ID='GPL-3.0-or-later'
 
