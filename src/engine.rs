@@ -864,7 +864,7 @@ impl CommandEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         server
-            .enable(&config)
+            .enable(&config, self)
             .map(ResponsePayload::RestState)
             .map_err(EngineError::Rest)
     }
@@ -894,7 +894,7 @@ impl CommandEngine {
             .rest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match server.enable(&config) {
+        match server.enable(&config, self) {
             Ok(state) => tracing::info!(url = %state.url(), "the HTTP interface is listening"),
             Err(reason) => {
                 tracing::warn!(%reason, "the HTTP interface did not start; the daemon continues");

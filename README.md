@@ -427,8 +427,46 @@ port    = 9600
 #token  = "…"
 ```
 
-Two routes answer so far, `GET /v1/health` and `GET /v1/version`. The routes
-that read a capture and drive a device follow; the plan for them is
+### Routes
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/v1/health` | Liveness. The one route that needs no token |
+| `GET` | `/v1/version` | Version, features compiled in, the route list |
+| `GET` | `/v1/ports` | Managed ports; `?hardware=true` adds what the system reports |
+| `PUT` | `/v1/ports/{port}` | Open a port, or reconfigure one that is open |
+| `DELETE` | `/v1/ports/{port}` | Close a managed port |
+| `GET` | `/v1/ports/{port}` | Link state and buffer statistics |
+| `GET` | `/v1/ports/{port}/stats` | Buffer statistics |
+| `GET` | `/v1/ports/{port}/lines` | A page of captured lines |
+| `DELETE` | `/v1/ports/{port}/lines` | Discard the buffer; `?archive=true` snapshots first |
+| `GET` | `/v1/ports/{port}/search` | `q`, `mode`, `from`, `to`, `limit` |
+| `POST` | `/v1/ports/{port}/export` | Write the capture to a file |
+
+The port is percent-encoded in the path, because `/dev/cu.usbmodem1101` and
+`COM3` are both port names. Writing to a device, the file transfers and the ESP
+operations are the next slice; a test walks every request the daemon knows and
+fails when one has neither a route nor a recorded reason for not having one.
+
+```bash
+curl -s 'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/lines?tail=5'
+curl -s 'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/search?q=Guru'
+```
+
+A line on the wire is the record the `jsonl` export writes, from the same
+function, so a file and a response carry the same fields. Every field of the
+read window is reachable: `start`, `after`, `tail`, `since`, `limit` and
+`wait_ms`, with `since`, `from` and `to` as RFC 3339.
+
+**Two headers are checked**, and they are what make the missing token safe. A
+body has to declare `Content-Type: application/json`, which a form POST cannot
+set and a cross-origin `fetch` cannot send without a preflight this server never
+grants. And the `Host` header has to name this listener on a loopback name,
+which is what stops DNS rebinding: an attacker's hostname resolving to
+`127.0.0.1` still carries their name in that header. Errors are
+`application/problem+json` with a typed `type`.
+
+The plan for the rest is
 [`docs/plans/rest-interface.md`](docs/plans/rest-interface.md).
 
 ---
