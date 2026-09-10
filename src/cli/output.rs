@@ -13,7 +13,7 @@ pub fn print_line(line: &StoredLine, timestamps: bool, json: bool) {
     if json {
         println!("{}", serde_json::to_string(line).unwrap_or_default());
     } else if timestamps {
-        let ts = chrono::DateTime::from_timestamp_nanos(line.timestamp_ns).format("%H:%M:%S%.3f");
+        let ts = crate::export::format_time_of_day(line.timestamp_ns);
         println!("[{ts}] {}", line.payload);
     } else {
         println!("{}", line.payload);
@@ -93,8 +93,9 @@ pub fn print_status(
     println!("  Total Bytes:    {}", stats.total_bytes);
     println!("  Database Size:  {} bytes", stats.db_size_bytes);
     if let Some(ts) = stats.last_timestamp_ns {
-        let dt = chrono::DateTime::from_timestamp_nanos(ts);
-        println!("  Last Activity:  {}", dt.format("%Y-%m-%d %H:%M:%S UTC"));
+        // The one place that already named its zone, kept as the record form
+        // it is: this is a reported fact, not a line on a live screen.
+        println!("  Last Activity:  {}", crate::export::format_timestamp(ts));
     }
     Ok(())
 }
