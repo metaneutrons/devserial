@@ -24,12 +24,20 @@ impl Sandbox {
 
     /// A devserial invocation that cannot touch production state.
     ///
-    /// Every call carries a timeout. Without one a blocking invocation makes
-    /// the whole test hang, and the failure then names the test rather than
-    /// the call that blocked.
+    /// The timeout is the backstop for `cargo test`, which has none of its own:
+    /// without it a blocking invocation hangs the whole run. In CI the backstop
+    /// is nextest's `terminate-after` in `.config/nextest.toml`, and that one
+    /// has to fire first, which is why this period sits above it. nextest names
+    /// the test it killed; this timeout cannot, for the reason the test at the
+    /// bottom of this file pins down.
+    ///
+    /// It was 20 seconds, and that was too close to how long a cold debug
+    /// binary takes to start on a loaded Windows runner. The job that exposed
+    /// it took 6m22s where the same job on the same code had taken 1m55s, and
+    /// `a_missing_config_file_is_reported` failed with empty output.
     fn command(&self) -> Command {
         let mut cmd = Command::cargo_bin("devserial").expect("binary");
-        cmd.timeout(std::time::Duration::from_secs(20))
+        cmd.timeout(std::time::Duration::from_secs(90))
             .env("DEVSERIAL_DATA_DIR", self.dir.path())
             .env("DEVSERIAL_SOCKET", self.dir.path().join("test.sock"))
             .env_remove("DEVSERIAL_CONFIG")
@@ -363,4 +371,44 @@ fn tui_help_documents_the_line_options() {
         .success()
         .stdout(predicate::str::contains("--data-bits"))
         .stdout(predicate::str::contains("--flow-control"));
+}
+
+/// A timeout kill passes `.failure()`, so it can stand in for the failure a
+/// test was expecting.
+///
+/// This pins the harness rather than devserial, because the behaviour cost an
+/// afternoon. `assert_cmd` kills a child that outruns its timeout and hands
+/// back the kill as an ordinary failing command. A test that asserts
+/// `.failure()` and then a message therefore reports only "Unexpected stderr",
+/// with an empty string and nothing to go on, and on Windows the kill even
+/// arrives as exit code 1 so the status gives nothing away either.
+///
+/// Two things follow. The timeout in `Sandbox::command` has to stay above
+/// nextest's `terminate-after`, so the mechanism that can name the test
+/// reports first in CI. And anyone tempted to lower it should read this and
+/// know what a too-short period turns into.
+///
+/// Unix only. The property belongs to `assert_cmd` and is not
+/// platform-specific; what is platform-specific is finding a sleeper that
+/// behaves the same everywhere, and Windows `timeout` refuses a redirected
+/// stdin.
+#[cfg(unix)]
+#[test]
+fn a_timeout_kill_passes_failure_and_carries_no_message() {
+    let output = Command::new("sleep")
+        .arg("5")
+        .timeout(std::time::Duration::from_millis(200))
+        .assert()
+        // The dangerous part: a killed process is accepted as a failing one.
+        .failure()
+        .get_output()
+        .clone();
+
+    // The part that makes the report useless: a process killed before it wrote
+    // anything has nothing to match a message predicate against.
+    assert!(
+        output.stderr.is_empty(),
+        "a sleeper killed before it writes should carry no stderr, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
