@@ -157,6 +157,27 @@ pub fn now_for_filename() -> String {
 /// the two finds an offset and no explanation.
 pub const DISPLAY_ZONE_NOTE: &str = "times local";
 
+/// One captured line as JSON.
+///
+/// The `jsonl` export and the HTTP interface hand out the same object, from
+/// here, so a file on disk and a response on the wire carry the same records
+/// rather than two shapes kept in step by hand. A test compares them.
+///
+/// `timestamp_ns` is a string on purpose. A nanosecond epoch in 2026 is 198.6
+/// times above JavaScript's `MAX_SAFE_INTEGER`, where a double's step is
+/// 256 ns, so `JSON.parse` rounds it silently. That is nothing against a UART
+/// bit at 8.7 µs, but it breaks handing the value back as a filter, where an
+/// exclusive boundary then repeats or skips a line.
+#[must_use]
+pub fn line_object(line: &StoredLine) -> serde_json::Value {
+    serde_json::json!({
+        "id": line.id,
+        "timestamp": format_timestamp(line.timestamp_ns),
+        "timestamp_ns": line.timestamp_ns.to_string(),
+        "payload": line.payload,
+    })
+}
+
 /// Write the header row a format requires, if any.
 ///
 /// # Errors
@@ -191,19 +212,7 @@ pub fn write_line<W: Write>(
             )?;
         }
         ExportFormat::Jsonl => {
-            // `timestamp_ns` is a string on purpose. A nanosecond epoch in
-            // 2026 is 198.6 times above JavaScript's MAX_SAFE_INTEGER, where a
-            // double's step is 256 ns, so JSON.parse rounds it silently. That
-            // is nothing against a UART bit at 8.7 µs, but it breaks handing
-            // the value back as a filter, where an exclusive boundary then
-            // repeats or skips a line.
-            let obj = serde_json::json!({
-                "id": line.id,
-                "timestamp": format_timestamp(line.timestamp_ns),
-                "timestamp_ns": line.timestamp_ns.to_string(),
-                "payload": line.payload,
-            });
-            writeln!(writer, "{obj}")?;
+            writeln!(writer, "{}", line_object(line))?;
         }
     }
     Ok(())
