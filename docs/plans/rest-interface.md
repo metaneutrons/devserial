@@ -201,9 +201,9 @@ Dependencies: M1, M2
 - M3-A4: A failed autostart from the configuration file leaves the daemon
   running and the reason retrievable. Verified by a test that occupies the
   configured port before the daemon starts.
-- M3-A5: `devserial rest`, `--enable`, `--disable`, `--port`, `--bind`,
-  `--token-file` and `--rotate-token` behave as documented, with the state
-  readable in the exit code and on stdout.
+- M3-A5: `devserial rest`, `--enable`, `--disable`, `--port`, `--bind` and
+  `--token-file` behave as documented, with the state readable on stdout.
+  `--rotate-token` is dropped; see the decision log.
 - M3-A6: F7 in the terminal monitor and a window in the GUI show the state, the
   bind address, the port and the failure reason, and switch the server on and
   off. Both read the daemon's state rather than a local copy.
@@ -316,6 +316,19 @@ change, a consolidation and a correction in one delivery, against the rule that
 a pull request carries changes of one kind. The exception is deliberate: all
 three touch the same function, and the release notes need one entry for the
 break rather than two.
+
+**10 September 2026, `--rotate-token` dropped from M3-A5.** The design had the
+daemon generate a token on first enable and keep it in `config.db`, and
+`--rotate-token` would have replaced it. Building M3 made that machinery
+pointless: loopback needs no token at all, and a bind that leaves the machine
+requires one the operator already controls, in the configuration file or in a
+file passed with `--token-file`. There is nothing devserial generated, so there
+is nothing for it to rotate; rotating means editing the file the operator owns.
+The flag would have been a verb for a thing that does not exist.
+
+What is lost is the convenience of a generated token for a non-loopback bind,
+which now has to be produced by hand. That is a fair trade against a second
+place where a secret lives.
 
 A change to a criterion or to the scope is recorded here with its date and the
 pull request that made it, and a milestone claiming acceptance links the exact

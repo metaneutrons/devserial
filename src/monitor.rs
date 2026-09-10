@@ -246,7 +246,18 @@ pub fn run_monitor(port_name: &str, db_path: &Path, port_info: &str) -> Result<(
         return Ok(());
     }
 
-    run_monitor_inner(port_name, db_path, port_info, None, None, None)
+    run_monitor_inner(
+        port_name,
+        db_path,
+        port_info,
+        None,
+        None,
+        None,
+        // The subprocess the MCP server spawns has no session, so it has no
+        // route to the daemon's switch either.
+        #[cfg(feature = "rest")]
+        None,
+    )
 }
 
 /// Block until the parent process closes our stdin.
@@ -272,6 +283,7 @@ pub fn run_monitor_with_port(
     port_info: &str,
     write_port: Box<dyn std::io::Write + Send>,
     keepalive: Arc<crate::standalone::SessionKeepalive>,
+    #[cfg(feature = "rest")] rest: Option<crate::standalone::RestControlFn>,
 ) -> Result<(), String> {
     run_monitor_inner(
         port_name,
@@ -280,6 +292,8 @@ pub fn run_monitor_with_port(
         Some(Arc::new(std::sync::Mutex::new(write_port))),
         None,
         Some(keepalive),
+        #[cfg(feature = "rest")]
+        rest,
     )
 }
 
@@ -555,6 +569,7 @@ fn run_monitor_inner(
     writer: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
     reconfigure: Option<ReconfigureFn>,
     keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
+    #[cfg(feature = "rest")] rest: Option<crate::standalone::RestControlFn>,
 ) -> Result<(), String> {
     platform::init_app();
 
@@ -568,7 +583,8 @@ fn run_monitor_inner(
     let history = storage.load_send_history(500).unwrap_or_default();
     let has_session = writer.is_some();
 
-    let initial = PortMonitorState::new_with_reconfigure(
+    #[allow(unused_mut)]
+    let mut initial = PortMonitorState::new_with_reconfigure(
         port_name.to_string(),
         port_info.to_string(),
         storage,
@@ -582,6 +598,10 @@ fn run_monitor_inner(
         None,
         keepalive,
     );
+    #[cfg(feature = "rest")]
+    {
+        initial.rest = rest;
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let socket_server = start_socket_server(tx, &ctx_holder, &open_ports);
@@ -1183,6 +1203,18 @@ pub struct PortMonitorState {
     transfer_proto: crate::modem::FileTransferProtocol,
     transfer_status: Option<String>,
     show_about_dialog: bool,
+    /// Whether the HTTP interface window is open.
+    #[cfg(feature = "rest")]
+    show_rest_dialog: bool,
+    /// Shows and changes the HTTP interface through the daemon.
+    #[cfg(feature = "rest")]
+    pub rest: Option<crate::standalone::RestControlFn>,
+    /// What the daemon last said about the HTTP interface.
+    #[cfg(feature = "rest")]
+    rest_state: Option<crate::protocol::RestState>,
+    /// The port typed into the window, before it is applied.
+    #[cfg(feature = "rest")]
+    rest_port: String,
     pub show_settings_dialog: bool,
     /// Live line settings; the single place this window keeps them.
     pub config: PortConfig,
@@ -1268,6 +1300,14 @@ impl PortMonitorState {
             transfer_proto: crate::modem::FileTransferProtocol::Zmodem,
             transfer_status: None,
             show_about_dialog: false,
+            #[cfg(feature = "rest")]
+            show_rest_dialog: false,
+            #[cfg(feature = "rest")]
+            rest: None,
+            #[cfg(feature = "rest")]
+            rest_state: None,
+            #[cfg(feature = "rest")]
+            rest_port: String::new(),
             show_settings_dialog: false,
             settings_custom_baud: config.baudrate.to_string(),
             config,
@@ -1805,6 +1845,11 @@ impl PortMonitorState {
 
         if self.show_about_dialog {
             self.render_about_dialog(ui.ctx(), icon_texture);
+        }
+
+        #[cfg(feature = "rest")]
+        if self.show_rest_dialog {
+            self.render_rest_dialog(ui.ctx());
         }
 
         // Compute context-aware edit state for macOS menu bar (Cut / Copy / Paste / Select All)
@@ -2608,6 +2653,149 @@ impl PortMonitorState {
         self.show_transfer_dialog = is_open && !close_requested;
     }
 
+    /// Ask the daemon what it says about the HTTP interface.
+    ///
+    /// A failure leaves the last answer in place: a daemon that did not answer
+    /// has not said the interface is off.
+    #[cfg(feature = "rest")]
+    fn refresh_rest(&mut self) {
+        if let Some(rest) = self.rest.as_ref() {
+            match rest(&crate::standalone::RestRequest::Status) {
+                Ok(state) => {
+                    if self.rest_port.is_empty() {
+                        self.rest_port = state.port.to_string();
+                    }
+                    self.rest_state = Some(state);
+                }
+                Err(e) => self.settings_status = Some((format!("REST unavailable: {e}"), true)),
+            }
+        }
+    }
+
+    /// The HTTP interface, shown and changed.
+    ///
+    /// A window of its own rather than a modal sheet, because it shows state
+    /// another process can change while it is open.
+    #[cfg(feature = "rest")]
+    #[allow(clippy::too_many_lines)]
+    fn render_rest_dialog(&mut self, ctx: &egui::Context) {
+        let mut is_open = self.show_rest_dialog;
+        let mut close_requested = false;
+        let mut request = None;
+
+        egui::Window::new("REST interface")
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH);
+                let listening = self.rest_state.as_ref().is_some_and(|rest| rest.listening);
+
+                ui.horizontal(|ui| {
+                    let (colour, label) = if listening {
+                        (egui::Color32::from_rgb(80, 200, 120), "● Listening")
+                    } else {
+                        (egui::Color32::from_rgb(150, 150, 150), "○ Off")
+                    };
+                    ui.colored_label(colour, label);
+                    if let Some(rest) = self.rest_state.as_ref() {
+                        ui.label(
+                            egui::RichText::new(rest.url())
+                                .color(egui::Color32::from_rgb(140, 200, 255)),
+                        );
+                    }
+                });
+
+                if let Some(reason) = self
+                    .rest_state
+                    .as_ref()
+                    .and_then(|rest| rest.reason.as_deref())
+                {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 180, 60),
+                        format!("⚠ last attempt: {reason}"),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Port:").strong());
+                    // Frozen while it listens: changing the port of a running
+                    // listener means restarting it, and the button below says
+                    // so rather than doing it silently.
+                    ui.add_enabled(
+                        !listening,
+                        egui::TextEdit::singleline(&mut self.rest_port).desired_width(90.0),
+                    );
+                    if listening {
+                        ui.label(
+                            egui::RichText::new("stop first to change it")
+                                .color(egui::Color32::from_rgb(150, 150, 150))
+                                .size(11.0),
+                        );
+                    }
+                });
+
+                if let Some(rest) = self.rest_state.as_ref() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(if rest.token_required {
+                            "A token is required: this bind leaves the machine."
+                        } else {
+                            "No token on loopback. Any local process can reach it."
+                        })
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(150, 150, 150)),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if listening {
+                        if ui.button("⏹ Stop").clicked() {
+                            request = Some(crate::standalone::RestRequest::Disable);
+                        }
+                    } else if ui.button("▶ Start").clicked() {
+                        request = Some(crate::standalone::RestRequest::Enable {
+                            bind: None,
+                            port: self.rest_port.trim().parse().ok(),
+                        });
+                    }
+                    if ui.button("Close").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if let Some(request) = request {
+            let outcome = self.rest.as_ref().map_or_else(
+                || Err("no daemon connection".to_string()),
+                |rest| rest(&request),
+            );
+            match outcome {
+                Ok(state) => {
+                    self.rest_port = state.port.to_string();
+                    self.rest_state = Some(state);
+                }
+                Err(e) => {
+                    self.settings_status = Some((format!("REST: {e}"), true));
+                    self.refresh_rest();
+                }
+            }
+        }
+
+        self.show_rest_dialog = is_open && !close_requested;
+    }
+
     fn render_about_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -3187,6 +3375,30 @@ impl PortMonitorState {
             }
 
             ui.separator();
+
+            #[cfg(feature = "rest")]
+            {
+                // The label carries the state, so the toolbar answers "is it
+                // on" without a window having to be opened for it.
+                let listening = self.rest_state.as_ref().is_some_and(|rest| rest.listening);
+                let label = if listening {
+                    format!(
+                        "🌐 REST :{}",
+                        self.rest_state.as_ref().map_or(0, |rest| rest.port)
+                    )
+                } else {
+                    "🌐 REST".to_string()
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text("Show and change the HTTP interface of the daemon")
+                    .clicked()
+                {
+                    self.show_rest_dialog = true;
+                    self.refresh_rest();
+                }
+            }
+
             if ui
                 .button("ℹ About")
                 .on_hover_text("About devserial (Author, Version, Repository)")

@@ -342,6 +342,11 @@ pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
             Err(CliError::msg("command is not a remote operation"))
         }
 
+        // Handled before reaching this router: it decides for itself whether
+        // to start a daemon, which this router always does.
+        #[cfg(feature = "rest")]
+        Command::Rest { .. } => Err(CliError::msg("command is not a remote operation")),
+
         #[cfg(feature = "monitor")]
         Command::Gui | Command::Monitor { .. } | Command::MonitorSubprocess { .. } => {
             Err(CliError::msg("command is not a remote operation"))
@@ -350,6 +355,76 @@ pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
         #[cfg(feature = "tui")]
         Command::Tui { .. } => Err(CliError::msg("command is not a remote operation")),
     }
+}
+
+/// Show or change the HTTP interface.
+///
+/// Reporting the state does not start a daemon: asking whether something
+/// listens must not be the thing that makes it listen. Enabling and disabling
+/// do start one, because they are instructions rather than questions.
+///
+/// # Errors
+/// Returns an error if the daemon cannot be reached or refuses the change.
+#[cfg(feature = "rest")]
+pub fn rest_control(
+    session: &Session,
+    enable: bool,
+    disable: bool,
+    bind: Option<String>,
+    port: Option<u16>,
+    token_file: Option<&std::path::Path>,
+) -> Result<(), CliError> {
+    let token = token_file
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .map(|text| text.trim().to_string())
+                .map_err(|e| CliError::msg(format!("cannot read the token file: {e}")))
+        })
+        .transpose()?
+        .filter(|token| !token.is_empty());
+
+    let payload = if enable {
+        RequestPayload::RestEnable { bind, port, token }
+    } else if disable {
+        RequestPayload::RestDisable
+    } else {
+        RequestPayload::RestStatus
+    };
+
+    let response = if enable || disable {
+        session.request(payload)?
+    } else {
+        match session.request_existing(payload) {
+            Ok(response) => response,
+            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
+                println!("Daemon is not running, so nothing is listening.");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    let crate::protocol::ResponsePayload::RestState(state) = response else {
+        return Err(CliError::msg("unexpected answer from the daemon"));
+    };
+
+    if state.listening {
+        println!("REST is listening on {}", state.url());
+    } else {
+        println!("REST is off (configured for {})", state.url());
+    }
+    if let Some(reason) = state.reason {
+        println!("  last attempt failed: {reason}");
+    }
+    println!(
+        "  token: {}",
+        if state.token_required {
+            "required"
+        } else {
+            "not required on loopback"
+        }
+    );
+    Ok(())
 }
 
 /// Handle `daemon --status` and `daemon --stop`.

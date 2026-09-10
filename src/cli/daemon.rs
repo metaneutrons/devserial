@@ -34,6 +34,13 @@ pub fn run_daemon(socket: Option<PathBuf>, config_path: Option<&Path>) -> Result
         }
 
         let engine = CommandEngine::new(port_manager, state_db, Arc::clone(&config));
+
+        // Starts the HTTP interface if the configuration asks for it. A failed
+        // bind is logged and kept in the state rather than ending the daemon,
+        // which exists to hold serial ports.
+        #[cfg(feature = "rest")]
+        engine.rest_autostart();
+
         let server = IpcServer::new(engine, endpoint, pid_path);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 

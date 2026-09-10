@@ -25,6 +25,8 @@ pub const BUILTIN_MACRO_NAMES: [&str; 3] = ["reset", "enter_bootloader", "break"
 pub struct Config {
     /// Global settings.
     pub global: GlobalConfig,
+    /// HTTP interface settings.
+    pub rest: RestConfig,
     /// Per-port configurations keyed by port path.
     pub ports: HashMap<String, PortConfig>,
     /// User-defined macros keyed by name.
@@ -116,6 +118,74 @@ impl Default for GlobalConfig {
         }
     }
 }
+
+/// Settings of the HTTP interface.
+///
+/// Absent means disabled, which is why every field has a default: a
+/// configuration file without a `[rest]` section describes a daemon that
+/// serves nothing over HTTP, and that is the shape almost every file has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RestConfig {
+    /// Whether the daemon listens on start.
+    pub enabled: bool,
+    /// Address to bind. Anything other than loopback needs a token.
+    pub bind: String,
+    /// Port to listen on.
+    pub port: u16,
+    /// Bearer token, required for a bind that is not loopback.
+    ///
+    /// Set here only to pin a token across machines; otherwise it is left
+    /// unset and loopback needs none.
+    pub token: Option<String>,
+}
+
+impl Default for RestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: DEFAULT_REST_BIND.to_string(),
+            port: DEFAULT_REST_PORT,
+            token: None,
+        }
+    }
+}
+
+impl RestConfig {
+    /// Whether this address is a loopback address.
+    ///
+    /// The whole security boundary of the interface, since loopback needs no
+    /// token. A name that is not an address is not loopback: resolving it
+    /// could make `localhost.attacker.example` pass.
+    #[must_use]
+    pub fn binds_loopback(&self) -> bool {
+        self.bind
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+
+    /// The address the listener is asked for.
+    ///
+    /// # Errors
+    /// Returns an error if the bind address is not an address.
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, String> {
+        let ip: std::net::IpAddr = self
+            .bind
+            .parse()
+            .map_err(|_| format!("'{}' is not an IP address", self.bind))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
+    }
+}
+
+/// Where the HTTP interface listens unless told otherwise.
+///
+/// Loopback, because the interface can write bytes to a device and flash
+/// firmware. 9600 because it is the number a serial developer recalls without
+/// looking it up; `/etc/services` assigns it to `micromuse-ncpw`, and that
+/// collision is accepted rather than unnoticed, which is why a bind failure is
+/// a first-class case rather than a crash.
+pub const DEFAULT_REST_BIND: &str = "127.0.0.1";
+pub const DEFAULT_REST_PORT: u16 = 9600;
 
 /// Per-port configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

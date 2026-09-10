@@ -27,6 +27,8 @@ pub mod platform;
 pub mod port_manager;
 pub mod protocol;
 pub mod reader;
+#[cfg(feature = "rest")]
+pub mod rest;
 pub mod serial_params;
 pub mod server;
 pub mod standalone;

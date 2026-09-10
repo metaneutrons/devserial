@@ -17,15 +17,20 @@
 //! surfaces are compiled in, and a link to it fails the documentation build for
 //! every other feature set.
 //!
-//! What the registry leaves out on purpose: a capability is something a person
-//! does *with the port*, and how a surface is drawn is not that. The two
-//! cannot meet there in any case, because the window scales itself while the
-//! size of a terminal belongs to the terminal and not to the program running
-//! inside it. Interface scale, window size and full screen are therefore
-//! absent from the list rather than recorded as gaps, which would claim the
-//! terminal still owes something it cannot deliver.
+//! What the registry covers is what a person can do through a surface: with
+//! the port it is showing, and with the daemon behind it. The second half was
+//! added when the HTTP interface arrived, because its switch is offered by both
+//! surfaces and leaving it out would have meant the register no longer
+//! describes what they do.
+//!
+//! What it leaves out is how a surface is *drawn*. The two cannot meet there in
+//! any case: the window scales itself, while the size of a terminal belongs to
+//! the terminal and not to the program running inside it. Interface scale,
+//! window size and full screen are therefore absent from the list rather than
+//! recorded as gaps, which would claim the terminal still owes something it
+//! cannot deliver.
 
-/// One thing a person can do with an open port.
+/// One thing a person can do through a surface.
 ///
 /// Named after the effect, not after the control that triggers it, so the same
 /// entry covers a toolbar button and a key combination.
@@ -74,6 +79,13 @@ pub enum Capability {
     FlashFirmware,
     /// Show version, licence and origin.
     About,
+    /// Show and change the HTTP interface of the daemon.
+    ///
+    /// Not a thing done with the port, which is why the register's definition
+    /// widened rather than this being recorded as a gap: both surfaces offer
+    /// it, so leaving it out would describe them wrongly.
+    #[cfg(feature = "rest")]
+    RestServer,
 }
 
 impl Capability {
@@ -98,6 +110,8 @@ impl Capability {
         Self::TransferProtocol,
         Self::FlashFirmware,
         Self::About,
+        #[cfg(feature = "rest")]
+        Self::RestServer,
     ];
 }
 
@@ -127,6 +141,8 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::TransferProtocol, "FileTransferProtocol::ALL"),
     (Capability::FlashFirmware, "\"Flash ▾\""),
     (Capability::About, "show_about_dialog"),
+    #[cfg(feature = "rest")]
+    (Capability::RestServer, "fn render_rest_dialog"),
 ];
 
 /// What the terminal interface offers, with the same kind of proof.
@@ -151,6 +167,8 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::TransferProtocol, "fn transfer_title"),
     (Capability::Export, "fn run_export"),
     (Capability::FlashFirmware, "fn start_flash"),
+    #[cfg(feature = "rest")]
+    (Capability::RestServer, "InputMode::Rest"),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.

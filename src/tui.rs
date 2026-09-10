@@ -91,6 +91,9 @@ pub struct TuiContext {
     pub reconfigure: Option<crate::standalone::ReconfigureFn>,
     /// Sends and receives files over a modem protocol.
     pub transfer: Option<crate::standalone::TransferFn>,
+    /// Shows and changes the HTTP interface.
+    #[cfg(feature = "rest")]
+    pub rest: Option<crate::standalone::RestControlFn>,
 }
 
 /// Run the TUI monitor.
@@ -123,6 +126,9 @@ enum InputMode {
     Signals,
     /// Picking a macro from the configured list.
     Macros,
+    /// Showing and changing the HTTP interface.
+    #[cfg(feature = "rest")]
+    Rest,
     /// Naming a file to write the buffer to.
     Export,
     /// Naming a firmware image and watching espflash run.
@@ -190,6 +196,12 @@ struct AppState {
     reconfigure: Option<crate::standalone::ReconfigureFn>,
     /// Sends and receives files over a modem protocol.
     transfer: Option<crate::standalone::TransferFn>,
+    /// Shows and changes the HTTP interface.
+    #[cfg(feature = "rest")]
+    rest: Option<crate::standalone::RestControlFn>,
+    /// What the daemon last said about the HTTP interface.
+    #[cfg(feature = "rest")]
+    rest_state: Option<crate::protocol::RestState>,
     /// What the reader reports about the hardware.
     ///
     /// Without it the bar could only show what the user had asked for, and an
@@ -200,6 +212,36 @@ struct AppState {
 }
 
 impl AppState {
+    /// Ask the daemon what it says about the HTTP interface.
+    ///
+    /// A failure leaves the last answer in place rather than claiming the
+    /// interface is off: a daemon that did not answer has not told us that.
+    #[cfg(feature = "rest")]
+    fn refresh_rest(&mut self) {
+        if let Some(rest) = self.rest.as_ref() {
+            match rest(&crate::standalone::RestRequest::Status) {
+                Ok(state) => self.rest_state = Some(state),
+                Err(e) => self.set_status(format!("REST state unavailable: {e}")),
+            }
+        }
+    }
+
+    /// Stop the HTTP interface.
+    #[cfg(feature = "rest")]
+    fn stop_rest(&mut self) {
+        let outcome = self.rest.as_ref().map_or_else(
+            || Err("no daemon connection".to_string()),
+            |rest| rest(&crate::standalone::RestRequest::Disable),
+        );
+        match outcome {
+            Ok(state) => {
+                self.rest_state = Some(state);
+                self.set_status("REST stopped");
+            }
+            Err(e) => self.set_status(format!("REST did not stop: {e}")),
+        }
+    }
+
     /// True while the reader says the hardware is not there.
     fn link_is_down(&self) -> bool {
         !matches!(
@@ -235,6 +277,10 @@ impl AppState {
             write: None,
             reconfigure: None,
             transfer: None,
+            #[cfg(feature = "rest")]
+            rest: None,
+            #[cfg(feature = "rest")]
+            rest_state: None,
             link: None,
             lines: std::collections::VecDeque::new(),
             last_id: 0,
@@ -411,6 +457,10 @@ fn run_app(
     state.write = context.write;
     state.reconfigure = context.reconfigure;
     state.transfer = context.transfer;
+    #[cfg(feature = "rest")]
+    {
+        state.rest = context.rest;
+    }
 
     loop {
         // Poll new lines from storage.
@@ -482,6 +532,13 @@ fn run_app(
                     continue;
                 }
                 KeyCode::Char('k') => {
+                    // On the HTTP screen the same key means the same thing it
+                    // means everywhere: let go of what is held.
+                    #[cfg(feature = "rest")]
+                    if state.input_mode == InputMode::Rest {
+                        state.stop_rest();
+                        continue;
+                    }
                     let config = state.config.clone();
                     state.toggle_connection(&config);
                     continue;
@@ -550,6 +607,21 @@ fn run_app(
                     state.set_status(
                         "espflash was not found; install it with cargo install espflash",
                     );
+                }
+                continue;
+            }
+            #[cfg(feature = "rest")]
+            KeyCode::F(7) => {
+                state.input_mode = toggle(&state.input_mode, InputMode::Rest);
+                if state.input_mode == InputMode::Rest {
+                    // The state is fetched on open rather than kept, because
+                    // the command line and the window can change it too.
+                    state.refresh_rest();
+                    state.input = state
+                        .rest_state
+                        .as_ref()
+                        .map(|rest| rest.port.to_string())
+                        .unwrap_or_default();
                 }
                 continue;
             }
@@ -979,6 +1051,28 @@ fn handle_enter(
                 Err(e) => state.set_status(format!("{label} send failed: {e}")),
             }
         }
+        #[cfg(feature = "rest")]
+        InputMode::Rest => {
+            let port = state.input.trim().parse::<u16>().ok();
+            if !state.input.trim().is_empty() && port.is_none() {
+                state.set_status("that is not a port number");
+                return;
+            }
+            let outcome = state.rest.as_ref().map_or_else(
+                || Err("no daemon connection".to_string()),
+                |rest| rest(&crate::standalone::RestRequest::Enable { bind: None, port }),
+            );
+            match outcome {
+                Ok(rest) => {
+                    state.set_status(format!("REST listening on {}", rest.url()));
+                    state.rest_state = Some(rest);
+                }
+                Err(e) => {
+                    state.set_status(format!("REST did not start: {e}"));
+                    state.refresh_rest();
+                }
+            }
+        }
         InputMode::RecvFile => {
             let dir = if state.input.is_empty() {
                 ".".to_string()
@@ -1092,7 +1186,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Normal => (
             "> ",
             format!(
-                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F1 about | Ctrl+C quit ",
+                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F1 about | Ctrl+C quit ",
                 crate::export::DISPLAY_ZONE_NOTE
             ),
         ),
@@ -1116,6 +1210,8 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
             " Press a number to run that macro (Esc to close) ".to_string(),
         ),
         InputMode::Export => ("Export to: ", export_title(state)),
+        #[cfg(feature = "rest")]
+        InputMode::Rest => ("Port: ", rest_title(state)),
         #[cfg(feature = "esp")]
         InputMode::Flash => ("Firmware: ", flash_title(state)),
     };
@@ -1192,6 +1288,35 @@ fn export_title(state: &AppState) -> String {
     format!(
         " Write {scope} as {} (Up/Down format, Tab scope, Esc cancels) ",
         export_format_label(state.export_format)
+    )
+}
+
+/// What the HTTP interface screen says above the input line.
+///
+/// The state comes from the daemon, so another surface or the command line
+/// changing it shows up here on the next open rather than being contradicted.
+#[cfg(feature = "rest")]
+fn rest_title(state: &AppState) -> String {
+    let Some(rest) = state.rest_state.as_ref() else {
+        return " REST: the daemon did not answer (Esc closes) ".to_string();
+    };
+    let head = if rest.listening {
+        format!("listening on {}", rest.url())
+    } else {
+        format!("off, configured for {}", rest.url())
+    };
+    let token = if rest.token_required {
+        ", token required"
+    } else {
+        ""
+    };
+    rest.reason.as_deref().map_or_else(
+        || format!(" REST {head}{token} | Enter starts, Ctrl+K stops, Esc closes "),
+        |reason| {
+            format!(
+                " REST {head}{token} | last attempt: {reason} | Enter starts, Ctrl+K stops, Esc closes "
+            )
+        },
     )
 }
 

@@ -47,6 +47,36 @@ pub struct RpcResponse {
     pub result: Result<ResponsePayload, String>,
 }
 
+/// What the daemon reports about its HTTP interface.
+#[cfg(feature = "rest")]
+///
+/// One shape for all three surfaces, so the window, the terminal and the
+/// command line describe the same thing in the same words. `reason` is kept
+/// after a failed bind, because the surfaces show it until the next attempt and
+/// a state without it would look like a listener that simply is not there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestState {
+    /// Whether a listener is accepting connections.
+    pub listening: bool,
+    /// Address the listener holds, or the one that was asked for.
+    pub bind: String,
+    /// Port the listener holds, or the one that was asked for.
+    pub port: u16,
+    /// Why the last attempt failed, if it did.
+    pub reason: Option<String>,
+    /// Whether a bearer token is required.
+    pub token_required: bool,
+}
+
+#[cfg(feature = "rest")]
+impl RestState {
+    /// The address a caller reaches, for a surface that shows it.
+    #[must_use]
+    pub fn url(&self) -> String {
+        format!("http://{}:{}/v1", self.bind, self.port)
+    }
+}
+
 /// Information about a managed serial port.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortInfoResponse {
@@ -252,6 +282,20 @@ pub enum RequestPayload {
         file_path: String,
         address: String,
     },
+    /// State of the HTTP interface.
+    #[cfg(feature = "rest")]
+    RestStatus,
+    /// Start the HTTP interface, binding before the answer is sent.
+    #[cfg(feature = "rest")]
+    RestEnable {
+        bind: Option<String>,
+        port: Option<u16>,
+        /// Bearer token for this run, required for a non-loopback bind.
+        token: Option<String>,
+    },
+    /// Stop the HTTP interface.
+    #[cfg(feature = "rest")]
+    RestDisable,
     /// Request graceful daemon shutdown.
     Shutdown,
 }
@@ -281,6 +325,8 @@ impl RequestPayload {
             | Self::EspInfo { port }
             | Self::EspErase { port }
             | Self::EspWriteBin { port, .. } => Some(port),
+            #[cfg(feature = "rest")]
+            Self::RestStatus | Self::RestEnable { .. } | Self::RestDisable => None,
             Self::Ping | Self::ListPorts | Self::ListHardware | Self::Shutdown => None,
         }
     }
@@ -349,6 +395,9 @@ pub enum ResponsePayload {
     /// ESP tool command output.
     #[cfg(feature = "esp")]
     EspSuccess(String),
+    /// State of the HTTP interface.
+    #[cfg(feature = "rest")]
+    RestState(RestState),
     /// Daemon shutdown initiated.
     ShutdownAck,
 }
