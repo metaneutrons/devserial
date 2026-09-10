@@ -228,6 +228,26 @@ pub type TransferFn = Arc<
     dyn Fn(bool, &str, crate::modem::FileTransferProtocol) -> Result<String, String> + Send + Sync,
 >;
 
+/// What a surface asks of the HTTP interface.
+#[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestRequest {
+    /// Report the state without changing it.
+    Status,
+    /// Start listening, optionally somewhere other than configured.
+    Enable {
+        bind: Option<String>,
+        port: Option<u16>,
+    },
+    /// Stop listening.
+    Disable,
+}
+
+/// Shows and changes the HTTP interface through the daemon.
+#[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
+pub type RestControlFn =
+    Arc<dyn Fn(&RestRequest) -> Result<crate::protocol::RestState, String> + Send + Sync>;
+
 /// Something a surface asks the hardware to do.
 ///
 /// Its own vocabulary rather than the window's wire type: `gui_ipc` exists to
@@ -315,6 +335,30 @@ fn daemon_toggle(
             RequestPayload::ClosePort { name: port.clone() }
         };
         ask(&runtime, &client, payload).map(|_| ())
+    })
+}
+
+/// Show and change the HTTP interface through the daemon.
+///
+/// The state is the daemon's, read on every call rather than cached, because
+/// another surface or the command line can change it while a window is open.
+#[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
+fn daemon_rest(client: &Arc<IpcClient>, runtime: tokio::runtime::Handle) -> RestControlFn {
+    let client = Arc::clone(client);
+    Arc::new(move |request: &RestRequest| {
+        let payload = match request {
+            RestRequest::Status => RequestPayload::RestStatus,
+            RestRequest::Enable { bind, port } => RequestPayload::RestEnable {
+                bind: bind.clone(),
+                port: *port,
+                token: None,
+            },
+            RestRequest::Disable => RequestPayload::RestDisable,
+        };
+        match ask(&runtime, &client, payload)? {
+            ResponsePayload::RestState(state) => Ok(state),
+            _ => Err("unexpected answer from the daemon".to_string()),
+        }
     })
 }
 
@@ -542,7 +586,7 @@ pub fn open_standalone_session(
         runtime: runtime.clone(),
     };
 
-    Ok(crate::monitor::PortMonitorState::new_with_reconfigure(
+    let mut monitor = crate::monitor::PortMonitorState::new_with_reconfigure(
         port.to_string(),
         config.framing_summary(),
         parts.storage,
@@ -553,9 +597,14 @@ pub fn open_standalone_session(
         Some(daemon_reconfigure(port, &parts.client, runtime.clone())),
         Some(daemon_action(port, &parts.client, runtime.clone())),
         Some(config.clone()),
-        Some(daemon_toggle(port, &parts.client, runtime)),
+        Some(daemon_toggle(port, &parts.client, runtime.clone())),
         Some(Arc::clone(&parts.keepalive)),
-    ))
+    );
+    #[cfg(feature = "rest")]
+    {
+        monitor.rest = Some(daemon_rest(&parts.client, runtime));
+    }
+    Ok(monitor)
 }
 
 /// Open a serial port on the daemon and show it in a window.
@@ -609,6 +658,8 @@ pub fn run_monitor_standalone(
         &info,
         Box::new(writer),
         Arc::clone(&parts.keepalive),
+        #[cfg(feature = "rest")]
+        Some(daemon_rest(&parts.client, runtime.clone())),
     );
 
     match result {
@@ -683,6 +734,8 @@ fn run_tui_attached(
         write: Some(Box::new(writer)),
         reconfigure: Some(daemon_reconfigure(port, &parts.client, runtime.clone())),
         transfer: Some(daemon_transfer(port, &parts.client, runtime.clone())),
+        #[cfg(feature = "rest")]
+        rest: Some(daemon_rest(&parts.client, runtime.clone())),
     };
 
     crate::tui::run_tui(port, config, &parts.shared_storage, runtime, context)

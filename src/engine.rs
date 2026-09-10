@@ -44,6 +44,17 @@ pub enum EngineError {
     Param(#[from] serial_params::ParamError),
     #[error("invalid regex: {0}")]
     Regex(#[from] regex::Error),
+    /// The HTTP interface could not be started, with the reason a person
+    /// can act on rather than an io error kind.
+    #[cfg(feature = "rest")]
+    #[error("{0}")]
+    Rest(String),
+    /// A request reached a handler that does not serve it.
+    ///
+    /// Only reachable by grouping arms in the dispatcher, so it describes a
+    /// mistake in this file rather than anything a caller did.
+    #[error("internal dispatch error: {0}")]
+    Internal(String),
     #[error("io error on '{path}': {source}")]
     Io {
         path: String,
@@ -90,6 +101,13 @@ pub struct CommandEngine {
     port_manager: PortManagerHandle,
     state_db: Arc<Mutex<StateDb>>,
     config: Arc<Config>,
+    /// The HTTP interface, shared with every clone of this engine.
+    ///
+    /// One listener per daemon, not one per clone: the engine is cloned into
+    /// each connection handler, and a listener per clone would answer the same
+    /// question differently depending on which port a caller reached.
+    #[cfg(feature = "rest")]
+    rest: Arc<Mutex<crate::rest::RestServer>>,
 }
 
 impl CommandEngine {
@@ -97,16 +115,25 @@ impl CommandEngine {
     ///
     /// The data and archive directories come from the configuration, so there
     /// is no second place where they could disagree.
+    // Not const: with the `rest` feature the constructor builds the shared
+    // listener state. Without it there is nothing to build, and clippy is
+    // right that the function could be const there; making the attribute
+    // conditional would put the feature split in two places.
     #[must_use]
-    pub const fn new(
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(
         port_manager: PortManagerHandle,
         state_db: Arc<Mutex<StateDb>>,
         config: Arc<Config>,
     ) -> Self {
+        #[cfg(feature = "rest")]
+        let rest = Arc::new(Mutex::new(crate::rest::RestServer::new(&config.rest)));
         Self {
             port_manager,
             state_db,
             config,
+            #[cfg(feature = "rest")]
+            rest,
         }
     }
 
@@ -197,43 +224,14 @@ impl CommandEngine {
             } => self.clear(&port, archive_current.unwrap_or(false)).await,
             RequestPayload::GetStats { port } => self.stats(&port).await,
             #[cfg(feature = "esp")]
-            RequestPayload::EspFlash {
-                port,
-                firmware_path,
-                baud,
-            } => {
-                let log = format!("FLASH {firmware_path}");
-                self.esp_operation(&port, Some(log), |port| async move {
-                    crate::esp::flash(&port, &firmware_path, baud).await
-                })
-                .await
-            }
-            #[cfg(feature = "esp")]
-            RequestPayload::EspInfo { port } => {
-                self.esp_operation(&port, None, |port| async move {
-                    crate::esp::board_info(&port).await
-                })
-                .await
-            }
-            #[cfg(feature = "esp")]
-            RequestPayload::EspErase { port } => {
-                self.esp_operation(&port, Some("ERASE FLASH".to_string()), |port| async move {
-                    crate::esp::erase_flash(&port).await
-                })
-                .await
-            }
-            #[cfg(feature = "esp")]
-            RequestPayload::EspWriteBin {
-                port,
-                file_path,
-                address,
-            } => {
-                let log = format!("WRITE-BIN {file_path} @ {address}");
-                self.esp_operation(&port, Some(log), |port| async move {
-                    crate::esp::write_bin(&port, &file_path, &address).await
-                })
-                .await
-            }
+            payload @ (RequestPayload::EspFlash { .. }
+            | RequestPayload::EspInfo { .. }
+            | RequestPayload::EspErase { .. }
+            | RequestPayload::EspWriteBin { .. }) => self.execute_esp(payload).await,
+            #[cfg(feature = "rest")]
+            payload @ (RequestPayload::RestStatus
+            | RequestPayload::RestEnable { .. }
+            | RequestPayload::RestDisable) => self.execute_rest(payload),
             RequestPayload::Shutdown => Ok(ResponsePayload::ShutdownAck),
         }
     }
@@ -809,7 +807,150 @@ impl CommandEngine {
         })
     }
 
+    // ------------------------------------------------------------- rest
+
+    /// Carry out one of the three switch requests.
+    ///
+    /// Grouped into one arm so `execute` stays inside the line budget rather
+    /// than growing a third of its length for a transport that is one listener.
+    #[cfg(feature = "rest")]
+    fn execute_rest(&self, payload: RequestPayload) -> Result<ResponsePayload, EngineError> {
+        match payload {
+            RequestPayload::RestStatus => Ok(ResponsePayload::RestState(self.rest_state())),
+            RequestPayload::RestEnable { bind, port, token } => self.rest_enable(bind, port, token),
+            RequestPayload::RestDisable => Ok(ResponsePayload::RestState(self.rest_disable())),
+            other => Err(EngineError::Internal(format!(
+                "{other:?} is not a switch request"
+            ))),
+        }
+    }
+
+    /// What the daemon reports about its HTTP interface.
+    #[cfg(feature = "rest")]
+    fn rest_state(&self) -> crate::protocol::RestState {
+        self.rest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+    }
+
+    /// Start the HTTP interface, binding before this returns.
+    ///
+    /// The bind is part of answering the request, so a caller learns in the
+    /// same reply whether the port was there. A failure is an error rather
+    /// than a state with a reason, because the caller asked for something and
+    /// did not get it; the reason is also kept, so a surface polling the state
+    /// afterwards still shows why.
+    #[cfg(feature = "rest")]
+    fn rest_enable(
+        &self,
+        bind: Option<String>,
+        port: Option<u16>,
+        token: Option<String>,
+    ) -> Result<ResponsePayload, EngineError> {
+        let mut config = self.config.rest.clone();
+        if let Some(bind) = bind {
+            config.bind = bind;
+        }
+        if let Some(port) = port {
+            config.port = port;
+        }
+        if token.is_some() {
+            config.token = token;
+        }
+
+        let mut server = self
+            .rest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        server
+            .enable(&config)
+            .map(ResponsePayload::RestState)
+            .map_err(EngineError::Rest)
+    }
+
+    /// Stop the HTTP interface.
+    #[cfg(feature = "rest")]
+    fn rest_disable(&self) -> crate::protocol::RestState {
+        self.rest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disable()
+    }
+
+    /// Start the interface if the configuration asks for it.
+    ///
+    /// A failed bind here does not take the daemon with it. The daemon exists
+    /// to hold serial ports, and refusing to start because an HTTP port was
+    /// taken would lose that for a feature the user may not even be using. The
+    /// reason is logged and kept in the state, so the surfaces show it.
+    #[cfg(feature = "rest")]
+    pub fn rest_autostart(&self) {
+        if !self.config.rest.enabled {
+            return;
+        }
+        let config = self.config.rest.clone();
+        let mut server = self
+            .rest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match server.enable(&config) {
+            Ok(state) => tracing::info!(url = %state.url(), "the HTTP interface is listening"),
+            Err(reason) => {
+                tracing::warn!(%reason, "the HTTP interface did not start; the daemon continues");
+            }
+        }
+    }
+
     // ------------------------------------------------------------ esp
+
+    /// Carry out one of the four ESP operations.
+    ///
+    /// Split out of `execute` so the dispatcher stays inside the line budget.
+    /// The four share the release-and-reopen dance in `esp_operation`; what
+    /// differs is the command and the marker written into the buffer.
+    #[cfg(feature = "esp")]
+    async fn execute_esp(&self, payload: RequestPayload) -> Result<ResponsePayload, EngineError> {
+        match payload {
+            RequestPayload::EspFlash {
+                port,
+                firmware_path,
+                baud,
+            } => {
+                let log = format!("FLASH {firmware_path}");
+                self.esp_operation(&port, Some(log), |port| async move {
+                    crate::esp::flash(&port, &firmware_path, baud).await
+                })
+                .await
+            }
+            RequestPayload::EspInfo { port } => {
+                self.esp_operation(&port, None, |port| async move {
+                    crate::esp::board_info(&port).await
+                })
+                .await
+            }
+            RequestPayload::EspErase { port } => {
+                self.esp_operation(&port, Some("ERASE FLASH".to_string()), |port| async move {
+                    crate::esp::erase_flash(&port).await
+                })
+                .await
+            }
+            RequestPayload::EspWriteBin {
+                port,
+                file_path,
+                address,
+            } => {
+                let log = format!("WRITE-BIN {file_path} @ {address}");
+                self.esp_operation(&port, Some(log), |port| async move {
+                    crate::esp::write_bin(&port, &file_path, &address).await
+                })
+                .await
+            }
+            other => Err(EngineError::Internal(format!(
+                "{other:?} is not an ESP operation"
+            ))),
+        }
+    }
 
     /// Run an espflash operation with the port temporarily released.
     ///
@@ -978,6 +1119,30 @@ mod tests {
     use crate::protocol::PortSettings;
     use crate::serial_params::Parity;
     use crate::testutil::mock_serial::mock_serial;
+
+    /// An engine whose HTTP interface is configured but not started.
+    #[cfg(feature = "rest")]
+    fn engine_with_rest(rest: crate::config::RestConfig) -> (CommandEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.global.data_dir = dir.path().to_path_buf();
+        config.global.archive_dir = dir.path().join("archive");
+        config.rest = rest;
+        let pm = PortManagerHandle::new();
+        let state_db = Arc::new(Mutex::new(StateDb::open_memory().unwrap()));
+        let engine = CommandEngine::new(pm, state_db, Arc::new(config));
+        (engine, dir)
+    }
+
+    #[cfg(feature = "rest")]
+    fn rest_config(bind: &str, port: u16, enabled: bool) -> crate::config::RestConfig {
+        crate::config::RestConfig {
+            enabled,
+            bind: bind.to_string(),
+            port,
+            token: None,
+        }
+    }
 
     fn make_test_engine() -> (CommandEngine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -1402,5 +1567,170 @@ mod tests {
         assert_eq!((tr.start_ns, tr.end_ns), (5, i64::MAX));
         let tr = time_range(None, Some(5)).unwrap();
         assert_eq!((tr.start_ns, tr.end_ns), (0, 5));
+    }
+    /// A port another program holds is reported as taken, by number.
+    ///
+    /// Bound for real rather than with a synthetic error, because the point is
+    /// that the engine's answer comes from the operating system refusing the
+    /// bind, not from a message we chose to render.
+    #[cfg(feature = "rest")]
+    #[tokio::test]
+    async fn a_taken_port_is_reported_with_its_number() {
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        let (engine, _dir) = engine_with_rest(rest_config("127.0.0.1", port, false));
+        let refused = engine
+            .execute(RequestPayload::RestEnable {
+                bind: None,
+                port: None,
+                token: None,
+            })
+            .await
+            .expect_err("a port another listener holds cannot be bound");
+
+        let reason = refused.to_string();
+        assert!(reason.contains(&port.to_string()), "{reason}");
+        assert!(reason.contains("in use"), "{reason}");
+
+        // The reason survives in the state, because a surface polls that
+        // rather than the error it did not receive.
+        let ResponsePayload::RestState(state) =
+            engine.execute(RequestPayload::RestStatus).await.unwrap()
+        else {
+            panic!("expected a state");
+        };
+        assert!(!state.listening);
+        assert_eq!(state.reason.as_deref().map(str::to_owned), Some(reason));
+    }
+
+    /// A privileged port says so, and says what to do instead.
+    ///
+    /// Skipped when the bind succeeds, which means the test is running as root
+    /// and has nothing to prove. Asking the operating system is better than
+    /// guessing at a user id.
+    #[cfg(all(feature = "rest", unix))]
+    #[tokio::test]
+    async fn a_privileged_port_names_the_limit() {
+        if std::net::TcpListener::bind("127.0.0.1:443").is_ok() {
+            return;
+        }
+
+        let (engine, _dir) = engine_with_rest(rest_config("127.0.0.1", 443, false));
+        let refused = engine
+            .execute(RequestPayload::RestEnable {
+                bind: None,
+                port: None,
+                token: None,
+            })
+            .await
+            .expect_err("443 needs privileges");
+        let reason = refused.to_string();
+        assert!(reason.contains("443"), "{reason}");
+        assert!(reason.contains("1024"), "{reason}");
+    }
+
+    /// An address no interface holds is reported as such, with the address.
+    ///
+    /// 192.0.2.1 is TEST-NET-1 from RFC 5737, reserved for documentation and
+    /// therefore not configured on any machine that is behaving.
+    #[cfg(feature = "rest")]
+    #[tokio::test]
+    async fn an_address_this_machine_does_not_have_is_reported() {
+        let (engine, _dir) = engine_with_rest(rest_config("192.0.2.1", 0, false));
+        let refused = engine
+            .execute(RequestPayload::RestEnable {
+                bind: None,
+                port: None,
+                token: None,
+            })
+            .await
+            .expect_err("TEST-NET-1 is not an address of this machine");
+        let reason = refused.to_string();
+        assert!(reason.contains("192.0.2.1"), "{reason}");
+    }
+
+    /// The switch starts and stops a real listener, and says which port.
+    #[cfg(feature = "rest")]
+    #[tokio::test]
+    async fn the_switch_starts_and_stops_a_listener() {
+        let (engine, _dir) = engine_with_rest(rest_config("127.0.0.1", 0, false));
+
+        let ResponsePayload::RestState(started) = engine
+            .execute(RequestPayload::RestEnable {
+                bind: None,
+                port: None,
+                token: None,
+            })
+            .await
+            .expect("binding an ephemeral port on loopback")
+        else {
+            panic!("expected a state");
+        };
+        assert!(started.listening);
+        assert!(started.reason.is_none());
+        assert!(!started.token_required, "loopback needs no token");
+
+        let ResponsePayload::RestState(stopped) =
+            engine.execute(RequestPayload::RestDisable).await.unwrap()
+        else {
+            panic!("expected a state");
+        };
+        assert!(!stopped.listening);
+    }
+
+    /// A failed autostart leaves the daemon running.
+    ///
+    /// The daemon exists to hold serial ports. Refusing to start because an
+    /// HTTP port was taken would lose that for a feature the user may not be
+    /// using at all, so the reason is kept and everything else carries on.
+    #[cfg(feature = "rest")]
+    #[tokio::test]
+    async fn a_failed_autostart_does_not_take_the_daemon_with_it() {
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        let (engine, _dir) = engine_with_rest(rest_config("127.0.0.1", port, true));
+        engine.rest_autostart();
+
+        let ResponsePayload::RestState(state) =
+            engine.execute(RequestPayload::RestStatus).await.unwrap()
+        else {
+            panic!("expected a state");
+        };
+        assert!(!state.listening, "the port was taken, so nothing listens");
+        assert!(
+            state.reason.is_some_and(|r| r.contains("in use")),
+            "the reason has to survive for the surfaces to show"
+        );
+
+        // The engine still answers, which is the half that matters.
+        assert_eq!(
+            engine.execute(RequestPayload::Ping).await.unwrap(),
+            ResponsePayload::Pong
+        );
+    }
+
+    /// An override on the request wins over the configuration.
+    #[cfg(feature = "rest")]
+    #[tokio::test]
+    async fn a_request_can_override_the_configured_port() {
+        let (engine, _dir) = engine_with_rest(rest_config("127.0.0.1", 9600, false));
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+
+        let ResponsePayload::RestState(state) = engine
+            .execute(RequestPayload::RestEnable {
+                bind: None,
+                port: Some(port),
+                token: None,
+            })
+            .await
+            .expect("the override binds")
+        else {
+            panic!("expected a state");
+        };
+        assert_eq!(state.port, port, "the override was ignored");
     }
 }

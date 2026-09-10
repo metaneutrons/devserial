@@ -352,6 +352,39 @@ pub enum Command {
         line: LineOptions,
     },
 
+    /// Show or change the HTTP interface of the daemon
+    ///
+    /// Without a flag it reports the state. The interface is off unless asked
+    /// for, listens on 127.0.0.1:9600 by default, and needs a token only for a
+    /// bind that is not loopback.
+    #[cfg(feature = "rest")]
+    Rest {
+        /// Start listening
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Stop listening
+        #[arg(long)]
+        disable: bool,
+
+        /// Port to listen on, overriding the configuration
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Address to bind, overriding the configuration
+        ///
+        /// Anything other than a loopback address needs a token.
+        #[arg(long)]
+        bind: Option<String>,
+
+        /// File holding the bearer token, read for this run
+        ///
+        /// A file rather than an argument, so the token does not land in the
+        /// shell history or in the process list of every other user.
+        #[arg(long, value_name = "FILE")]
+        token_file: Option<std::path::PathBuf>,
+    },
+
     /// Display version, author, license and repository info
     About,
 
@@ -407,6 +440,18 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
             } else {
                 daemon::run_daemon(cli.socket, config_path.as_deref())
             }
+        }
+
+        #[cfg(feature = "rest")]
+        Some(Command::Rest {
+            enable,
+            disable,
+            port,
+            bind,
+            token_file,
+        }) => {
+            let session = handlers::Session::new(cli.socket, config_path)?;
+            handlers::rest_control(&session, enable, disable, bind, port, token_file.as_deref())
         }
 
         Some(Command::About) => {

@@ -302,6 +302,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `clear` | Empty the buffer, optionally archiving it first |
 | `stats` | Connection state and buffer statistics |
 | `flash` | Flash an ESP device through `espflash` |
+| `rest` | Show or change the HTTP interface of the daemon |
 | `daemon` | Run, inspect or stop the daemon |
 | `monitor` / `tui` | Interactive monitors |
 | `mcp` | Run as an MCP server |
@@ -383,6 +384,52 @@ devserial daemon --stop     # stop it
 ```
 
 The daemon owns the open ports, the SQLite writers and the IPC endpoint. It restores the ports that were open when it last stopped.
+
+---
+
+## The HTTP interface
+
+Off unless you ask for it. Once on, it is a fourth transport over the same
+execution core as everything else, so a request behaves the way the equivalent
+CLI command does.
+
+```bash
+devserial rest                       # what is it doing
+devserial rest --enable              # 127.0.0.1:9600 by default
+devserial rest --enable --port 8422
+devserial rest --disable
+```
+
+The switch is in all three surfaces and they show one state, because they all
+ask the daemon: `devserial rest` on the command line, `F7` in the terminal
+monitor, and a **REST** button in the window's toolbar that carries the port in
+its label while the interface is listening.
+
+**Port 9600, on `127.0.0.1`.** The number is the one a serial developer recalls
+without looking it up. `/etc/services` assigns it to `micromuse-ncpw`; that
+collision is known and accepted, which is why a bind failure is a first-class
+case: the three reasons a person can act on are told apart, naming the port or
+the address, and a failed start from the configuration file leaves the daemon
+running with the reason retrievable rather than taking it down.
+
+**No token on loopback.** A request to `127.0.0.1` is served as it stands. That
+is a step down from the IPC socket, which is `0600` and refuses another user, and
+it is a deliberate one: every local process can reach the interface. A bind to
+any other address requires a token and refuses to start without one.
+
+```toml
+[rest]
+enabled = false
+bind    = "127.0.0.1"
+port    = 9600
+# Needed only for a bind that is not loopback. `--token-file` passes one for a
+# single run without putting it in the shell history.
+#token  = "…"
+```
+
+Two routes answer so far, `GET /v1/health` and `GET /v1/version`. The routes
+that read a capture and drive a device follow; the plan for them is
+[`docs/plans/rest-interface.md`](docs/plans/rest-interface.md).
 
 ---
 
@@ -552,8 +599,9 @@ devserial daemon
 |---------|:-------:|----------|
 | `esp` | yes | Flashing, chip info and flash erase through `espflash` |
 | `monitor` | no | The desktop GUI (`egui` and `eframe`) |
+| `rest` | no | The HTTP interface (`axum` and `tower-http`) |
 | `tui` | no | The terminal monitor (`ratatui` and `crossterm`) |
-| `full` | no | `esp`, `monitor` and `tui` together: everything a release carries |
+| `full` | no | `esp`, `monitor`, `rest` and `tui` together: everything a release carries |
 | `testutil` | no | Mock serial ports and generators, for tests |
 
 Released binaries are built with `--no-default-features --features full`, which is everything above except `testutil`. That used to be `--all-features`, which swept the test scaffolding into an artefact that carries a Developer ID signature; the switch keeps it out. Building with fewer features removes the corresponding subcommands and MCP tools; the crate compiles and passes its tests with any combination, including `--no-default-features`.
