@@ -910,8 +910,7 @@ fn render_lines(page: &LinesPage, timestamps: bool) -> String {
     let mut out = format!("[lines {first}-{last} of {} total]\n", page.total_lines);
     for line in &page.lines {
         if timestamps {
-            let ts =
-                chrono::DateTime::from_timestamp_nanos(line.timestamp_ns).format("%H:%M:%S%.3f");
+            let ts = crate::export::format_time_of_day(line.timestamp_ns);
             let _ = writeln!(out, "{ts} {}", line.payload);
         } else {
             out.push_str(&line.payload);
@@ -1431,7 +1430,7 @@ mod tests {
         assert!(out.contains("Exported 3 lines"));
 
         let content = std::fs::read_to_string(&out_path).unwrap();
-        assert!(content.starts_with("line,timestamp,timestamp_ns,payload\n"));
+        assert!(content.starts_with("id,timestamp,timestamp_ns,payload\n"));
     }
 
     #[tokio::test]

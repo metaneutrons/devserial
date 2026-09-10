@@ -1683,7 +1683,7 @@ impl PortMonitorState {
     fn note(&mut self, text: &str) {
         let timestamp_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         self.push_display_line(DisplayLine {
-            timestamp: chrono::Utc::now().format("%H:%M:%S%.3f").to_string(),
+            timestamp: crate::export::now_time_of_day(),
             timestamp_ns,
             payload: text.to_string(),
             is_sent: false,
@@ -1719,9 +1719,7 @@ impl PortMonitorState {
 
             if let Ok(new_lines) = self.storage.read_lines(self.last_id + 1, 500) {
                 for line in &new_lines {
-                    let timestamp = chrono::DateTime::from_timestamp_nanos(line.timestamp_ns)
-                        .format("%H:%M:%S%.3f")
-                        .to_string();
+                    let timestamp = crate::export::format_time_of_day(line.timestamp_ns);
                     self.last_id = line.id;
                     self.push_display_line(DisplayLine {
                         timestamp,
@@ -1742,7 +1740,7 @@ impl PortMonitorState {
             self.show_export_dialog = true;
             if self.export_path.is_empty() {
                 let sanitized_port = crate::paths::sanitize_port_name(&self.port_name);
-                let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let now = crate::export::now_for_filename();
                 self.export_path = format!("devserial_export_{sanitized_port}_{now}.txt");
             }
         }
@@ -1761,7 +1759,7 @@ impl PortMonitorState {
             self.show_export_dialog = !self.show_export_dialog;
             if self.show_export_dialog && self.export_path.is_empty() {
                 let sanitized_port = crate::paths::sanitize_port_name(&self.port_name);
-                let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let now = crate::export::now_for_filename();
                 self.export_path = format!("devserial_export_{sanitized_port}_{now}.txt");
             }
         }
@@ -2833,7 +2831,7 @@ impl PortMonitorState {
                             ExportFormat::Csv => "csv",
                             ExportFormat::Jsonl => "jsonl",
                         };
-                        let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                        let now = crate::export::now_for_filename();
                         self.export_path = format!("devserial_export_{sanitized_port}_{now}.{ext}");
                     }
                 });
@@ -3115,7 +3113,15 @@ impl PortMonitorState {
             ui.separator();
 
             // Group 5: View toggles & Clear/Pause
-            ui.checkbox(&mut self.show_timestamps, "Time");
+            // The zone is named here, once, rather than on every line. A
+            // displayed time is local while an export carries UTC, and a
+            // reader comparing the two would otherwise find an offset and no
+            // explanation.
+            ui.checkbox(&mut self.show_timestamps, "Time")
+                .on_hover_text(format!(
+                    "Show the capture time of each line ({}; an export carries UTC)",
+                    crate::export::DISPLAY_ZONE_NOTE
+                ));
             ui.checkbox(&mut self.hex_view, "Hex");
             ui.separator();
 
@@ -3156,7 +3162,7 @@ impl PortMonitorState {
                 self.show_export_dialog = !self.show_export_dialog;
                 if self.export_path.is_empty() {
                     let sanitized_port = crate::paths::sanitize_port_name(&self.port_name);
-                    let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    let now = crate::export::now_for_filename();
                     self.export_path = format!("devserial_export_{sanitized_port}_{now}.txt");
                 }
             }
@@ -3510,7 +3516,7 @@ impl PortMonitorState {
 
         let timestamp_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         self.push_display_line(DisplayLine {
-            timestamp: chrono::Utc::now().format("%H:%M:%S%.3f").to_string(),
+            timestamp: crate::export::now_time_of_day(),
             timestamp_ns,
             payload: input,
             is_sent: true,

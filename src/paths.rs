@@ -46,7 +46,7 @@ pub fn archive_path(archive_dir: &Path, port: &str, timestamp: &str) -> PathBuf 
 /// Timestamp component used in archive file names.
 #[must_use]
 pub fn archive_timestamp() -> String {
-    chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
+    crate::export::now_for_filename()
 }
 
 /// Platform default data directory, honouring [`ENV_DATA_DIR`].

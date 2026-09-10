@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(lines_exported, 1);
 
         let content = std::fs::read_to_string(&out).unwrap();
-        assert!(content.starts_with("line,timestamp,timestamp_ns,payload\n"));
+        assert!(content.starts_with("id,timestamp,timestamp_ns,payload\n"));
         assert!(content.contains("\"hello\""));
     }
 

@@ -271,7 +271,7 @@ impl AppState {
     /// recognisable next to one made in the other.
     fn suggested_export_path(&self) -> String {
         let port = crate::paths::sanitize_port_name(&self.port_name);
-        let now = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let now = crate::export::now_for_filename();
         // The extension is appended, not applied through
         // `with_format_extension`. That function replaces everything after the
         // last dot, and a sanitised port name carries one: `/dev/cu.usbmodem1`
@@ -383,7 +383,7 @@ impl AppState {
     }
 
     fn note(&mut self, storage: &Arc<std::sync::Mutex<SqliteStorage>>, text: &str) {
-        let ts = chrono::Utc::now().format("%H:%M:%S%.3f").to_string();
+        let ts = crate::export::now_time_of_day();
         self.push_line(ts, text.to_string());
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let guard = storage
@@ -421,9 +421,7 @@ fn run_app(
             guard.read_lines(state.last_id + 1, FETCH_BATCH).ok()
         };
         for line in fetched.into_iter().flatten() {
-            let ts = chrono::DateTime::from_timestamp_nanos(line.timestamp_ns)
-                .format("%H:%M:%S%.3f")
-                .to_string();
+            let ts = crate::export::format_time_of_day(line.timestamp_ns);
             state.last_id = line.id;
             state.push_line(ts, line.payload);
         }
@@ -1093,8 +1091,10 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
     let (prompt, title): (&str, String) = match state.input_mode {
         InputMode::Normal => (
             "> ",
-            " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time | Ctrl+H hex | F1 about | Ctrl+C quit "
-                .to_string(),
+            format!(
+                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F1 about | Ctrl+C quit ",
+                crate::export::DISPLAY_ZONE_NOTE
+            ),
         ),
         InputMode::SendFile => ("Send File Path: ", transfer_title(state, "transmit")),
         InputMode::RecvFile => ("Recv Output Dir: ", transfer_title(state, "receive into")),
@@ -1107,7 +1107,10 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
             "Filter: ",
             " Show only lines containing this text (Enter to apply, Esc to clear) ".to_string(),
         ),
-        InputMode::Signals => ("", " d toggles DTR, r toggles RTS (Esc to close) ".to_string()),
+        InputMode::Signals => (
+            "",
+            " d toggles DTR, r toggles RTS (Esc to close) ".to_string(),
+        ),
         InputMode::Macros => (
             "",
             " Press a number to run that macro (Esc to close) ".to_string(),
