@@ -90,6 +90,26 @@ handing the value back as a filter.
 export calls it `line`, and the cursor is `next_after_id`. One spelling for all
 transports, which renames the export's field.
 
+**Three renderings from one place, and a stated time zone.** Measured on
+0.1.14: the display format `%H:%M:%S%.3f` is written out seven times across
+five files, the filename format `%Y%m%d_%H%M%S` six times, and every timestamp
+a person reads on screen is UTC without saying so, so a reader in Berlin sees
+21:26 for something that happened at 23:26 local. The only place that names a
+zone is `devserial stats`.
+
+The renderings are not unified into one string, because they have different
+readers. A record needs the date and the zone and pays nothing for length; a
+screen line would spend thirty of eighty columns on a date that does not change
+during a session; the MCP text output would spend tokens on the same. What is
+unified is where they live, and the zone becomes deliberate: **a timestamp a
+person reads is local time, a timestamp in a record is UTC and carries `Z`.**
+
+The cost of that split is a reader comparing a screen line with an exported
+line and finding an offset. It is accepted because the alternative, UTC on
+screen, asks the person at the desk to convert while looking at a device next
+to them. It is mitigated by naming the zone once where it can be seen rather
+than on every line.
+
 **`RestServer` joins the capability register.** `surface.rs` names every
 capability once and a test fails when the window and the terminal differ. Its
 definition widens from what a person does with an open port to include controls
@@ -133,19 +153,34 @@ Dependencies: none
 - M1-A6: Clippy, tests and `cargo doc` pass on the four feature sets the CI
   matrix covers.
 
-### M2: one export format at full precision
+### M2: one timestamp story
 
 Execution: <https://github.com/metaneutrons/devserial/issues/64>
 Dependencies: M1 is not required; M2 may run in parallel or first.
 
-- M2-A1: `export::format_timestamp` renders nine fractional digits. Verified by a
-  unit test on a timestamp whose sub-millisecond digits are non-zero.
+- M2-A1: `export::format_timestamp` renders nine fractional digits in UTC with
+  a `Z`. Verified by a unit test on a timestamp whose sub-millisecond digits are
+  non-zero.
 - M2-A2: The `csv` header and the `jsonl` object name the line id `id`, and
   `jsonl` writes `timestamp_ns` as a string. Verified by tests on the rendered
   output of both formats.
-- M2-A3: Every place that consumed the old field name or the millisecond form is
-  updated, established by a search for the old names rather than by inspection.
-- M2-A4: The change is stated as a breaking change to the export format in the
+- M2-A3: `export.rs` holds one function per rendering: the record form, the
+  time-of-day form a person reads, and the compact form a filename carries. No
+  `%H:%M:%S` or `%Y%m%d_%H%M%S` literal survives outside that module. Verified
+  by a test that searches the module sources, in the manner `surface.rs`
+  already uses, so a new inline copy fails rather than passing unnoticed.
+- M2-A4: Every timestamp a person reads, in the window, in the terminal, in
+  `devserial read` and in the MCP text output, is local time. Every timestamp in
+  a record is UTC. Verified by tests on the two functions and by the search in
+  M2-A3, which is what establishes that the surfaces call the local one.
+- M2-A5: The zone is stated once where a person can see it rather than on every
+  line, and `devserial stats` keeps saying UTC because that is what it prints.
+- M2-A6: Export and archive filenames use the same rendering and the same zone.
+  They are two names for the same moment today and differ by the local offset.
+- M2-A7: Every place that consumed the old field name, the millisecond form or
+  an inline literal is updated, established by the search in M2-A3 rather than
+  by inspection.
+- M2-A8: The change is stated as a breaking change to the export format in the
   pull request subject, so it reaches the release notes as one.
 
 ### M3: the server and its switch
@@ -250,12 +285,13 @@ the reason for its own acceptance criteria on the monitor entry points. M2
 changes an output format, and rolling it back would break anyone who adapted in
 the meantime, so it is announced rather than reversible.
 
-**Risks.** Two are worth naming. Port 9600 is registered, so a collision is
-possible; M3-A3 and M3-A4 are what make it survivable rather than a defect. And
-the loopback decision leaves any local process able to drive the hardware, which
-is accepted; M4-A6 is what keeps a web page in the user's own browser from
-becoming one of those processes, and it is a required criterion rather than a
-nicety.
+**Risks.** Three are worth naming. Port 9600 is registered, so a collision is
+possible; M3-A3 and M3-A4 are what make it survivable rather than a defect. The
+loopback decision leaves any local process able to drive the hardware, which is
+accepted; M4-A6 is what keeps a web page in the user's own browser from becoming
+one of those processes, and it is a required criterion rather than a nicety. And
+M2 puts two time zones in one program, local on screen and UTC in records; the
+mitigation is M2-A5, naming the zone where it can be seen.
 
 **Verification cost.** Focused tests during iteration on the native target. The
 four-feature-set matrix across Linux, macOS and Windows runs per pull request
@@ -265,6 +301,22 @@ not a forecast; compile-time impact was not measured and is not claimed.
 
 ## Decision changes
 
-None yet. A change to a criterion or to the scope is recorded here with its
-date and the pull request that made it, and a milestone claiming acceptance
-links the exact revision of this file it was accepted against.
+**10 September 2026, M2 widened from the export format to the whole timestamp
+story.** Preparing M2 turned up three things beyond the precision of the export:
+the display format is written out seven times across five files and the filename
+format six times, and every timestamp a person reads is UTC without saying so.
+Splitting that from M2 would mean touching `format_timestamp` twice and
+publishing two breaking changes to the same output format in two releases, which
+is worse for anyone parsing it than one. M2-A1 and M2-A2 are unchanged; A3 to
+A7 are new; the old A3 and A4 became A7 and A8. The zone decision is recorded
+under [Design and decisions](#design-and-decisions).
+
+This does widen a milestone rather than adding one, and it puts a format
+change, a consolidation and a correction in one delivery, against the rule that
+a pull request carries changes of one kind. The exception is deliberate: all
+three touch the same function, and the release notes need one entry for the
+break rather than two.
+
+A change to a criterion or to the scope is recorded here with its date and the
+pull request that made it, and a milestone claiming acceptance links the exact
+revision of this file it was accepted against.
