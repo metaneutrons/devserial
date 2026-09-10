@@ -31,7 +31,7 @@ Every line is written with a nanosecond timestamp. Four front ends read from the
 | GUI monitor | interactive work on the desktop | `devserial`, or `devserial monitor PORT` |
 | TUI monitor | interactive work over SSH | `devserial tui PORT` |
 
-**Who holds the port depends on how you start it.** The CLI and the MCP server talk to a background daemon, which keeps the port open after the command returns and shares one execution core, so a command behaves identically whichever of them issued it. `devserial monitor PORT` and `devserial tui PORT` open the port themselves and run no daemon; they carry out the same actions on their own path, mirroring what the daemon does. Either way the capture lands in the same database for that port, so a monitor window and a `devserial read` see the same lines.
+**The daemon holds every port.** A serial port can be opened once, so there is one holder and everything else talks to it. `devserial monitor PORT` and `devserial tui PORT` start the daemon if it is not running, ask it to open the line, then read the capture and send their actions back to it, exactly as the CLI and the MCP server do. One consequence worth knowing: closing a monitor does not stop the capture. The daemon keeps reading, and opening the monitor again continues the same log. `devserial close PORT` is what releases the hardware.
 
 Unplugging a device does not lose the log, and reconnecting resumes into the same buffer.
 
@@ -213,7 +213,7 @@ devserial monitor /dev/cu.usbmodem1101 --baud 115200 --parity none --data-bits 8
 
 Every device is offered once. On macOS a port exists twice in `/dev`, as a callout node (`cu.`) and a dial-in node (`tty.`); the callout node is the correct one for outgoing use, so it is the one you get.
 
-**Windows and sessions.** All sessions live in one process with one Dock icon. A second `devserial monitor` invocation opens a window in the running instance instead of starting a second application. Ports already shown are marked and cannot be opened twice.
+**Windows and sessions.** All sessions live in one process with one Dock icon. A second `devserial monitor` invocation opens a window in the running instance instead of starting a second application. Ports already shown are marked and cannot be opened twice. A port the daemon already holds keeps its line settings when a monitor attaches to it; use the settings dialog or `devserial open` to change them.
 
 **Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS toggles, timestamp and hex views, pause and auto-follow, clearing the view without touching the capture, and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
 
@@ -583,7 +583,7 @@ cargo check --no-default-features --features full
 
 Continuous integration runs lints, tests and documentation on Linux, macOS and Windows across four feature sets, plus a job that checks the declared minimum supported Rust version.
 
-Architecture in one paragraph: `engine.rs` is the only place a daemon-side operation is carried out. `protocol.rs` holds the vocabulary of requests and responses. The CLI, the IPC daemon and the MCP server are transports over that vocabulary and contain no operation logic, which is what keeps their behaviour identical. `port_manager.rs` owns those ports, `storage.rs` the SQLite layer, `transport.rs` the platform-specific IPC. `standalone.rs` is the exception and says so in its own header: a monitor started on a port owns that port itself, so it carries out BREAK, the control lines and the macros on a path of its own that mirrors the engine. `surface.rs` keeps the window and the terminal from drifting apart.
+Architecture in one paragraph: `engine.rs` is the only place an operation is carried out. `protocol.rs` holds the vocabulary of requests and responses. The CLI, the IPC daemon, the MCP server and both monitors are transports over that vocabulary and contain no operation logic, which is what keeps their behaviour identical. `port_manager.rs` owns the open ports, `storage.rs` the SQLite layer, `transport.rs` the platform-specific IPC. `standalone.rs` turns an IPC endpoint into the writer and the three closures a surface needs, so neither the window nor the terminal knows it is not holding the port. `surface.rs` keeps the window and the terminal from drifting apart.
 
 ---
 

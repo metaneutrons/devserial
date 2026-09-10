@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
-//! Standalone mode: GUI or TUI with a directly owned serial port.
+//! Attached mode: a window or a terminal on a port the daemon holds.
 //!
-//! No daemon and no MCP server are involved. The capture database still lives
-//! in the configured data directory, so a port opened here and the same port
-//! opened through the daemon share one buffer.
+//! A serial port can be opened once. While a monitor held its own port, that
+//! port could not also be a daemon port, so the CLI, the MCP server and
+//! anything else reaching the daemon could not see it. Both monitors therefore
+//! ask the daemon to open the line, then read the capture it writes and send
+//! every action back to it.
+//!
+//! What that buys, beyond one kind of port: the capture survives the window.
+//! Closing a monitor used to stop the reader that filled the buffer; now the
+//! daemon keeps reading, and reopening the monitor continues the same log.
+//!
+//! The surfaces do not know any of this. They take a writer, three closures
+//! and a watch on the link state, and this module produces all of them from an
+//! IPC endpoint instead of from an owned file descriptor.
 
 #[cfg(any(feature = "monitor", feature = "tui"))]
 use std::path::Path;
@@ -17,83 +27,81 @@ use crate::cli::CliError;
 #[cfg(any(feature = "monitor", feature = "tui"))]
 use crate::config::PortConfig;
 #[cfg(any(feature = "monitor", feature = "tui"))]
+use crate::ipc::IpcClient;
+#[cfg(any(feature = "monitor", feature = "tui"))]
+use crate::protocol::{RequestPayload, ResponsePayload};
+#[cfg(any(feature = "monitor", feature = "tui"))]
+use crate::reader::ConnectionState;
+#[cfg(any(feature = "monitor", feature = "tui"))]
 use crate::storage::SqliteStorage;
 
-/// Resolve the data directory for standalone mode.
+/// How often the link state is read back from the daemon.
 ///
-/// Reads the same configuration the daemon reads, so both write their capture
-/// databases to the same place.
+/// The reader lives in the daemon now, so a surface cannot watch it directly.
+/// Half a second is below what a person notices on an indicator and far above
+/// what the request costs on a local socket.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+const LINK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Resolve the data directory for an attached session.
+///
+/// Reads the same configuration the daemon reads, so both agree on where the
+/// capture database for a port lives.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 fn resolve_data_dir(config_path: Option<&Path>) -> std::path::PathBuf {
     match crate::config::load_config(config_path) {
         Ok(config) => config.global.data_dir,
         Err(e) => {
-            tracing::warn!(error = %e, "using the default data directory");
+            tracing::warn!(error = %e, "could not read the configuration, using the default data directory");
             crate::paths::default_data_dir()
         }
     }
 }
 
-/// Data directory for sessions opened from inside the GUI.
+/// Data directory for windows opened from inside a running GUI.
 #[cfg(feature = "monitor")]
 pub(crate) fn gui_data_dir() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| resolve_data_dir(None)).clone()
 }
 
-/// Keeps the runtime and the reader task of a standalone session alive.
-///
-/// Previously the reader was kept running by an endless `sleep` loop and the
-/// runtime was leaked with `std::mem::forget`, which meant no shutdown ever
-/// flushed pending writes.
+/// Keeps the runtime and the link watch of an attached session alive.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 pub struct SessionKeepalive {
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
-    reader: Mutex<Option<crate::reader::PortReaderHandle>>,
+    link: tokio::sync::watch::Receiver<ConnectionState>,
+    poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[cfg(any(feature = "monitor", feature = "tui"))]
 impl SessionKeepalive {
-    fn new(runtime: tokio::runtime::Runtime, reader: crate::reader::PortReaderHandle) -> Arc<Self> {
+    fn new(
+        runtime: tokio::runtime::Runtime,
+        link: tokio::sync::watch::Receiver<ConnectionState>,
+        poller: tokio::task::JoinHandle<()>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             runtime: Mutex::new(Some(runtime)),
-            reader: Mutex::new(Some(reader)),
+            link,
+            poller: Mutex::new(Some(poller)),
         })
     }
 
-    /// Replace the reader after a reconnect, shutting the previous one down.
-    fn replace_reader(&self, reader: Option<crate::reader::PortReaderHandle>) {
-        let mut guard = self
-            .reader
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = reader;
-    }
-
-    /// What the reader currently reports about the hardware.
+    /// What the daemon last reported about the hardware.
     ///
-    /// The windows used to show whether the user had pressed Disconnect, which
-    /// is not the same question. A device that is unplugged leaves that flag
-    /// untouched, so the indicator went on claiming a connection that had been
-    /// gone for minutes.
-    pub fn connection_state(&self) -> Option<crate::reader::ConnectionState> {
-        self.reader
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(crate::reader::PortReaderHandle::state)
+    /// The surfaces show whether the device is there, which is not the same
+    /// question as whether the user pressed Disconnect. A device that is
+    /// unplugged leaves that flag untouched.
+    pub fn connection_state(&self) -> Option<ConnectionState> {
+        Some(self.link.borrow().clone())
     }
 
-    /// Watch on what the reader reports, for a surface that shows it.
-    pub fn link(&self) -> Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>> {
-        self.reader
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|reader| reader.state_rx.clone())
+    /// Watch on the link state, for a surface that shows it.
+    pub fn link(&self) -> Option<tokio::sync::watch::Receiver<ConnectionState>> {
+        Some(self.link.clone())
     }
 
-    /// Runtime handle for blocking calls from the GUI thread.
+    /// Runtime handle for blocking calls from the interface thread.
     ///
     /// The monitor window also uses it to run espflash while the port is
     /// released, so it is visible outside this module.
@@ -111,8 +119,16 @@ impl SessionKeepalive {
 #[cfg(any(feature = "monitor", feature = "tui"))]
 impl Drop for SessionKeepalive {
     fn drop(&mut self) {
-        // Dropping the reader closes its shutdown channel, which ends the task.
-        self.replace_reader(None);
+        // The port stays open on the daemon on purpose. Only this process's
+        // view of it ends here.
+        let poller = self
+            .poller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(poller) = poller {
+            poller.abort();
+        }
         let taken = {
             let mut guard = self
                 .runtime
@@ -121,79 +137,55 @@ impl Drop for SessionKeepalive {
             guard.take()
         };
         if let Some(runtime) = taken {
-            // Shutting down in the background keeps the GUI thread responsive.
+            // Shutting down in the background keeps the interface responsive.
             runtime.shutdown_background();
         }
     }
 }
 
-/// Blocking writer that forwards GUI input to the serial port.
-#[cfg(feature = "monitor")]
+/// Blocking writer that forwards input to the port the daemon holds.
+#[cfg(any(feature = "monitor", feature = "tui"))]
 #[derive(Clone)]
-pub struct TokioSerialWriter {
-    handle: Arc<tokio::sync::Mutex<Option<crate::port_manager::SerialPortHandle>>>,
+pub struct DaemonWriter {
+    port: String,
+    client: Arc<IpcClient>,
     runtime: tokio::runtime::Handle,
 }
 
-#[cfg(feature = "monitor")]
-impl std::io::Write for TokioSerialWriter {
+#[cfg(any(feature = "monitor", feature = "tui"))]
+impl std::io::Write for DaemonWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let handle = Arc::clone(&self.handle);
-        let data = buf.to_vec();
+        // The wire carries a string and a flag. Text goes as text so the
+        // daemon's log of it stays readable; anything that is not UTF-8 goes as
+        // hex rather than being replaced or refused.
+        let (data, is_hex) = std::str::from_utf8(buf).map_or_else(
+            |_| (crate::hex::encode(buf), true),
+            |text| (text.to_string(), false),
+        );
+        let payload = RequestPayload::WriteData {
+            port: self.port.clone(),
+            data,
+            is_hex,
+        };
+        let client = Arc::clone(&self.client);
+        let written = buf.len();
         self.runtime.block_on(async move {
-            let guard = handle.lock().await;
-            let port = match guard.as_ref() {
-                Some(port) => Arc::clone(port),
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        "serial port is disconnected",
-                    ));
-                }
-            };
-            drop(guard);
-            port.lock().await.write_all(&data).await?;
-            Ok(data.len())
+            match client.send(payload).await {
+                Ok(ResponsePayload::WriteSuccess { .. }) => Ok(written),
+                Ok(_) => Err(std::io::Error::other("unexpected answer from the daemon")),
+                Err(e) => Err(std::io::Error::other(e.to_string())),
+            }
         })
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let handle = Arc::clone(&self.handle);
-        self.runtime.block_on(async move {
-            let guard = handle.lock().await;
-            match guard.as_ref() {
-                Some(port) => port.lock().await.flush().await,
-                None => Ok(()),
-            }
-        })
+        // The daemon writes through before it answers, so there is nothing
+        // buffered on this side to push.
+        Ok(())
     }
 }
 
-#[cfg(feature = "monitor")]
-impl TokioSerialWriter {
-    /// Reconfigure the serial port in place.
-    ///
-    /// # Errors
-    /// Returns an error if reconfiguring fails.
-    pub fn reconfigure(&self, config: &PortConfig) -> Result<(), String> {
-        let handle = Arc::clone(&self.handle);
-        let config = config.clone();
-        self.runtime.block_on(async move {
-            let guard = handle.lock().await;
-            match guard.as_ref() {
-                Some(port) => {
-                    let mut port = port.lock().await;
-                    crate::port_manager::reconfigure_serial_port(&mut port, &config)
-                        .map_err(|e| format!("failed to reconfigure serial port: {e}"))
-                }
-                None => Err("serial port is disconnected".to_string()),
-            }
-        })
-    }
-}
-
-/// Everything one standalone session owns.
+/// Everything one attached session owns.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 struct SessionParts {
     /// The window hands this to its monitor state; the terminal reads through
@@ -201,20 +193,19 @@ struct SessionParts {
     #[cfg(feature = "monitor")]
     storage: SqliteStorage,
     shared_storage: Arc<Mutex<SqliteStorage>>,
-    writer_slot: Arc<tokio::sync::Mutex<Option<crate::port_manager::SerialPortHandle>>>,
+    client: Arc<IpcClient>,
     keepalive: Arc<SessionKeepalive>,
     history: Vec<String>,
 }
 
-/// Acts on a port this process owns.
+/// Changes the line settings of an open port.
 ///
-/// The graphical window forwarded Break, DTR, RTS and macros over stdout to
-/// the process that held the port. A window that holds its own port has no
-/// such counterpart, so `send_event` answered "this window owns the port and
-/// handles actions directly" and the four controls did nothing at all. The
-/// terminal interface never had them.
-///
-/// This closure is that missing counterpart, and both surfaces use it.
+/// Shared by both surfaces, so it lives here rather than with the window; the
+/// terminal reconfigured its own port handle and had no such type.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+pub type ReconfigureFn = Arc<dyn Fn(&PortConfig) -> Result<(), String> + Send + Sync>;
+
+/// Acts on the port the daemon holds.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 pub type DirectActionFn = Arc<dyn Fn(&PortAction) -> Result<(), String> + Send + Sync>;
 
@@ -225,6 +216,17 @@ pub type DirectActionFn = Arc<dyn Fn(&PortAction) -> Result<(), String> + Send +
 /// meant `--features tui` alone no longer compiled.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 pub type ToggleConnectFn = Arc<dyn Fn(bool, &PortConfig) -> Result<(), String> + Send + Sync>;
+
+/// Sends or receives a file over a modem protocol.
+///
+/// The daemon reads and writes the file itself, so a surface passes a path
+/// rather than bytes. The terminal used to read the file, run the protocol on
+/// its own port handle and write the result; with the port on the daemon there
+/// is no handle to run a protocol on, and the daemon already has the code.
+#[cfg(feature = "tui")]
+pub type TransferFn = Arc<
+    dyn Fn(bool, &str, crate::modem::FileTransferProtocol) -> Result<String, String> + Send + Sync,
+>;
 
 /// Something a surface asks the hardware to do.
 ///
@@ -245,77 +247,136 @@ pub enum PortAction {
     Macro { name: String },
 }
 
-/// Build the closure that carries out hardware actions on an owned port.
 #[cfg(any(feature = "monitor", feature = "tui"))]
-fn direct_action(
+impl PortAction {
+    /// The request that carries out this action.
+    fn payload(&self, port: &str) -> RequestPayload {
+        match self {
+            Self::Break { duration_ms } => RequestPayload::SendBreak {
+                port: port.to_string(),
+                duration_ms: *duration_ms,
+            },
+            Self::Signal { dtr, rts } => RequestPayload::SetSignal {
+                port: port.to_string(),
+                dtr: *dtr,
+                rts: *rts,
+            },
+            Self::Macro { name } => RequestPayload::ExecuteMacro {
+                port: port.to_string(),
+                macro_name: name.clone(),
+            },
+        }
+    }
+}
+
+/// Send one request and reduce the answer to success or a readable reason.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn ask(
+    runtime: &tokio::runtime::Handle,
+    client: &Arc<IpcClient>,
+    payload: RequestPayload,
+) -> Result<ResponsePayload, String> {
+    let client = Arc::clone(client);
+    runtime.block_on(async move { client.send(payload).await.map_err(|e| e.to_string()) })
+}
+
+/// Build the closure that carries out hardware actions.
+///
+/// The macro table is not read here. The daemon resolves a macro name against
+/// the configuration it loaded, which is what makes a macro behave the same
+/// whether it was started from a window, a terminal or the command line.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn daemon_action(
+    port: &str,
+    client: &Arc<IpcClient>,
     runtime: tokio::runtime::Handle,
-    slot: Arc<tokio::sync::Mutex<Option<crate::port_manager::SerialPortHandle>>>,
-    config_path: Option<&Path>,
 ) -> DirectActionFn {
-    // The macro table is read once. Re-reading it per keystroke would let a
-    // half-written configuration file break an action mid-session.
-    let macros = crate::config::load_config(config_path).unwrap_or_default();
+    let port = port.to_string();
+    let client = Arc::clone(client);
+    Arc::new(move |action| ask(&runtime, &client, action.payload(&port)).map(|_| ()))
+}
 
-    Arc::new(move |action| {
-        // The macro is resolved before the port is taken, so an unknown name
-        // never leaves a half-run sequence behind.
-        let steps = match action {
-            PortAction::Break { duration_ms } => {
-                let ms = duration_ms.unwrap_or(crate::serial_params::DEFAULT_BREAK_MS);
-                vec![BreakOrSteps::Break(ms)]
+/// Release the port or take it back.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn daemon_toggle(
+    port: &str,
+    client: &Arc<IpcClient>,
+    runtime: tokio::runtime::Handle,
+) -> ToggleConnectFn {
+    let port = port.to_string();
+    let client = Arc::clone(client);
+    Arc::new(move |connect: bool, config: &PortConfig| {
+        let payload = if connect {
+            RequestPayload::OpenPort {
+                name: port.clone(),
+                settings: config_settings(config),
             }
-            PortAction::Signal { dtr, rts } => {
-                let mut steps = Vec::new();
-                if let Some(value) = *dtr {
-                    steps.push(BreakOrSteps::Step(crate::config::MacroStep::Dtr { value }));
-                }
-                if let Some(value) = *rts {
-                    steps.push(BreakOrSteps::Step(crate::config::MacroStep::Rts { value }));
-                }
-                steps
-            }
-            PortAction::Macro { name } => macros
-                .macro_steps(name)
-                .ok_or_else(|| {
-                    format!(
-                        "unknown macro '{name}'; available: {}",
-                        macros.available_macros().join(", ")
-                    )
-                })?
-                .into_iter()
-                .map(BreakOrSteps::Step)
-                .collect(),
+        } else {
+            RequestPayload::ClosePort { name: port.clone() }
         };
+        ask(&runtime, &client, payload).map(|_| ())
+    })
+}
 
-        let slot = Arc::clone(&slot);
-        runtime.block_on(async move {
-            // Resolved per call rather than captured, so the action follows
-            // the port across a reconnect and says so plainly when the link
-            // is down instead of acting on a stale handle.
-            let port = slot
-                .lock()
-                .await
-                .clone()
-                .ok_or_else(|| "the port is not connected".to_string())?;
-            for item in steps {
-                match item {
-                    BreakOrSteps::Break(ms) => {
-                        let guard = port.lock().await;
-                        guard
-                            .set_break(true)
-                            .map_err(|e| format!("BREAK error: {e}"))?;
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                        guard
-                            .set_break(false)
-                            .map_err(|e| format!("BREAK error: {e}"))?;
-                    }
-                    BreakOrSteps::Step(step) => {
-                        run_macro_steps(&port, std::slice::from_ref(&step)).await?;
-                    }
+/// Send or receive a file through the daemon.
+#[cfg(feature = "tui")]
+fn daemon_transfer(
+    port: &str,
+    client: &Arc<IpcClient>,
+    runtime: tokio::runtime::Handle,
+) -> TransferFn {
+    let port = port.to_string();
+    let client = Arc::clone(client);
+    Arc::new(
+        move |send: bool, path: &str, protocol: crate::modem::FileTransferProtocol| {
+            let payload = if send {
+                RequestPayload::SendFile {
+                    port: port.clone(),
+                    file_path: path.to_string(),
+                    protocol,
                 }
+            } else {
+                RequestPayload::ReceiveFile {
+                    port: port.clone(),
+                    output_dir: path.to_string(),
+                    protocol,
+                }
+            };
+            match ask(&runtime, &client, payload)? {
+                ResponsePayload::TransferSuccess {
+                    bytes_transferred,
+                    file_name,
+                    path,
+                    ..
+                } => Ok(path.map_or_else(
+                    || format!("{bytes_transferred} bytes, {file_name}"),
+                    |path| format!("{bytes_transferred} bytes, {path}"),
+                )),
+                _ => Err("unexpected answer from the daemon".to_string()),
             }
-            Ok(())
-        })
+        },
+    )
+}
+
+/// Change the line settings of the port the daemon holds.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+fn daemon_reconfigure(
+    port: &str,
+    client: &Arc<IpcClient>,
+    runtime: tokio::runtime::Handle,
+) -> ReconfigureFn {
+    let port = port.to_string();
+    let client = Arc::clone(client);
+    Arc::new(move |config: &PortConfig| {
+        ask(
+            &runtime,
+            &client,
+            RequestPayload::ReconfigurePort {
+                name: port.clone(),
+                settings: config_settings(config),
+            },
+        )
+        .map(|_| ())
     })
 }
 
@@ -330,136 +391,116 @@ fn macro_names(config_path: Option<&Path>) -> Vec<String> {
         .available_macros()
 }
 
-/// A macro step or a BREAK, which is not expressible as a step.
-#[cfg(any(feature = "monitor", feature = "tui"))]
-enum BreakOrSteps {
-    Break(u64),
-    Step(crate::config::MacroStep),
-}
-
-/// Carry out one macro, aborting at the first step that fails.
+/// Publish what the daemon reports about the link into a watch.
 ///
-/// Mirrors what the daemon does, so a macro behaves the same whether it was
-/// started from a window, a terminal or the command line.
+/// A surface that shows the link state watches a channel. With the reader in
+/// the daemon there is nothing local to watch, so this task asks and publishes.
+/// A failed request is not a disconnected device: the daemon may be busy or
+/// gone, and reporting the last known state is closer to the truth than
+/// claiming the cable was pulled.
 #[cfg(any(feature = "monitor", feature = "tui"))]
-async fn run_macro_steps(
-    port: &crate::port_manager::SerialPortHandle,
-    steps: &[crate::config::MacroStep],
-) -> Result<(), String> {
-    use crate::config::MacroStep;
-
-    for step in steps {
-        match step {
-            MacroStep::Dtr { value } => port
-                .lock()
-                .await
-                .set_dtr(*value)
-                .map_err(|e| format!("DTR error: {e}"))?,
-            MacroStep::Rts { value } => port
-                .lock()
-                .await
-                .set_rts(*value)
-                .map_err(|e| format!("RTS error: {e}"))?,
-            MacroStep::Delay { ms } => {
-                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
-            }
-            MacroStep::Write { value } => {
-                // An unreadable step aborts the macro rather than silently
-                // sending nothing, as it does in the daemon.
-                let bytes = if crate::hex::has_prefix(value) {
-                    crate::hex::decode(value).map_err(|e| format!("hex error: {e}"))?
-                } else {
-                    value.as_bytes().to_vec()
-                };
-                port.lock()
-                    .await
-                    .write_all(&bytes)
-                    .await
-                    .map_err(|e| format!("write error: {e}"))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Release the port and take it back, for a surface that offers the choice.
-///
-/// Releasing stops the reader and empties the writer slot; taking it back
-/// reopens the port and starts a fresh reader on it. Both surfaces need this,
-/// so it is built once from the session rather than written out at each caller.
-#[cfg(any(feature = "monitor", feature = "tui"))]
-fn connect_toggle(port: &str, parts: &SessionParts) -> ToggleConnectFn {
+fn spawn_link_poller(
+    port: &str,
+    client: &Arc<IpcClient>,
+    runtime: &tokio::runtime::Handle,
+    initial: ConnectionState,
+) -> (
+    tokio::sync::watch::Receiver<ConnectionState>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::watch::channel(initial);
     let port = port.to_string();
-    let slot = Arc::clone(&parts.writer_slot);
-    let storage = Arc::clone(&parts.shared_storage);
-    let keepalive = Arc::clone(&parts.keepalive);
-
-    Arc::new(move |connect: bool, config: &PortConfig| {
-        let runtime = keepalive
-            .handle()
-            .ok_or_else(|| "session runtime is gone".to_string())?;
-        if !connect {
-            keepalive.replace_reader(None);
-            runtime.block_on(async {
-                *slot.lock().await = None;
-            });
-            return Ok(());
+    let client = Arc::clone(client);
+    let poller = runtime.spawn(async move {
+        let mut ticker = tokio::time::interval(LINK_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let payload = RequestPayload::GetStatus { port: port.clone() };
+            if let Ok(ResponsePayload::Status { state, .. }) = client.send(payload).await {
+                tx.send_if_modified(|current| {
+                    if *current == state {
+                        false
+                    } else {
+                        *current = state;
+                        true
+                    }
+                });
+            }
+            if tx.is_closed() {
+                return;
+            }
         }
-
-        let (handle, reader) = {
-            let _guard = runtime.enter();
-            let serial = crate::port_manager::open_serial_port_raw(&port, config)
-                .map_err(|e| format!("failed to open port '{port}': {e}"))?;
-            let shared = crate::port_manager::SharedSerialPort::new(serial);
-            (
-                shared.handle(),
-                spawn_reconnecting_reader(&port, config, &storage, shared),
-            )
-        };
-        runtime.block_on(async {
-            *slot.lock().await = Some(handle);
-        });
-        keepalive.replace_reader(Some(reader));
-        Ok(())
-    })
+    });
+    (rx, poller)
 }
 
-/// Start a reader that can actually come back after the device disappears.
+/// Ask the daemon to hold the port, then assemble what a surface needs.
 ///
-/// `spawn_reader` uses `NoReconnect`, which still runs the reconnect state
-/// machine but can never produce a port. A window using it reports rising
-/// attempt counts for as long as it is open and reconnects never. Measured
-/// against a real device unplugged and replugged: six attempts in fifteen
-/// seconds, none of which could have succeeded, while the daemon on the same
-/// device was back after six seconds.
+/// A port the daemon already holds is left as it is rather than reconfigured.
+/// Opening a monitor is not a request to change the line settings of a session
+/// somebody else is using; the settings dialog and `devserial open` are.
 #[cfg(any(feature = "monitor", feature = "tui"))]
-fn spawn_reconnecting_reader(
-    path: &str,
+fn attach_session(
+    port: &str,
     config: &PortConfig,
-    storage: &Arc<Mutex<SqliteStorage>>,
-    shared: crate::port_manager::SharedSerialPort,
-) -> crate::reader::PortReaderHandle {
-    let factory = crate::port_manager::SerialReconnectFactory::new(path, config, shared.handle());
-    crate::reader::spawn_reader_with_reconnect(
-        shared,
-        storage,
-        config,
-        crate::reader::FlushSettings::default(),
-        factory,
-    )
-}
-
-/// Open a port, start capturing, and return the pieces a surface needs.
-///
-/// Both the window and the terminal use this. The terminal used to open its
-/// own port and spawn its own reader, which meant two implementations of the
-/// same thing and no session to release the port through.
-#[cfg(any(feature = "monitor", feature = "tui"))]
-fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<SessionParts, String> {
+    data_dir: &Path,
+    socket: Option<std::path::PathBuf>,
+    config_path: Option<&Path>,
+) -> Result<SessionParts, String> {
     crate::paths::create_private_dir(data_dir)
         .map_err(|e| format!("failed to create data directory: {e}"))?;
-    let db_path = crate::paths::port_db_path(data_dir, port);
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to build the async runtime: {e}"))?;
+
+    let endpoint = socket.unwrap_or_else(crate::paths::default_socket_path);
+    let client = Arc::new(
+        IpcClient::new(endpoint).with_config_path(config_path.map(std::path::Path::to_path_buf)),
+    );
+    let handle = runtime.handle().clone();
+
+    let state = {
+        let client = Arc::clone(&client);
+        let port = port.to_string();
+        let settings = config_settings(config);
+        handle.block_on(async move {
+            client
+                .ensure_daemon()
+                .await
+                .map_err(|e| format!("could not reach the daemon: {e}"))?;
+
+            let status = client
+                .send(RequestPayload::GetStatus { port: port.clone() })
+                .await;
+            if let Ok(ResponsePayload::Status { state, .. }) = status {
+                return Ok(state);
+            }
+
+            client
+                .send(RequestPayload::OpenPort {
+                    name: port.clone(),
+                    settings,
+                })
+                .await
+                .map_err(|e| format!("failed to open port '{port}': {e}"))?;
+
+            // PortOpened carries a settings summary, not a link state, so the
+            // state comes from asking rather than from the open.
+            match client
+                .send(RequestPayload::GetStatus { port: port.clone() })
+                .await
+            {
+                Ok(ResponsePayload::Status { state, .. }) => Ok(state),
+                Ok(_) => Err("unexpected answer from the daemon".to_string()),
+                Err(e) => Err(format!("could not read the state of '{port}': {e}")),
+            }
+        })?
+    };
+
+    let db_path = crate::paths::port_db_path(data_dir, port);
     let storage = SqliteStorage::open(&db_path)
         .map_err(|e| format!("failed to open capture database: {e}"))?;
     let history = storage.load_send_history(500).unwrap_or_default();
@@ -468,82 +509,56 @@ fn start_session(port: &str, config: &PortConfig, data_dir: &Path) -> Result<Ses
             .map_err(|e| format!("failed to open capture database: {e}"))?,
     ));
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to build the async runtime: {e}"))?;
-
-    // serial2_tokio registers the descriptor with the reactor while opening,
-    // not when it is first read, so the guard has to cover the open as well.
-    // Without that the GUI panicked on the first connect with "there is no
-    // reactor running".
-    let (writer_slot, reader) = {
-        let _guard = runtime.enter();
-        let serial = crate::port_manager::open_serial_port_raw(port, config)
-            .map_err(|e| format!("failed to open port '{port}': {e}"))?;
-        let shared = crate::port_manager::SharedSerialPort::new(serial);
-        let writer_slot = Arc::new(tokio::sync::Mutex::new(Some(shared.handle())));
-        (
-            writer_slot,
-            spawn_reconnecting_reader(port, config, &shared_storage, shared),
-        )
-    };
+    let (link, poller) = spawn_link_poller(port, &client, &handle, state);
 
     Ok(SessionParts {
         #[cfg(feature = "monitor")]
         storage,
         shared_storage,
-        writer_slot,
-        keepalive: SessionKeepalive::new(runtime, reader),
+        client,
+        keepalive: SessionKeepalive::new(runtime, link, poller),
         history,
     })
 }
 
-/// Open a standalone monitoring session for use inside a running GUI.
+/// Open a monitoring session for use inside a running GUI.
 ///
 /// # Errors
-/// Returns an error if the port cannot be opened or the database fails.
+/// Returns an error if the daemon cannot open the port or the database fails.
 #[cfg(feature = "monitor")]
 pub fn open_standalone_session(
     port: &str,
     config: &PortConfig,
 ) -> Result<crate::monitor::PortMonitorState, String> {
-    let parts = start_session(port, config, &gui_data_dir())?;
+    let parts = attach_session(port, config, &gui_data_dir(), None, None)?;
     let runtime = parts
         .keepalive
         .handle()
         .ok_or_else(|| "session runtime is gone".to_string())?;
 
-    let writer = TokioSerialWriter {
-        handle: Arc::clone(&parts.writer_slot),
+    let writer = DaemonWriter {
+        port: port.to_string(),
+        client: Arc::clone(&parts.client),
         runtime: runtime.clone(),
     };
-    let action = direct_action(runtime, Arc::clone(&parts.writer_slot), None);
-
-    let reconfigure: crate::monitor::ReconfigureFn = {
-        let writer = writer.clone();
-        Arc::new(move |config: &PortConfig| writer.reconfigure(config))
-    };
-
-    let toggle = connect_toggle(port, &parts);
 
     Ok(crate::monitor::PortMonitorState::new_with_reconfigure(
         port.to_string(),
         config.framing_summary(),
         parts.storage,
-        parts.history,
+        parts.history.clone(),
         Some(Arc::new(Mutex::new(
             Box::new(writer) as Box<dyn std::io::Write + Send>
         ))),
-        Some(reconfigure),
-        Some(action),
+        Some(daemon_reconfigure(port, &parts.client, runtime.clone())),
+        Some(daemon_action(port, &parts.client, runtime.clone())),
         Some(config.clone()),
-        Some(toggle),
-        Some(parts.keepalive),
+        Some(daemon_toggle(port, &parts.client, runtime)),
+        Some(Arc::clone(&parts.keepalive)),
     ))
 }
 
-/// Open a serial port and launch the GUI monitor for it.
+/// Open a serial port on the daemon and show it in a window.
 ///
 /// # Errors
 /// Returns an error if the port cannot be opened or the window fails.
@@ -551,13 +566,14 @@ pub fn open_standalone_session(
 pub fn run_monitor_standalone(
     port: &str,
     config: &PortConfig,
+    socket: Option<std::path::PathBuf>,
     config_path: Option<&Path>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(config_path);
 
-    // Hand over to an already running GUI before touching the hardware. The
-    // receiving instance opens the port itself, so this process does not have
-    // to stay alive holding a port it cannot show.
+    // Hand over to an already running GUI before opening anything. The
+    // receiving instance attaches to the port itself, so this process does not
+    // have to stay alive to show a window it did not create.
     let request = crate::gui_ipc::OpenPortRequest {
         port_name: port.to_string(),
         db_path: crate::paths::port_db_path(&data_dir, port),
@@ -573,14 +589,16 @@ pub fn run_monitor_standalone(
         Err(e) => tracing::warn!(error = %e, "could not reach the running GUI instance"),
     }
 
-    let parts = start_session(port, config, &data_dir).map_err(CliError::msg)?;
+    let parts =
+        attach_session(port, config, &data_dir, socket, config_path).map_err(CliError::msg)?;
     let runtime = parts
         .keepalive
         .handle()
         .ok_or_else(|| CliError::msg("session runtime is gone"))?;
-    let writer = TokioSerialWriter {
-        handle: Arc::clone(&parts.writer_slot),
-        runtime,
+    let writer = DaemonWriter {
+        port: port.to_string(),
+        client: Arc::clone(&parts.client),
+        runtime: runtime.clone(),
     };
 
     let db_path = crate::paths::port_db_path(&data_dir, port);
@@ -599,35 +617,7 @@ pub fn run_monitor_standalone(
             #[cfg(feature = "tui")]
             {
                 eprintln!("GUI unavailable ({gui_error}), falling back to the TUI");
-                let handle = parts
-                    .keepalive
-                    .handle()
-                    .ok_or_else(|| CliError::msg("session runtime is gone"))?;
-                let port_handle = {
-                    let slot = Arc::clone(&parts.writer_slot);
-                    handle.block_on(async move { slot.lock().await.clone() })
-                };
-                match port_handle {
-                    Some(port_handle) => crate::tui::run_tui(
-                        port,
-                        config,
-                        &parts.shared_storage,
-                        &port_handle,
-                        &handle,
-                        crate::tui::TuiContext {
-                            link: parts.keepalive.link(),
-                            action: Some(direct_action(
-                                handle.clone(),
-                                Arc::clone(&parts.writer_slot),
-                                config_path,
-                            )),
-                            macros: macro_names(config_path),
-                            toggle: Some(connect_toggle(port, &parts)),
-                            history: parts.history.clone(),
-                        },
-                    ),
-                    None => Err(CliError::msg("serial port is disconnected")),
-                }
+                run_tui_attached(port, config, &parts, &runtime, config_path)
             }
             #[cfg(not(feature = "tui"))]
             Err(CliError::msg(gui_error))
@@ -644,7 +634,7 @@ pub fn run_monitor_gui_app() -> Result<(), CliError> {
     crate::monitor::run_monitor_gui().map_err(CliError::msg)
 }
 
-/// Open a serial port and launch the TUI monitor.
+/// Open a serial port on the daemon and show it in the terminal.
 ///
 /// # Errors
 /// Returns an error if the port cannot be opened or the TUI fails.
@@ -652,49 +642,54 @@ pub fn run_monitor_gui_app() -> Result<(), CliError> {
 pub fn run_tui_standalone(
     port: &str,
     config: &PortConfig,
+    socket: Option<std::path::PathBuf>,
     config_path: Option<&Path>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(config_path);
-    let parts = start_session(port, config, &data_dir).map_err(CliError::msg)?;
+    let parts =
+        attach_session(port, config, &data_dir, socket, config_path).map_err(CliError::msg)?;
     let runtime = parts
         .keepalive
         .handle()
         .ok_or_else(|| CliError::msg("session runtime is gone"))?;
 
-    let port_handle = {
-        let slot = Arc::clone(&parts.writer_slot);
-        runtime.block_on(async move { slot.lock().await.clone() })
-    }
-    .ok_or_else(|| CliError::msg("serial port is disconnected"))?;
+    run_tui_attached(port, config, &parts, &runtime, config_path)
+}
+
+/// Run the terminal interface against an attached session.
+///
+/// Shared by `devserial tui` and by the window's fallback, which previously
+/// carried its own copy of this wiring.
+#[cfg(feature = "tui")]
+fn run_tui_attached(
+    port: &str,
+    config: &PortConfig,
+    parts: &SessionParts,
+    runtime: &tokio::runtime::Handle,
+    config_path: Option<&Path>,
+) -> Result<(), CliError> {
+    let writer = DaemonWriter {
+        port: port.to_string(),
+        client: Arc::clone(&parts.client),
+        runtime: runtime.clone(),
+    };
 
     let context = crate::tui::TuiContext {
         link: parts.keepalive.link(),
-        action: Some(direct_action(
-            runtime.clone(),
-            Arc::clone(&parts.writer_slot),
-            config_path,
-        )),
+        action: Some(daemon_action(port, &parts.client, runtime.clone())),
         macros: macro_names(config_path),
-        toggle: Some(connect_toggle(port, &parts)),
+        toggle: Some(daemon_toggle(port, &parts.client, runtime.clone())),
         history: parts.history.clone(),
+        write: Some(Box::new(writer)),
+        reconfigure: Some(daemon_reconfigure(port, &parts.client, runtime.clone())),
+        transfer: Some(daemon_transfer(port, &parts.client, runtime.clone())),
     };
 
-    let result = crate::tui::run_tui(
-        port,
-        config,
-        &parts.shared_storage,
-        &port_handle,
-        &runtime,
-        context,
-    );
-    // The session is held until here: dropping it shuts down the reader that
-    // fills the buffer the interface above was reading from.
-    drop(parts);
-    result
+    crate::tui::run_tui(port, config, &parts.shared_storage, runtime, context)
 }
 
 /// Protocol settings for a port configuration.
-#[cfg(feature = "monitor")]
+#[cfg(any(feature = "monitor", feature = "tui"))]
 const fn config_settings(config: &PortConfig) -> crate::protocol::PortSettings {
     crate::protocol::PortSettings {
         baudrate: Some(config.baudrate),
@@ -705,9 +700,163 @@ const fn config_settings(config: &PortConfig) -> crate::protocol::PortSettings {
     }
 }
 
-#[cfg(all(test, feature = "monitor"))]
+#[cfg(all(test, any(feature = "monitor", feature = "tui")))]
 mod tests {
     use super::*;
+
+    /// A daemon on a temporary socket, holding one mock port.
+    ///
+    /// Needs `testutil` for the mock, which the `--all-features` job in CI
+    /// enables and the release build never does.
+    #[cfg(all(unix, feature = "testutil"))]
+    struct FakeDaemon {
+        _dir: tempfile::TempDir,
+        socket: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+        ports: crate::port_manager::PortManagerHandle,
+        runtime: tokio::runtime::Runtime,
+        _shutdown: tokio::sync::broadcast::Sender<()>,
+    }
+
+    #[cfg(all(unix, feature = "testutil"))]
+    impl FakeDaemon {
+        const PORT: &'static str = "mock_attached_port";
+
+        fn start() -> Self {
+            let _ = std::fs::create_dir_all("./target/tmp");
+            let dir = tempfile::Builder::new().tempdir_in("./target/tmp").unwrap();
+            let socket = dir.path().join("attached.sock");
+            let pid = dir.path().join("attached.pid");
+            let data_dir = dir.path().to_path_buf();
+
+            // Its own runtime, because the session under test builds one of its
+            // own and blocks on it; a server sharing that runtime would be
+            // driven only while the session happened to be waiting.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            // The handle spawns its actor task on construction, so it needs the
+            // runtime entered rather than merely available.
+            let ports = {
+                let _guard = runtime.enter();
+                crate::port_manager::PortManagerHandle::new()
+            };
+            let mut config = crate::config::Config::default();
+            config.global.data_dir.clone_from(&data_dir);
+            config.global.archive_dir = dir.path().join("archive");
+            let engine = crate::engine::CommandEngine::new(
+                ports.clone(),
+                Arc::new(Mutex::new(crate::state::StateDb::open_memory().unwrap())),
+                Arc::new(config),
+            );
+
+            let (mock, _control) = crate::testutil::mock_serial::mock_serial(1024);
+            let storage = Arc::new(Mutex::new(
+                SqliteStorage::open(&crate::paths::port_db_path(&data_dir, Self::PORT)).unwrap(),
+            ));
+            runtime
+                .block_on(ports.open(
+                    Self::PORT.to_string(),
+                    Box::new(mock),
+                    PortConfig::default(),
+                    storage,
+                ))
+                .unwrap();
+
+            let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+            let server = crate::ipc::IpcServer::new(engine, socket.clone(), pid);
+            runtime.spawn(async move {
+                let _ = server.run(shutdown_rx).await;
+            });
+            while !socket.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            Self {
+                _dir: dir,
+                socket,
+                data_dir,
+                ports,
+                runtime,
+                _shutdown: shutdown,
+            }
+        }
+
+        fn managed_ports(&self) -> Vec<String> {
+            self.runtime
+                .block_on(self.ports.list())
+                .into_iter()
+                .map(|p| p.name)
+                .collect()
+        }
+    }
+
+    /// The session attaches to the port the daemon holds, its writes reach the
+    /// engine, and ending it leaves the port open.
+    ///
+    /// The last of those is the behaviour this change exists to produce: a
+    /// monitor that closed the port on exit took the capture down with it.
+    ///
+    /// What this cannot prove is the byte arriving at the device. A mock port
+    /// is registered as a reader, and the engine answers a write to one with
+    /// "no hardware handle", so the assertion below checks that the request
+    /// reached the engine and was carried out there rather than checking the
+    /// wire. Write-through is covered by the CLI against real hardware.
+    #[cfg(all(unix, feature = "testutil"))]
+    #[test]
+    fn the_session_attaches_and_leaves_the_port_open() {
+        use std::io::Write as _;
+
+        let daemon = FakeDaemon::start();
+        assert!(
+            daemon
+                .managed_ports()
+                .contains(&FakeDaemon::PORT.to_string()),
+            "the daemon should be holding the mock port before the session starts"
+        );
+
+        let parts = attach_session(
+            FakeDaemon::PORT,
+            &PortConfig::default(),
+            &daemon.data_dir,
+            Some(daemon.socket.clone()),
+            None,
+        )
+        .expect("attaching to a port the daemon already holds");
+
+        // Attaching neither opened a second port nor disturbed the first.
+        assert_eq!(
+            daemon.managed_ports(),
+            vec![FakeDaemon::PORT.to_string()],
+            "attaching changed what the daemon holds"
+        );
+
+        let runtime = parts.keepalive.handle().unwrap();
+        let mut writer = DaemonWriter {
+            port: FakeDaemon::PORT.to_string(),
+            client: Arc::clone(&parts.client),
+            runtime,
+        };
+        let outcome = writer.write_all(b"ping");
+        let reason = outcome
+            .expect_err("a mock port has no write side")
+            .to_string();
+        assert!(
+            reason.contains("mock port"),
+            "the write should have been refused by the engine, for the mock's \
+             own reason; instead: {reason}"
+        );
+
+        drop(parts);
+        assert!(
+            daemon
+                .managed_ports()
+                .contains(&FakeDaemon::PORT.to_string()),
+            "ending the session closed the port; the capture would stop with it"
+        );
+    }
 
     #[test]
     fn settings_round_trip_through_the_protocol() {
@@ -735,5 +884,61 @@ mod tests {
         std::fs::write(&config_file, format!("[global]\ndata_dir = {value}\n")).unwrap();
 
         assert_eq!(resolve_data_dir(Some(&config_file)), data_dir);
+    }
+
+    #[test]
+    fn every_action_maps_to_the_request_that_performs_it() {
+        // A surface control that produced no request, or the wrong one, would
+        // look like it worked and change nothing on the device.
+        let port = "/dev/ttyUSB0";
+
+        assert!(matches!(
+            PortAction::Break {
+                duration_ms: Some(7)
+            }
+            .payload(port),
+            RequestPayload::SendBreak {
+                duration_ms: Some(7),
+                ..
+            }
+        ));
+        assert!(matches!(
+            PortAction::Signal {
+                dtr: Some(true),
+                rts: None
+            }
+            .payload(port),
+            RequestPayload::SetSignal {
+                dtr: Some(true),
+                rts: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            PortAction::Macro {
+                name: "reset".to_string()
+            }
+            .payload(port),
+            RequestPayload::ExecuteMacro { .. }
+        ));
+
+        for action in [
+            PortAction::Break { duration_ms: None },
+            PortAction::Signal {
+                dtr: None,
+                rts: Some(false),
+            },
+            PortAction::Macro {
+                name: "enter_bootloader".to_string(),
+            },
+        ] {
+            let named = match action.payload(port) {
+                RequestPayload::SendBreak { port, .. }
+                | RequestPayload::SetSignal { port, .. }
+                | RequestPayload::ExecuteMacro { port, .. } => port,
+                other => panic!("{action:?} produced {other:?}"),
+            };
+            assert_eq!(named, port, "the request names another port");
+        }
     }
 }
