@@ -24,9 +24,9 @@ pub struct OpenPortRequest {
     pub port_info: String,
     /// Line settings for the receiving instance to open the port with.
     ///
-    /// `None` means the sender owns the port and the receiving window should
-    /// only display the capture database. That is the case for the monitor
-    /// subprocess started by the MCP server.
+    /// `None` means the receiving window should only display the capture
+    /// database and forward its actions to whoever sent the request. That is
+    /// the case for the monitor subprocess started by the MCP server.
     #[serde(default)]
     pub settings: Option<PortSettings>,
 }

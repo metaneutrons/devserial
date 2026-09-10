@@ -24,7 +24,6 @@ use crate::cli::CliError;
 use crate::cli::output::authors;
 use crate::config::PortConfig;
 use crate::modem::FileTransferProtocol;
-use crate::port_manager::SerialPortHandle;
 use crate::serial_params::{
     BAUD_PRESETS, DEFAULT_BREAK_MS, DataBits, FlowControl, Parity, StopBits,
 };
@@ -78,14 +77,20 @@ fn install_panic_hook() {
 pub struct TuiContext {
     /// Watch on what the reader says about the hardware.
     pub link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
-    /// Carries out Break, DTR, RTS and macros when this process owns the port.
+    /// Carries out Break, DTR, RTS and macros on the port.
     pub action: Option<crate::standalone::DirectActionFn>,
     /// Macro names offered in the picker, in the order they are numbered.
     pub macros: Vec<String>,
-    /// Releases and retakes the port, when this process holds it.
+    /// Releases the port and takes it back.
     pub toggle: Option<crate::standalone::ToggleConnectFn>,
     /// Lines sent in earlier sessions on this port.
     pub history: Vec<String>,
+    /// Where a typed line goes. `None` in a build with no session behind it.
+    pub write: Option<Box<dyn std::io::Write + Send>>,
+    /// Changes the line settings of the open port.
+    pub reconfigure: Option<crate::standalone::ReconfigureFn>,
+    /// Sends and receives files over a modem protocol.
+    pub transfer: Option<crate::standalone::TransferFn>,
 }
 
 /// Run the TUI monitor.
@@ -96,22 +101,13 @@ pub fn run_tui(
     port_name: &str,
     config: &PortConfig,
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
-    write_port: &SerialPortHandle,
     runtime: &tokio::runtime::Handle,
     context: TuiContext,
 ) -> Result<(), CliError> {
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run_app(
-        context,
-        &mut terminal,
-        port_name,
-        config,
-        storage,
-        write_port,
-        runtime,
-    )
+    run_app(context, &mut terminal, port_name, config, storage, runtime)
 }
 
 #[derive(PartialEq, Eq)]
@@ -186,9 +182,15 @@ struct AppState {
     rts_state: bool,
     /// Macros offered in the picker, in the order they are numbered.
     macro_names: Vec<String>,
-    /// Carries out hardware actions when this process owns the port.
+    /// Carries out hardware actions on the port.
     action: Option<crate::standalone::DirectActionFn>,
-    /// What the reader reports about the hardware, when this window owns it.
+    /// Where a typed line goes.
+    write: Option<Box<dyn std::io::Write + Send>>,
+    /// Changes the line settings of the open port.
+    reconfigure: Option<crate::standalone::ReconfigureFn>,
+    /// Sends and receives files over a modem protocol.
+    transfer: Option<crate::standalone::TransferFn>,
+    /// What the reader reports about the hardware.
     ///
     /// Without it the bar could only show what the user had asked for, and an
     /// unplugged device left it claiming a connection that was long gone.
@@ -230,6 +232,9 @@ impl AppState {
             rts_state: false,
             macro_names: Vec::new(),
             action: None,
+            write: None,
+            reconfigure: None,
+            transfer: None,
             link: None,
             lines: std::collections::VecDeque::new(),
             last_id: 0,
@@ -395,7 +400,6 @@ fn run_app(
     port_name: &str,
     config: &PortConfig,
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
-    write_port: &SerialPortHandle,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), CliError> {
     let mut state = AppState::new(port_name, config);
@@ -404,6 +408,9 @@ fn run_app(
     state.macro_names = context.macros;
     state.toggle = context.toggle;
     state.history = context.history;
+    state.write = context.write;
+    state.reconfigure = context.reconfigure;
+    state.transfer = context.transfer;
 
     loop {
         // Poll new lines from storage.
@@ -443,11 +450,13 @@ fn run_app(
             match key.code {
                 KeyCode::Char('c') => break,
                 KeyCode::Char('b') => {
-                    send_break(runtime, write_port);
-                    state.note(
-                        storage,
-                        &format!("━━━ SERIAL BREAK ({DEFAULT_BREAK_MS}ms) SENT ━━━"),
-                    );
+                    match send_break(&state) {
+                        Ok(()) => state.note(
+                            storage,
+                            &format!("━━━ SERIAL BREAK ({DEFAULT_BREAK_MS}ms) SENT ━━━"),
+                        ),
+                        Err(e) => state.set_status(format!("BREAK failed: {e}")),
+                    }
                     continue;
                 }
                 KeyCode::Char('s') if state.input_mode == InputMode::Normal => {
@@ -555,11 +564,13 @@ fn run_app(
                 continue;
             }
             KeyCode::F(4) => {
-                send_break(runtime, write_port);
-                state.note(
-                    storage,
-                    &format!("━━━ SERIAL BREAK ({DEFAULT_BREAK_MS}ms) SENT ━━━"),
-                );
+                match send_break(&state) {
+                    Ok(()) => state.note(
+                        storage,
+                        &format!("━━━ SERIAL BREAK ({DEFAULT_BREAK_MS}ms) SENT ━━━"),
+                    ),
+                    Err(e) => state.set_status(format!("BREAK failed: {e}")),
+                }
                 continue;
             }
             KeyCode::Esc => {
@@ -577,7 +588,7 @@ fn run_app(
         }
 
         if state.input_mode == InputMode::Configure {
-            handle_configure_key(&mut state, key.code, runtime, write_port, storage);
+            handle_configure_key(&mut state, key.code, storage);
             continue;
         }
 
@@ -678,7 +689,7 @@ fn run_app(
             KeyCode::Backspace => {
                 state.input.pop();
             }
-            KeyCode::Enter => handle_enter(&mut state, runtime, write_port, storage),
+            KeyCode::Enter => handle_enter(&mut state, runtime, storage),
             KeyCode::Up => {
                 state.auto_follow = false;
                 state.scroll_offset = state.scroll_offset.saturating_sub(1);
@@ -913,62 +924,60 @@ fn handle_macros_key(state: &mut AppState, key: KeyCode) {
     }
 }
 
-fn send_break(runtime: &tokio::runtime::Handle, port: &SerialPortHandle) {
-    let port = Arc::clone(port);
-    runtime.block_on(async move {
-        let guard = port.lock().await;
-        let _ = guard.set_break(true);
-        tokio::time::sleep(Duration::from_millis(DEFAULT_BREAK_MS)).await;
-        let _ = guard.set_break(false);
-    });
+/// Ask for a BREAK the same way every other hardware action is asked for.
+///
+/// The terminal used to hold the line low itself. That was a second
+/// implementation of what the daemon already does, and it needed a port handle
+/// this process no longer has.
+fn send_break(state: &AppState) -> Result<(), String> {
+    state.action.as_ref().map_or_else(
+        || Err("no hardware connection".to_string()),
+        |action| action(&crate::standalone::PortAction::Break { duration_ms: None }),
+    )
 }
 
 fn handle_enter(
     state: &mut AppState,
     runtime: &tokio::runtime::Handle,
-    port: &SerialPortHandle,
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
 ) {
+    let _ = runtime;
     match state.input_mode {
         InputMode::Normal if !state.input.is_empty() => {
             let mut data = state.input.as_bytes().to_vec();
             data.extend_from_slice(state.line_ending.suffix());
-            let port = Arc::clone(port);
-            runtime.block_on(async move {
-                let _ = port.lock().await.write_all(&data).await;
-            });
-            state.remember_sent(Some(storage));
-            state.input.clear();
+            let outcome = state.write.as_mut().map_or_else(
+                || Err("no hardware connection".to_string()),
+                |write| write.write_all(&data).map_err(|e| e.to_string()),
+            );
+            match outcome {
+                // The line is remembered only once it was accepted. A refused
+                // write used to land in the history anyway, so walking back
+                // offered lines the device never saw.
+                Ok(()) => {
+                    state.remember_sent(Some(storage));
+                    state.input.clear();
+                }
+                Err(e) => state.set_status(format!("Send failed: {e}")),
+            }
         }
         InputMode::SendFile if !state.input.is_empty() => {
             let path = std::mem::take(&mut state.input);
             state.input_mode = InputMode::Normal;
-
-            let (data, name) = match std::fs::read(&path) {
-                Ok(data) => {
-                    let name = std::path::Path::new(&path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("file.bin")
-                        .to_string();
-                    (data, name)
-                }
-                Err(e) => {
-                    state.set_status(format!("Read error: {e}"));
-                    return;
-                }
-            };
-
             let proto = state.transfer_proto;
             let label = proto.label();
             state.set_status(format!("Sending '{path}' via {label}..."));
-            let port = Arc::clone(port);
-            let result = runtime.block_on(async move {
-                let mut guard = port.lock().await;
-                crate::modem::send(&mut *guard, proto, &name, &data).await
-            });
-            match result {
-                Ok(bytes) => state.set_status(format!("Sent {bytes} bytes via {label}")),
+
+            // The daemon reads the file and runs the protocol. Reading it here
+            // and pushing the bytes needed a port handle to run the protocol
+            // on, and a modem protocol needs to read the answers as well as
+            // write, which a one-way writer cannot do.
+            let outcome = state.transfer.as_ref().map_or_else(
+                || Err("no hardware connection".to_string()),
+                |transfer| transfer(true, &path, proto),
+            );
+            match outcome {
+                Ok(summary) => state.set_status(format!("Sent {summary} via {label}")),
                 Err(e) => state.set_status(format!("{label} send failed: {e}")),
             }
         }
@@ -983,20 +992,13 @@ fn handle_enter(
             let label = proto.label();
             state.set_status(format!("Receiving into '{dir}' via {label}..."));
 
-            let port = Arc::clone(port);
-            let result = runtime.block_on(async move {
-                let mut guard = port.lock().await;
-                crate::modem::receive(&mut *guard, proto).await
-            });
-            match result {
-                Ok((name, data)) => {
-                    let target = std::path::Path::new(&dir).join(&name);
-                    match std::fs::write(&target, &data) {
-                        Ok(()) => state.set_status(format!("Received {}", target.display())),
-                        Err(e) => state.set_status(format!("Save error: {e}")),
-                    }
-                }
-                Err(e) => state.set_status(format!("ZMODEM receive failed: {e}")),
+            let outcome = state.transfer.as_ref().map_or_else(
+                || Err("no hardware connection".to_string()),
+                |transfer| transfer(false, &dir, proto),
+            );
+            match outcome {
+                Ok(summary) => state.set_status(format!("Received {summary}")),
+                Err(e) => state.set_status(format!("{label} receive failed: {e}")),
             }
         }
         _ => {}
@@ -1006,8 +1008,6 @@ fn handle_enter(
 fn handle_configure_key(
     state: &mut AppState,
     code: KeyCode,
-    runtime: &tokio::runtime::Handle,
-    port: &SerialPortHandle,
     storage: &Arc<std::sync::Mutex<SqliteStorage>>,
 ) {
     match code {
@@ -1043,11 +1043,10 @@ fn handle_configure_key(
         KeyCode::Enter => {
             state.config.baudrate = BAUD_PRESETS[state.baud_index];
             let config = state.config.clone();
-            let port = Arc::clone(port);
-            let result = runtime.block_on(async move {
-                let mut guard = port.lock().await;
-                crate::port_manager::reconfigure_serial_port(&mut guard, &config)
-            });
+            let result = state.reconfigure.as_ref().map_or_else(
+                || Err("no hardware connection".to_string()),
+                |reconfigure| reconfigure(&config),
+            );
 
             match result {
                 Ok(()) => {

@@ -153,8 +153,11 @@ fn failure_summary(text: &str) -> String {
         .to_string()
 }
 
-/// Callback type for direct hardware reconfiguration in standalone mode.
-pub type ReconfigureFn = Arc<dyn Fn(&PortConfig) -> Result<(), String> + Send + Sync>;
+/// Changes the line settings of the open port.
+///
+/// Defined with the session rather than here, because the terminal takes the
+/// same closure.
+pub use crate::standalone::ReconfigureFn;
 
 // --- Public API (spawn/handle) ---
 
@@ -549,8 +552,8 @@ fn run_monitor_inner(
     port_name: &str,
     db_path: &Path,
     port_info: &str,
-    direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
-    direct_reconfigure: Option<ReconfigureFn>,
+    writer: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+    reconfigure: Option<ReconfigureFn>,
     keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
 ) -> Result<(), String> {
     platform::init_app();
@@ -563,17 +566,17 @@ fn run_monitor_inner(
     let storage = crate::storage::SqliteStorage::open(db_path)
         .map_err(|e| format!("failed to open capture database: {e}"))?;
     let history = storage.load_send_history(500).unwrap_or_default();
-    let owns_port = direct_port.is_some();
+    let has_session = writer.is_some();
 
     let initial = PortMonitorState::new_with_reconfigure(
         port_name.to_string(),
         port_info.to_string(),
         storage,
         history,
-        direct_port,
-        direct_reconfigure,
+        writer,
+        reconfigure,
         // This entry point is the monitor subprocess, which forwards its
-        // actions to the process that owns the port.
+        // actions to the MCP server that spawned it.
         None,
         None,
         None,
@@ -615,9 +618,10 @@ fn run_monitor_inner(
                 *guard = Some(cc.egui_ctx.clone());
             }
 
-            // Windows driven by a parent process use stdin as their lifeline:
-            // a byte means new data, end of file means the parent is gone.
-            if !owns_port {
+            // A window the MCP server spawned has no session of its own and
+            // uses stdin as its lifeline: a byte means new data, end of file
+            // means the parent is gone.
+            if !has_session {
                 std::thread::spawn(move || {
                     use std::io::Read;
                     let mut buf = [0u8; 64];
@@ -1166,14 +1170,14 @@ pub struct PortMonitorState {
     history_idx: Option<usize>,
     history_draft: String,
     connected: bool,
-    pub direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
-    pub direct_reconfigure: Option<ReconfigureFn>,
-    /// Carries out Break, DTR, RTS and macros when this window owns the port.
+    pub writer: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+    pub reconfigure: Option<ReconfigureFn>,
+    /// Carries out Break, DTR, RTS and macros through the session.
     ///
     /// Without it those four went through `send_event`, which refuses as soon
     /// as the window holds the port itself. Every one of them therefore did
     /// nothing at all in `devserial gui`.
-    pub direct_action: Option<crate::standalone::DirectActionFn>,
+    pub action: Option<crate::standalone::DirectActionFn>,
     show_transfer_dialog: bool,
     transfer_path: String,
     transfer_proto: crate::modem::FileTransferProtocol,
@@ -1212,19 +1216,10 @@ impl PortMonitorState {
         port_info: String,
         storage: crate::storage::SqliteStorage,
         history: Vec<String>,
-        direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+        writer: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
     ) -> Self {
         Self::new_with_reconfigure(
-            port_name,
-            port_info,
-            storage,
-            history,
-            direct_port,
-            None,
-            None,
-            None,
-            None,
-            None,
+            port_name, port_info, storage, history, writer, None, None, None, None, None,
         )
     }
 
@@ -1235,9 +1230,9 @@ impl PortMonitorState {
         port_info: String,
         storage: crate::storage::SqliteStorage,
         history: Vec<String>,
-        direct_port: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
-        direct_reconfigure: Option<ReconfigureFn>,
-        direct_action: Option<crate::standalone::DirectActionFn>,
+        writer: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+        reconfigure: Option<ReconfigureFn>,
+        action: Option<crate::standalone::DirectActionFn>,
         initial_config: Option<PortConfig>,
         toggle_connect: Option<crate::standalone::ToggleConnectFn>,
         keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
@@ -1265,9 +1260,9 @@ impl PortMonitorState {
             history_idx: None,
             history_draft: String::new(),
             connected: true,
-            direct_port,
-            direct_reconfigure,
-            direct_action,
+            writer,
+            reconfigure,
+            action,
             show_transfer_dialog: false,
             transfer_path: String::new(),
             transfer_proto: crate::modem::FileTransferProtocol::Zmodem,
@@ -1344,14 +1339,15 @@ impl PortMonitorState {
 
     /// Start espflash with the port released, and remember how to get it back.
     ///
-    /// The window owns the port, so espflash cannot have it at the same time.
-    /// Releasing is therefore part of the operation rather than something the
-    /// user has to remember, and reconnecting happens whatever the outcome.
+    /// espflash opens the port itself, so whoever holds it has to let go
+    /// first. Releasing is therefore part of the operation rather than
+    /// something the user has to remember, and reconnecting happens whatever
+    /// the outcome.
     #[cfg(feature = "esp")]
     fn start_flash_operation(&mut self, ctx: &egui::Context, erase: bool) {
         let Some(runtime) = self.session_runtime() else {
             self.flash.outcome = Some((
-                "This window does not own the port, so it cannot release it for espflash."
+                "This window has no session, so it cannot release the port for espflash."
                     .to_string(),
                 true,
             ));
@@ -2459,7 +2455,7 @@ impl PortMonitorState {
         }
         let config = self.current_config();
 
-        let result = self.direct_reconfigure.as_ref().map_or_else(
+        let result = self.reconfigure.as_ref().map_or_else(
             || {
                 self.send_event(&MonitorEvent::Reconfigure {
                     settings: crate::protocol::PortSettings {
@@ -3450,20 +3446,20 @@ impl PortMonitorState {
         }
     }
 
-    /// Report a user action to whoever owns the port.
+    /// Report a user action to whoever can carry it out.
     ///
-    /// A window that owns the port carries the action out itself; one driven by
-    /// a parent process forwards the typed event over stdout. Before there was
-    /// a direct path, the first case simply returned an error, so Break, DTR,
+    /// A window with a session sends the action to the daemon; one the MCP
+    /// server spawned forwards the typed event over stdout. Before there was
+    /// an action path, the first case simply returned an error, so Break, DTR,
     /// RTS and the macro buttons were dead in `devserial gui`.
     fn send_event(&self, event: &MonitorEvent) -> Result<(), String> {
-        if let Some(act) = self.direct_action.as_ref()
+        if let Some(act) = self.action.as_ref()
             && let Some(action) = port_action_of(event)
         {
             return act(&action);
         }
-        if self.direct_port.is_some() {
-            return Err("this window owns the port and handles actions directly".to_string());
+        if self.writer.is_some() {
+            return Err("this window has no action path for that".to_string());
         }
         let line = event.encode().map_err(|e| e.to_string())?;
         let mut out = std::io::stdout().lock();
@@ -3500,7 +3496,7 @@ impl PortMonitorState {
 
         // Windows that own the port write directly; the others report the
         // action to the process that does.
-        if let Some(ref port) = self.direct_port {
+        if let Some(ref port) = self.writer {
             if let Ok(mut port) = port.lock() {
                 let _ = port.write_all(&data);
                 let _ = port.flush();

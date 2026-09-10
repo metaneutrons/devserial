@@ -421,6 +421,7 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         Some(Command::Monitor { port, line }) => crate::standalone::run_monitor_standalone(
             &port,
             &line.to_port_config()?,
+            cli.socket,
             config_path.as_deref(),
         ),
 
@@ -428,6 +429,7 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         Some(Command::Tui { port, line }) => crate::standalone::run_tui_standalone(
             &port,
             &line.to_port_config()?,
+            cli.socket,
             config_path.as_deref(),
         ),
 
