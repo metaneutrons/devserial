@@ -120,3 +120,33 @@ fn the_packaging_description_matches_the_manifest() {
         "the packaged description has drifted from Cargo.toml"
     );
 }
+
+/// A description Homebrew accepts.
+///
+/// `brew audit` refuses a formula whose `desc` reaches 80 characters, and that
+/// audit runs in the release pipeline rather than in CI. So a description that
+/// is too long passes every check here, builds every artifact, and fails at
+/// the step that publishes, which is the most expensive place to find out.
+/// That is not a hypothetical: 0.2.0 was held there by 96 characters.
+///
+/// The limit is checked against Cargo.toml because the test above makes it the
+/// one place the description is written; the AUR `pkgdesc` has no limit of its
+/// own and follows along.
+#[test]
+fn the_description_is_short_enough_for_homebrew() {
+    /// What `brew audit` allows. The message it prints is "Description is too
+    /// long. It should be less than 80 characters."
+    const HOMEBREW_LIMIT: usize = 80;
+
+    let manifest = MANIFEST
+        .lines()
+        .find_map(|line| line.strip_prefix("description = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("Cargo.toml has no description");
+
+    assert!(
+        manifest.len() < HOMEBREW_LIMIT,
+        "the description is {} characters, and brew audit allows fewer than {HOMEBREW_LIMIT}: {manifest}",
+        manifest.len()
+    );
+}

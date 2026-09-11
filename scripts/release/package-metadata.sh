@@ -29,8 +29,9 @@ PACKAGE=devserial
 REPOSITORY=${GITHUB_REPOSITORY:-metaneutrons/devserial}
 # Kept in step with the package description by a test in tests/features.rs,
 # because this is a hand-written copy of it and nothing else would notice a
-# change on one side only.
-DESCRIPTION='Serial terminal for developers with SQLite-buffered output and a CLI, TUI, GUI and MCP interface'
+# change on one side only. That test also holds it under 80 characters, which
+# is what 'brew audit' allows a formula's desc.
+DESCRIPTION='Serial terminal with SQLite-buffered output and CLI, TUI, GUI, REST and MCP'
 HOMEPAGE="https://github.com/${REPOSITORY}"
 LICENSE_ID='GPL-3.0-or-later'
 
