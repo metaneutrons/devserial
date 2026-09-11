@@ -137,8 +137,9 @@ Dependencies: none
 
 - M1-A1: `devserial monitor PORT` and `devserial tui PORT` open the port through
   the daemon, starting it if it is not running, and display the capture without
-  holding the line. Verified by an integration test that opens a port through
-  each entry point and asserts the daemon reports it in `ListPorts`.
+  holding the line. Verified for a port the daemon already holds by an
+  integration test. Opening a port that is *not* yet managed needs a device and
+  is covered by the hardware gate below rather than by this milestone.
 - M1-A2: A monitor that exits leaves the port open on the daemon and the capture
   growing. Verified by a test that starts a monitor, ends it, and reads new lines
   afterwards.
@@ -267,9 +268,32 @@ Dependencies: M5
 - M6-A4: The README documents the interface, the default port, the token rule
   and the two header requirements.
 
-Initiative completion: M1 to M6 accepted, the README current, and a release
-carrying the interface published. Publication is in scope because the export
-break in M2 has to reach users through release notes.
+### Hardware gate
+
+Execution: <https://github.com/metaneutrons/devserial/issues/76>
+Dependencies: the milestones whose behaviour it covers, as they land.
+
+Everything above is verified against mock ports, a real daemon on a temporary
+socket and a real HTTP listener. None of it has touched a serial device, and
+three of the milestones change what happens when one is attached: M1 moved every
+monitor onto the daemon, M5 streams a capture as it grows, M6 writes to the line
+and runs a modem protocol.
+
+- HW-A1: `devserial tui PORT` and `devserial monitor PORT` on a live device: type
+  a line, send a BREAK, change the baud rate, and confirm the daemon holds the
+  port while the monitor runs and keeps it after the monitor ends.
+- HW-A2: unplug the device while a monitor is open and plug it back in; the
+  indicator follows, and the capture continues into the same buffer.
+- HW-A3: a file transfer in each direction.
+- HW-A4: the write and ESP routes of M6 against the device.
+
+This is a gate rather than a milestone: it has no design of its own and delivers
+no code. It stays open until the behaviour it names has been seen on a device,
+and the initiative is not complete while it is open.
+
+Initiative completion: M1 to M6 accepted, the hardware gate closed, the README
+current, and a release carrying the interface published. Publication is in scope
+because the export break in M2 has to reach users through release notes.
 
 ## Migration, risks and verification cost
 
@@ -329,6 +353,21 @@ The flag would have been a verb for a thing that does not exist.
 What is lost is the convenience of a generated token for a non-loopback bind,
 which now has to be produced by hand. That is a fair trade against a second
 place where a secret lives.
+
+**11 September 2026, hardware verification moved out of M1 into a gate of its
+own.** M1's other five criteria are met and its code has been on `main` since
+`62b298a`, but M1-A1's second half and any hands-on check need a device, which
+is not something a milestone issue should wait on while four more milestones
+queue behind it. The verification is not dropped: it becomes a gate the
+initiative cannot complete without, widened to cover M5 and M6, which also
+change what happens when a device is attached.
+
+The cost is real and worth naming. Deferring the check means a defect found at
+the gate sits under several milestones of work rather than one, and the monitors'
+hardware path changed most in M1, so that is where such a defect is most likely.
+The trade is accepted because the alternative is a milestone blocked on an
+errand, and because nothing after M1 builds on the untested half: the routes
+reach the daemon, not the line.
 
 A change to a criterion or to the scope is recorded here with its date and the
 pull request that made it, and a milestone claiming acceptance links the exact
