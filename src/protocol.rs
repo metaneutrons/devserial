@@ -86,7 +86,9 @@ pub struct PortInfoResponse {
 }
 
 /// Serial line settings, all optional so a caller can change one of them.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 pub struct PortSettings {
     pub baudrate: Option<u32>,
     pub data_bits: Option<DataBits>,

@@ -443,20 +443,69 @@ port    = 9600
 | `DELETE` | `/v1/ports/{port}/lines` | Discard the buffer; `?archive=true` snapshots first |
 | `GET` | `/v1/ports/{port}/search` | `q`, `mode`, `from`, `to`, `limit` |
 | `POST` | `/v1/ports/{port}/export` | Write the capture to a file |
+| `POST` | `/v1/ports/{port}/write` | Write bytes, as text or as hex |
+| `POST` | `/v1/ports/{port}/break` | Hold the line in the break condition |
+| `POST` | `/v1/ports/{port}/signals` | Set `dtr`, `rts` or both |
+| `POST` | `/v1/ports/{port}/macros/{name}` | Run a macro from the configuration |
+| `POST` | `/v1/ports/{port}/transfers` | Send or receive a file, `direction` in the body |
+| `GET` | `/v1/openapi.json` | The interface as OpenAPI 3.1 |
+
+With the `esp` feature, four more and the stream that follows a flash:
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/v1/ports/{port}/esp` | What the attached board says about itself |
+| `POST` | `/v1/ports/{port}/esp/flash` | Start a flash; answers `202` with a job id |
+| `POST` | `/v1/ports/{port}/esp/erase` | Erase the flash |
+| `POST` | `/v1/ports/{port}/esp/write-bin` | Write a raw binary to an address |
+| `GET` | `/v1/jobs/{job}/stream` | The tool's output, line by line, ending with the outcome |
 
 The port is percent-encoded in the path, because `/dev/cu.usbmodem1101` and
-`COM3` are both port names. Writing to a device, the file transfers and the ESP
-operations are the next slice; a test walks every request the daemon knows and
-fails when one has neither a route nor a recorded reason for not having one.
+`COM3` are both port names. A test walks every request the daemon knows and
+fails when one has neither a route nor a recorded reason for not having one, a
+second one calls every advertised route and fails on a 404, and a third checks
+the description against the route list.
+
+`/v1/openapi.json` is generated rather than maintained: the paths come from the
+route list, the parameters and bodies from the very structs the handlers read,
+and the only sentence written by hand is the one-line summary. The document
+names the port it is answering on.
 
 ```bash
-curl -s 'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/lines?tail=5'
-curl -s 'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/search?q=Guru'
+PORT=%2Fdev%2Fcu.usbmodem1101
+
+curl -s "http://127.0.0.1:9600/v1/ports/$PORT/lines?tail=5"
+curl -s "http://127.0.0.1:9600/v1/ports/$PORT/search?q=Guru"
 
 # Follow the capture, resuming after line 4211
 curl -N -H 'Last-Event-ID: 4211' \
-  'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/lines/stream'
+  "http://127.0.0.1:9600/v1/ports/$PORT/lines/stream"
+
+# Write, in text or in hex
+curl -s -H 'Content-Type: application/json' \
+  -d '{"data":"AT\r\n"}' "http://127.0.0.1:9600/v1/ports/$PORT/write"
+curl -s -H 'Content-Type: application/json' \
+  -d '{"data":"41 42","hex":true}' "http://127.0.0.1:9600/v1/ports/$PORT/write"
+
+# Send a file, and run a macro
+curl -s -H 'Content-Type: application/json' \
+  -d '{"direction":"send","path":"/tmp/app.bin","protocol":"zmodem"}' \
+  "http://127.0.0.1:9600/v1/ports/$PORT/transfers"
+curl -s -H 'Content-Type: application/json' -d '{}' \
+  "http://127.0.0.1:9600/v1/ports/$PORT/macros/reset"
+
+# Flash, and watch it
+JOB=$(curl -s -H 'Content-Type: application/json' \
+  -d '{"firmware":"/tmp/firmware.bin"}' \
+  "http://127.0.0.1:9600/v1/ports/$PORT/esp/flash" | jq -r .job)
+curl -N "http://127.0.0.1:9600/v1/jobs/$JOB/stream"
 ```
+
+A body is JSON even where every field is optional, so a route that needs
+nothing takes `{}`. Flashing is the one operation too slow to answer inside a
+request: it returns a job id at once and the tool's output arrives on the job's
+stream, ending with a `done` event carrying the outcome. A client that
+reconnects gets the whole log, because the job is kept after it finishes.
 
 The stream is server-sent events rather than a WebSocket: the channel only runs
 one way, a plain `GET` reconnects on its own, and the event id is the line id, so

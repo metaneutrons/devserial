@@ -249,8 +249,11 @@ impl FromStr for FlowControl {
 }
 
 /// Number of data bits per character, validated to 5 through 8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(try_from = "u8", into = "u8")]
+#[schemars(with = "u8")]
 pub struct DataBits(u8);
 
 impl DataBits {
@@ -328,8 +331,11 @@ impl FromStr for DataBits {
 }
 
 /// Number of stop bits, validated to 1 or 2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(try_from = "u8", into = "u8")]
+#[schemars(with = "u8")]
 pub struct StopBits(u8);
 
 impl StopBits {
