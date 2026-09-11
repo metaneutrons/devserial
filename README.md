@@ -439,6 +439,7 @@ port    = 9600
 | `GET` | `/v1/ports/{port}` | Link state and buffer statistics |
 | `GET` | `/v1/ports/{port}/stats` | Buffer statistics |
 | `GET` | `/v1/ports/{port}/lines` | A page of captured lines |
+| `GET` | `/v1/ports/{port}/lines/stream` | The same lines as they arrive, over SSE |
 | `DELETE` | `/v1/ports/{port}/lines` | Discard the buffer; `?archive=true` snapshots first |
 | `GET` | `/v1/ports/{port}/search` | `q`, `mode`, `from`, `to`, `limit` |
 | `POST` | `/v1/ports/{port}/export` | Write the capture to a file |
@@ -451,7 +452,16 @@ fails when one has neither a route nor a recorded reason for not having one.
 ```bash
 curl -s 'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/lines?tail=5'
 curl -s 'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/search?q=Guru'
+
+# Follow the capture, resuming after line 4211
+curl -N -H 'Last-Event-ID: 4211' \
+  'http://127.0.0.1:9600/v1/ports/%2Fdev%2Fcu.usbmodem1101/lines/stream'
 ```
+
+The stream is server-sent events rather than a WebSocket: the channel only runs
+one way, a plain `GET` reconnects on its own, and the event id is the line id, so
+`Last-Event-ID` resumes exactly where a client left off. Writing is its own
+request, so the return channel a WebSocket would add has nothing to carry.
 
 A line on the wire is the record the `jsonl` export writes, from the same
 function, so a file and a response carry the same fields. Every field of the

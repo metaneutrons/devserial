@@ -825,6 +825,16 @@ impl CommandEngine {
         }
     }
 
+    /// How many engines share this daemon's listener state.
+    ///
+    /// Test-only, and the only honest way to see whether a stream that lost
+    /// its client let go: every clone of the engine, including the one a
+    /// streaming response holds, counts here.
+    #[cfg(all(test, feature = "rest"))]
+    pub(crate) fn shared_handles(&self) -> usize {
+        Arc::strong_count(&self.rest)
+    }
+
     /// What the daemon reports about its HTTP interface.
     #[cfg(feature = "rest")]
     fn rest_state(&self) -> crate::protocol::RestState {
