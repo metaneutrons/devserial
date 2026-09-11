@@ -5,7 +5,7 @@
 <h1 align="center">devserial</h1>
 
 <p align="center">
-  <strong>Serial terminal for developers with SQLite-buffered output and a CLI, TUI, GUI and MCP interface. One binary to rule them all. ;)</strong>
+  <strong>Serial terminal with SQLite-buffered output and CLI, TUI, GUI, REST and MCP. One binary to rule them all. ;)</strong>
 </p>
 
 <p align="center">
