@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.1](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.0...devserial-v0.2.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **packaging:** a description Homebrew accepts ([#80](https://github.com/metaneutrons/devserial/issues/80)) ([b8de828](https://github.com/metaneutrons/devserial/commit/b8de828b31dfa05826d2348a8b7fa1d89ae10f06))
+
 ## [0.2.0](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.14...devserial-v0.2.0) (2026-09-11)
 
 
