@@ -368,6 +368,24 @@ rather than building a second mechanism. What the move costs is that nothing
 exercises the mechanism with a long-running producer until M6; the line stream
 exercises it with a fast one, which is the weaker of the two cases.
 
+**11 September 2026, M6-A1 is verified at the engine boundary rather than on a
+mock port.** The criterion asked for a loopback or mock port, and a mock port
+turns out not to be able to carry it: the port manager keeps a hardware handle
+only for a real serial port, so write, break, signals and macros are all refused
+on a mock with "no hardware handle" before anything happens. There is no
+loopback device on the three CI platforms either, and making one would mean a
+pseudo-terminal through FFI, which the crate forbids.
+
+What the tests prove instead is the half that is this interface's own: the
+request reaches the engine with the port from the path and the fields from the
+body, shown by refusals that can only be produced that far in — an invalid hex
+string fails while being decoded, which happens only when `hex` arrived as
+true, and the same string without it is taken as text and gets to the port; an
+unknown macro is refused by the name in the path while a known one gets as far
+as the port; a transfer names the file from its body. The other half, bytes on
+a wire, is what HW-A4 in the hardware gate is for, and it was always going to
+be.
+
 **11 September 2026, hardware verification moved out of M1 into a gate of its
 own.** M1's other five criteria are met and its code has been on `main` since
 `62b298a`, but M1-A1's second half and any hands-on check need a device, which

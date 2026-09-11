@@ -5,13 +5,16 @@
 //!
 //! A fourth transport over [`crate::engine::CommandEngine`], beside the CLI,
 //! the IPC daemon and the MCP server, and like them it carries no operation
-//! logic of its own. This slice builds the listener, the switch and the way a
-//! failure is reported; the routes that do the work follow.
+//! logic of its own. Every request variant the daemon knows either has a route
+//! here or a recorded reason for not having one, and a test at the bottom of
+//! this file fails when neither is true.
 //!
-//! Two things here are decisions rather than mechanics, and both are written
-//! down where they are made: the bind happens inside the request that asked
-//! for it, so the answer says what happened, and a request to loopback needs
-//! no token while a bind to anything else refuses to start without one.
+//! Three things here are decisions rather than mechanics, and each is written
+//! down where it is made: the bind happens inside the request that asked for
+//! it, so the answer says what happened; a request to loopback needs no token
+//! while a bind to anything else refuses to start without one; and flashing,
+//! the one operation too slow to answer inside a request, is handed to a job
+//! whose output is a stream.
 
 // A handler's error is an `axum::Response`, which is 128 bytes, and clippy
 // calls that a large `Err`. Boxing it would mean every handler wrapping and
@@ -43,6 +46,22 @@ pub const ROUTES: &[&str] = &[
     "DELETE /v1/ports/{port}/lines",
     "GET /v1/ports/{port}/search",
     "POST /v1/ports/{port}/export",
+    "POST /v1/ports/{port}/write",
+    "POST /v1/ports/{port}/break",
+    "POST /v1/ports/{port}/signals",
+    "POST /v1/ports/{port}/macros/{name}",
+    "POST /v1/ports/{port}/transfers",
+    #[cfg(feature = "esp")]
+    "GET /v1/ports/{port}/esp",
+    #[cfg(feature = "esp")]
+    "POST /v1/ports/{port}/esp/flash",
+    #[cfg(feature = "esp")]
+    "POST /v1/ports/{port}/esp/erase",
+    #[cfg(feature = "esp")]
+    "POST /v1/ports/{port}/esp/write-bin",
+    #[cfg(feature = "esp")]
+    "GET /v1/jobs/{job}/stream",
+    "GET /v1/openapi.json",
 ];
 
 /// How long a stream parks on the engine when nothing is arriving.
@@ -249,6 +268,43 @@ struct Guards {
     engine: crate::engine::CommandEngine,
 }
 
+/// What a handler reaches: the engine, and the jobs running on it.
+///
+/// Two things rather than one because the flash route hands its work to a job
+/// and the job stream reads it back. Everything else takes the engine alone,
+/// which is why this is a substate rather than a new extractor everywhere.
+#[derive(Clone)]
+struct Api {
+    engine: crate::engine::CommandEngine,
+    port: u16,
+    #[cfg(feature = "esp")]
+    jobs: Jobs,
+}
+
+impl Api {
+    fn new(engine: crate::engine::CommandEngine, port: u16) -> Self {
+        Self {
+            engine,
+            port,
+            #[cfg(feature = "esp")]
+            jobs: Jobs::default(),
+        }
+    }
+}
+
+impl axum::extract::FromRef<Api> for crate::engine::CommandEngine {
+    fn from_ref(api: &Api) -> Self {
+        api.engine.clone()
+    }
+}
+
+#[cfg(feature = "esp")]
+impl axum::extract::FromRef<Api> for Jobs {
+    fn from_ref(api: &Api) -> Self {
+        Self::clone(&api.jobs)
+    }
+}
+
 /// The router the interface serves.
 ///
 /// `/v1/health` sits outside the guards: a caller has to be able to ask
@@ -275,7 +331,23 @@ fn router(guards: &Guards) -> axum::Router {
         .route("/v1/ports/{port}/lines/stream", get(stream_lines))
         .route("/v1/ports/{port}/search", get(search))
         .route("/v1/ports/{port}/export", post(export))
-        .with_state(guards.engine.clone())
+        .route("/v1/ports/{port}/write", post(write_data))
+        .route("/v1/ports/{port}/break", post(send_break))
+        .route("/v1/ports/{port}/signals", post(set_signals))
+        .route("/v1/ports/{port}/macros/{name}", post(run_macro))
+        .route("/v1/ports/{port}/transfers", post(transfer))
+        .route("/v1/openapi.json", get(openapi));
+
+    #[cfg(feature = "esp")]
+    let guarded = guarded
+        .route("/v1/ports/{port}/esp", get(esp_info))
+        .route("/v1/ports/{port}/esp/flash", post(esp_flash))
+        .route("/v1/ports/{port}/esp/erase", post(esp_erase))
+        .route("/v1/ports/{port}/esp/write-bin", post(esp_write_bin))
+        .route("/v1/jobs/{job}/stream", get(job_stream));
+
+    let guarded = guarded
+        .with_state(Api::new(guards.engine.clone(), guards.port))
         .layer(axum::middleware::from_fn_with_state(
             Arc::new(guards.clone()),
             require_token,
@@ -639,22 +711,680 @@ async fn stream_lines(
     Ok(axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
+// -------------------------------------------------------- driving the device
+//
+// The five routes that change what the device sees. Each is the operation the
+// CLI already carries out, reached through the engine rather than repeated
+// here, so the two transports cannot drift apart.
+
+/// Write bytes to the port.
+async fn write_data(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<WriteBody>,
+) -> Reply {
+    use crate::protocol::{RequestPayload, ResponsePayload};
+
+    let ResponsePayload::WriteSuccess { bytes_written } = run(
+        &engine,
+        RequestPayload::WriteData {
+            port,
+            data: body.data,
+            is_hex: body.hex,
+        },
+    )
+    .await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(axum::Json(
+        serde_json::json!({ "bytes_written": bytes_written }),
+    ))
+}
+
+/// Hold the line in the break condition.
+async fn send_break(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<BreakBody>,
+) -> Reply {
+    use crate::protocol::{RequestPayload, ResponsePayload};
+
+    let ResponsePayload::BreakSuccess { duration_ms } = run(
+        &engine,
+        RequestPayload::SendBreak {
+            port,
+            duration_ms: body.duration_ms,
+        },
+    )
+    .await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(axum::Json(
+        serde_json::json!({ "duration_ms": duration_ms }),
+    ))
+}
+
+/// Set DTR, RTS or both.
+async fn set_signals(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<SignalsBody>,
+) -> Reply {
+    use crate::protocol::{RequestPayload, ResponsePayload};
+
+    let ResponsePayload::SignalSuccess { applied } = run(
+        &engine,
+        RequestPayload::SetSignal {
+            port,
+            dtr: body.dtr,
+            rts: body.rts,
+        },
+    )
+    .await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(axum::Json(serde_json::json!({ "applied": applied })))
+}
+
+/// Run a macro from the configuration.
+///
+/// The macro is named in the path rather than in a body, because it is the
+/// thing being run and not a parameter of it.
+async fn run_macro(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path((port, name)): axum::extract::Path<(String, String)>,
+) -> Reply {
+    use crate::protocol::{RequestPayload, ResponsePayload};
+
+    let ResponsePayload::MacroSuccess { executed_steps } = run(
+        &engine,
+        RequestPayload::ExecuteMacro {
+            port,
+            macro_name: name,
+        },
+    )
+    .await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(axum::Json(
+        serde_json::json!({ "executed": executed_steps }),
+    ))
+}
+
+/// Send or receive a file with a modem protocol.
+///
+/// One route for both directions: the transfer is the same operation with the
+/// file going the other way, and a caller that has to pick a direction anyway
+/// is better served by one name than by two.
+async fn transfer(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<TransferBody>,
+) -> Reply {
+    use crate::protocol::{RequestPayload, ResponsePayload};
+
+    let payload = match body {
+        TransferBody::Send { path, protocol } => RequestPayload::SendFile {
+            port,
+            file_path: path,
+            protocol,
+        },
+        TransferBody::Receive {
+            directory,
+            protocol,
+        } => RequestPayload::ReceiveFile {
+            port,
+            output_dir: directory,
+            protocol,
+        },
+    };
+
+    let ResponsePayload::TransferSuccess {
+        bytes_transferred,
+        file_name,
+        protocol,
+        path,
+    } = run(&engine, payload).await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(axum::Json(serde_json::json!({
+        "bytes_transferred": bytes_transferred,
+        "file_name": file_name,
+        "protocol": protocol,
+        "path": path,
+    })))
+}
+
+// ------------------------------------------------------------------ the esp
+//
+// Present only with the `esp` feature, and absent from the route list without
+// it, so a caller reading `/v1/version` learns what this build can do rather
+// than discovering it at a 404.
+
+/// What the attached board says about itself.
+#[cfg(feature = "esp")]
+async fn esp_info(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+) -> Reply {
+    esp_answer(run(&engine, crate::protocol::RequestPayload::EspInfo { port }).await?)
+}
+
+/// Erase the flash.
+#[cfg(feature = "esp")]
+async fn esp_erase(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+) -> Reply {
+    esp_answer(run(&engine, crate::protocol::RequestPayload::EspErase { port }).await?)
+}
+
+/// Write a raw binary to an address in flash.
+#[cfg(feature = "esp")]
+async fn esp_write_bin(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<EspWriteBinBody>,
+) -> Reply {
+    esp_answer(
+        run(
+            &engine,
+            crate::protocol::RequestPayload::EspWriteBin {
+                port,
+                file_path: body.path,
+                address: body.address,
+            },
+        )
+        .await?,
+    )
+}
+
+/// The tool's output, which is the same answer for all three of these.
+#[cfg(feature = "esp")]
+fn esp_answer(answer: crate::protocol::ResponsePayload) -> Reply {
+    let crate::protocol::ResponsePayload::EspSuccess(output) = answer else {
+        return Err(unexpected());
+    };
+    Ok(axum::Json(serde_json::json!({ "output": output })))
+}
+
+/// Start a flash, and answer with the job that is carrying it out.
+///
+/// `202` rather than `200`: flashing takes tens of seconds, and a request that
+/// waited for it would be indistinguishable from one that hung. The answer
+/// names the stream where the tool's output arrives line by line and where the
+/// outcome is reported, so nothing has to be polled for.
+#[cfg(feature = "esp")]
+async fn esp_flash(
+    axum::extract::State(engine): Engine,
+    axum::extract::State(jobs): axum::extract::State<Jobs>,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<EspFlashBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let id = job_id();
+    let job = Arc::new(Job::new());
+    remember(&jobs, id.clone(), Arc::clone(&job));
+
+    tokio::spawn(async move {
+        let (progress, mut lines) =
+            tokio::sync::mpsc::unbounded_channel::<crate::esp::OutputLine>();
+        let collecting = Arc::clone(&job);
+        let pump = tokio::spawn(async move {
+            while let Some(line) = lines.recv().await {
+                collecting.push(line.text);
+            }
+        });
+
+        let outcome = engine
+            .esp_flash_reporting(port, body.firmware, body.baud, progress)
+            .await;
+
+        // The pump ends when the call above drops its sender, so waiting for
+        // it here is what puts every line in the log before the outcome does.
+        drop(pump.await);
+        job.finish(match outcome {
+            Ok(crate::protocol::ResponsePayload::EspSuccess(output)) => Ok(output),
+            Ok(_) => Err("the engine answered with something this route does not serve".to_owned()),
+            Err(e) => Err(e.to_string()),
+        });
+    });
+
+    (
+        axum::http::StatusCode::ACCEPTED,
+        axum::Json(serde_json::json!({
+            "job": id,
+            "stream": format!("/v1/jobs/{id}/stream"),
+        })),
+    )
+        .into_response()
+}
+
+/// The output of a job, one event per line, ending with its outcome.
+///
+/// The mechanism the capture stream already uses: an id on every event, and
+/// `Last-Event-ID` to resume from it. A client that reconnects after the job
+/// finished still gets everything, because the log is kept.
+#[cfg(feature = "esp")]
+async fn job_stream(
+    axum::extract::State(jobs): axum::extract::State<Jobs>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<JobQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    axum::response::Sse<
+        impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    axum::response::Response,
+> {
+    let Some(job) = find(&jobs, &id) else {
+        return Err(problem(
+            axum::http::StatusCode::NOT_FOUND,
+            "no-such-job",
+            &format!("no job '{id}' is known"),
+        ));
+    };
+
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    // An event id is the line's position counted from one, so the id last seen
+    // is also the number of lines already delivered.
+    let mut sent = query.after.or(resume).unwrap_or(0);
+
+    let stream = async_stream::stream! {
+        // Subscribed before the first read, so a line written between the read
+        // and the wait bumps a revision this reader has not seen and it comes
+        // straight back rather than waiting for the next one.
+        let mut revisions = job.revision.subscribe();
+        loop {
+            let (lines, outcome) = job.since(sent);
+            for text in lines {
+                sent += 1;
+                yield Ok(axum::response::sse::Event::default()
+                    .id(sent.to_string())
+                    .event("line")
+                    .data(serde_json::json!({ "text": text }).to_string()));
+            }
+            if let Some(outcome) = outcome {
+                let done = match outcome {
+                    Ok(output) => serde_json::json!({ "ok": true, "output": output }),
+                    Err(error) => serde_json::json!({ "ok": false, "error": error }),
+                };
+                yield Ok(axum::response::sse::Event::default()
+                    .event("done")
+                    .data(done.to_string()));
+                break;
+            }
+            if revisions.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+
+    Ok(axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
+}
+
+// ------------------------------------------------------------------- jobs
+//
+// A job is one run of an external tool. It exists because flashing is the one
+// operation too slow to answer inside a request, and it is deliberately not a
+// general task system: there is one producer, the log is the whole state, and
+// the registry dies with the listener.
+
+/// How many finished jobs the registry keeps.
+///
+/// A finished job stays so a client that reconnects can still read the
+/// outcome. Without a cap, a daemon that flashes all day would hold every run
+/// it ever made.
+#[cfg(feature = "esp")]
+const JOBS_KEPT: usize = 16;
+
+/// What a job has printed, and how it ended.
+#[cfg(feature = "esp")]
+#[derive(Default)]
+struct JobLog {
+    lines: Vec<String>,
+    outcome: Option<Result<String, String>>,
+}
+
+/// One run of an external tool.
+#[cfg(feature = "esp")]
+struct Job {
+    log: std::sync::Mutex<JobLog>,
+    revision: tokio::sync::watch::Sender<u64>,
+}
+
+#[cfg(feature = "esp")]
+impl Job {
+    fn new() -> Self {
+        Self {
+            log: std::sync::Mutex::new(JobLog::default()),
+            revision: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    fn push(&self, text: String) {
+        self.change(|log| log.lines.push(text));
+    }
+
+    fn finish(&self, outcome: Result<String, String>) {
+        self.change(|log| log.outcome = Some(outcome));
+    }
+
+    fn change(&self, write: impl FnOnce(&mut JobLog)) {
+        write(
+            &mut self
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        self.revision.send_modify(|revision| *revision += 1);
+    }
+
+    /// Everything past `sent`, and the outcome when there is one.
+    ///
+    /// Both come from one lock on purpose. The outcome is set after the last
+    /// line, so a snapshot carrying it carries every line before it, and a
+    /// reader can end the stream without wondering what it missed.
+    fn since(&self, sent: usize) -> (Vec<String>, Option<Result<String, String>>) {
+        let log = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            log.lines.get(sent..).unwrap_or_default().to_vec(),
+            log.outcome.clone(),
+        )
+    }
+
+    fn is_finished(&self) -> bool {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome
+            .is_some()
+    }
+}
+
+/// The jobs this listener knows, oldest first.
+#[cfg(feature = "esp")]
+type Jobs = Arc<std::sync::Mutex<std::collections::VecDeque<(String, Arc<Job>)>>>;
+
+/// Put a job in the registry, dropping old finished ones.
+#[cfg(feature = "esp")]
+fn remember(jobs: &Jobs, id: String, job: Arc<Job>) {
+    let mut known = jobs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    known.push_back((id, job));
+    // A running job is somebody's stream, so only finished ones are dropped.
+    while known.len() > JOBS_KEPT && known.front().is_some_and(|(_, job)| job.is_finished()) {
+        known.pop_front();
+    }
+    drop(known);
+}
+
+/// The job with this id, if the registry still has it.
+#[cfg(feature = "esp")]
+fn find(jobs: &Jobs, id: &str) -> Option<Arc<Job>> {
+    jobs.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(known, _)| known == id)
+        .map(|(_, job)| Arc::clone(job))
+}
+
+/// An id no other job in this process has had.
+///
+/// The clock and a counter: the counter keeps two jobs started in the same
+/// nanosecond apart, and the clock keeps a job apart from one that had the
+/// same counter before the listener was restarted.
+#[cfg(feature = "esp")]
+fn job_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(0));
+    format!("{clock:x}{count:x}")
+}
+
+// ---------------------------------------------------------- the description
+//
+// `/v1/openapi.json` is built from `ROUTES` and from the very structs the
+// handlers deserialize. Nothing about a route is described in two places: the
+// path and method come from the list, the parameters and bodies from the
+// types, and the only sentence written by hand is the summary.
+
+/// The interface as `OpenAPI`, for a reader or a generator.
+fn openapi_document(port: u16) -> serde_json::Value {
+    let mut paths = serde_json::Map::new();
+    for route in ROUTES {
+        let Some((method, path)) = route.split_once(' ') else {
+            continue;
+        };
+        let (query, body) = shapes(route);
+        let mut operation = serde_json::json!({
+            "summary": describe(route),
+            "operationId": operation_id(method, path),
+            "parameters": parameters(path, query.as_ref()),
+        });
+        if let Some(body) = body {
+            operation["requestBody"] = serde_json::json!({
+                "required": true,
+                "content": { "application/json": { "schema": body } },
+            });
+        }
+        operation["responses"] = responses(route);
+
+        paths
+            .entry(path.to_owned())
+            .or_insert_with(|| serde_json::json!({}))[method.to_lowercase()] = operation;
+    }
+
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "devserial",
+            "version": env!("CARGO_PKG_VERSION"),
+            "summary": "The serial daemon over HTTP.",
+            "description": "Every request carries Host: localhost:PORT or the \
+                            loopback address on the bound port, and every body \
+                            declares Content-Type: application/json. A bearer \
+                            token is required unless the listener is on \
+                            loopback without one configured.",
+            "license": { "name": "GPL-3.0-or-later" },
+        },
+        "servers": [{ "url": format!("http://127.0.0.1:{port}") }],
+        "components": {
+            "securitySchemes": {
+                "token": { "type": "http", "scheme": "bearer" },
+            },
+        },
+        "paths": paths,
+    })
+}
+
+/// The interface, described for a generator.
+async fn openapi(
+    axum::extract::State(api): axum::extract::State<Api>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(openapi_document(api.port))
+}
+
+/// What one route is for, in one sentence.
+///
+/// The only hand-written part of the description, and the test below fails
+/// when a route has no sentence here.
+fn describe(route: &str) -> &'static str {
+    match route {
+        "GET /v1/health" => "Whether the interface is answering.",
+        "GET /v1/version" => "What this build is, and every route it serves.",
+        "GET /v1/ports" => "The ports the daemon holds, and what the operating system reports.",
+        "PUT /v1/ports/{port}" => "Open a port, or change the settings of one already open.",
+        "DELETE /v1/ports/{port}" => "Close a port the daemon holds.",
+        "GET /v1/ports/{port}" => "Link state and buffer statistics of one port.",
+        "GET /v1/ports/{port}/stats" => "Buffer statistics of one port.",
+        "GET /v1/ports/{port}/lines" => "A page of captured lines.",
+        "GET /v1/ports/{port}/lines/stream" => "The capture as it grows, one event per line.",
+        "DELETE /v1/ports/{port}/lines" => "Discard the buffer, optionally archiving it first.",
+        "GET /v1/ports/{port}/search" => "Search the capture.",
+        "POST /v1/ports/{port}/export" => "Write the capture to a file the daemon can reach.",
+        "POST /v1/ports/{port}/write" => "Write bytes to the port, as text or as hex.",
+        "POST /v1/ports/{port}/break" => "Hold the line in the break condition.",
+        "POST /v1/ports/{port}/signals" => "Set DTR, RTS or both.",
+        "POST /v1/ports/{port}/macros/{name}" => "Run a macro from the configuration.",
+        "POST /v1/ports/{port}/transfers" => "Send or receive a file with a modem protocol.",
+        "GET /v1/openapi.json" => "This description.",
+        #[cfg(feature = "esp")]
+        "GET /v1/ports/{port}/esp" => "What the attached board says about itself.",
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/flash" => "Start flashing firmware, and name the job doing it.",
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/erase" => "Erase the flash of the attached board.",
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/write-bin" => "Write a raw binary to an address in flash.",
+        #[cfg(feature = "esp")]
+        "GET /v1/jobs/{job}/stream" => "The output of a job, one event per line.",
+        _ => "",
+    }
+}
+
+/// The query parameters and the request body of one route, as schemas.
+///
+/// Derived from the structs the handlers deserialize, so a field that is
+/// renamed or dropped changes the description with it.
+fn shapes(route: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let query = |schema: serde_json::Value| (Some(schema), None);
+    let body = |schema: serde_json::Value| (None, Some(schema));
+    match route {
+        "GET /v1/ports" => query(schema_of::<PortsQuery>()),
+        "GET /v1/ports/{port}/lines" | "GET /v1/ports/{port}/lines/stream" => {
+            query(schema_of::<LinesQuery>())
+        }
+        "DELETE /v1/ports/{port}/lines" => query(schema_of::<ClearQuery>()),
+        "GET /v1/ports/{port}/search" => query(schema_of::<SearchQuery>()),
+        "PUT /v1/ports/{port}" => body(schema_of::<crate::protocol::PortSettings>()),
+        "POST /v1/ports/{port}/export" => body(schema_of::<ExportBody>()),
+        "POST /v1/ports/{port}/write" => body(schema_of::<WriteBody>()),
+        "POST /v1/ports/{port}/break" => body(schema_of::<BreakBody>()),
+        "POST /v1/ports/{port}/signals" => body(schema_of::<SignalsBody>()),
+        "POST /v1/ports/{port}/transfers" => body(schema_of::<TransferBody>()),
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/flash" => body(schema_of::<EspFlashBody>()),
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/write-bin" => body(schema_of::<EspWriteBinBody>()),
+        #[cfg(feature = "esp")]
+        "GET /v1/jobs/{job}/stream" => query(schema_of::<JobQuery>()),
+        _ => (None, None),
+    }
+}
+
+/// One type's JSON schema, as a value this document can carry.
+fn schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_default()
+}
+
+/// The parameters of one route: the path placeholders, then the query.
+fn parameters(path: &str, query: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut parameters: Vec<serde_json::Value> = path
+        .split('/')
+        .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "in": "path",
+                "required": true,
+                "schema": { "type": "string" },
+            })
+        })
+        .collect();
+
+    let properties = query
+        .and_then(|schema| schema.get("properties"))
+        .and_then(serde_json::Value::as_object);
+    for (name, schema) in properties.into_iter().flatten() {
+        parameters.push(serde_json::json!({
+            "name": name,
+            "in": "query",
+            "required": false,
+            "schema": schema,
+        }));
+    }
+    parameters
+}
+
+/// What a route answers with.
+///
+/// One success and one catch-all, because every failure this interface
+/// produces is a problem document and listing them per route would say the
+/// same thing twenty times.
+fn responses(route: &str) -> serde_json::Value {
+    let (code, description) = if route.ends_with("/esp/flash") {
+        ("202", "the job was started")
+    } else if route.ends_with("/stream") {
+        ("200", "an event stream")
+    } else {
+        ("200", "the request was carried out")
+    };
+    serde_json::json!({
+        code: { "description": description },
+        "default": {
+            "description": "a problem document (RFC 9457)",
+            "content": { "application/problem+json": {} },
+        },
+    })
+}
+
+/// A name for one route, built from its method and path.
+fn operation_id(method: &str, path: &str) -> String {
+    let mut id = method.to_lowercase();
+    // The leading empty segment and the version carry nothing that tells two
+    // routes apart.
+    for segment in path.split('/').skip(2) {
+        let cleaned: String = segment
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        for word in cleaned.split('_').filter(|word| !word.is_empty()) {
+            id.push('_');
+            id.push_str(word);
+        }
+    }
+    id
+}
+
 // ------------------------------------------------------------- parameters
 
 /// `GET /v1/ports`
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PortsQuery {
     hardware: Option<bool>,
 }
 
 /// `DELETE /v1/ports/{port}/lines`
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ClearQuery {
     archive: Option<bool>,
 }
 
 /// `POST /v1/ports/{port}/export`
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExportBody {
     path: String,
     format: Option<crate::export::ExportFormat>,
@@ -662,12 +1392,87 @@ struct ExportBody {
     end_line: Option<i64>,
 }
 
+/// `POST /v1/ports/{port}/write`
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WriteBody {
+    /// What to write. A `0x` prefix is read as hex without `hex` being set.
+    data: String,
+    /// Read `data` as hex even when it carries no prefix.
+    #[serde(default)]
+    hex: bool,
+}
+
+/// `POST /v1/ports/{port}/break`
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BreakBody {
+    /// How long to hold the line, in milliseconds.
+    duration_ms: Option<u64>,
+}
+
+/// `POST /v1/ports/{port}/signals`
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SignalsBody {
+    /// Data terminal ready.
+    dtr: Option<bool>,
+    /// Request to send.
+    rts: Option<bool>,
+}
+
+/// `POST /v1/ports/{port}/transfers`
+///
+/// One route for both directions, told apart by `direction`, because a
+/// transfer is the same operation with the file going the other way.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(tag = "direction", rename_all = "lowercase")]
+enum TransferBody {
+    /// Send a file the daemon can read.
+    Send {
+        /// Path on the machine the daemon runs on.
+        path: String,
+        protocol: crate::modem::FileTransferProtocol,
+    },
+    /// Receive a file into a directory the daemon can write to.
+    Receive {
+        /// Directory on the machine the daemon runs on.
+        directory: String,
+        protocol: crate::modem::FileTransferProtocol,
+    },
+}
+
+/// `POST /v1/ports/{port}/esp/flash`
+#[cfg(feature = "esp")]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EspFlashBody {
+    /// Path to the firmware, on the machine the daemon runs on.
+    firmware: String,
+    /// Baud rate for the flash itself, not for the port afterwards.
+    baud: Option<u32>,
+}
+
+/// `POST /v1/ports/{port}/esp/write-bin`
+#[cfg(feature = "esp")]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EspWriteBinBody {
+    /// Path to the binary, on the machine the daemon runs on.
+    path: String,
+    /// Flash address, such as `0x1000`.
+    address: String,
+}
+
+/// `GET /v1/jobs/{job}/stream`
+#[cfg(feature = "esp")]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct JobQuery {
+    /// The last event id already seen, so the stream resumes after it.
+    after: Option<usize>,
+}
+
 /// `GET /v1/ports/{port}/lines`
 ///
 /// Every field of `ReadWindow` is reachable, so the HTTP caller can ask the
 /// same questions the CLI and the MCP server can. `since` is RFC 3339 rather
 /// than a nanosecond count, parsed by the same function the MCP server uses.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct LinesQuery {
     start: Option<i64>,
     after: Option<i64>,
@@ -691,7 +1496,7 @@ impl LinesQuery {
 }
 
 /// `GET /v1/ports/{port}/search`
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchQuery {
     q: String,
     mode: Option<crate::protocol::SearchMode>,
@@ -1006,20 +1811,29 @@ mod tests {
             R::Search { .. } => Ok(&["GET /v1/ports/{port}/search"]),
             R::Export { .. } => Ok(&["POST /v1/ports/{port}/export"]),
 
-            // Recorded exceptions, each with the reason it is one.
             R::Shutdown => Err(
                 "stopping the daemon over HTTP would let a caller remove the thing answering it",
             ),
-            R::WriteData { .. }
-            | R::SendBreak { .. }
-            | R::SetSignal { .. }
-            | R::ExecuteMacro { .. }
-            | R::SendFile { .. }
-            | R::ReceiveFile { .. } => Err("driving the device is the next slice"),
+            R::WriteData { .. } => Ok(&["POST /v1/ports/{port}/write"]),
+            R::SendBreak { .. } => Ok(&["POST /v1/ports/{port}/break"]),
+            R::SetSignal { .. } => Ok(&["POST /v1/ports/{port}/signals"]),
+            R::ExecuteMacro { .. } => Ok(&["POST /v1/ports/{port}/macros/{name}"]),
+            // One route for both, told apart by the direction in the body.
+            R::SendFile { .. } | R::ReceiveFile { .. } => Ok(&["POST /v1/ports/{port}/transfers"]),
             #[cfg(feature = "esp")]
-            R::EspFlash { .. } | R::EspInfo { .. } | R::EspErase { .. } | R::EspWriteBin { .. } => {
-                Err("the ESP routes are the next slice")
-            }
+            R::EspInfo { .. } => Ok(&["GET /v1/ports/{port}/esp"]),
+            // Two routes, one request: starting the flash and watching it.
+            #[cfg(feature = "esp")]
+            R::EspFlash { .. } => Ok(&[
+                "POST /v1/ports/{port}/esp/flash",
+                "GET /v1/jobs/{job}/stream",
+            ]),
+            #[cfg(feature = "esp")]
+            R::EspErase { .. } => Ok(&["POST /v1/ports/{port}/esp/erase"]),
+            #[cfg(feature = "esp")]
+            R::EspWriteBin { .. } => Ok(&["POST /v1/ports/{port}/esp/write-bin"]),
+
+            // Recorded exceptions, each with the reason it is one.
             R::RestStatus | R::RestEnable { .. } | R::RestDisable => {
                 Err("the switch is reached through the daemon, not through the thing it switches")
             }
@@ -1161,10 +1975,11 @@ mod tests {
             .flat_map(<[&str]>::iter)
             .copied()
             .collect();
+        // Two routes describe the build rather than carrying out a request,
+        // so they are the ones with nothing to claim them.
+        let about_itself = ["GET /v1/version", "GET /v1/openapi.json"];
         for route in ROUTES {
-            // `/v1/version` describes the build rather than carrying out a
-            // request, so it is the one route with nothing to claim it.
-            if *route == "GET /v1/version" {
+            if about_itself.contains(route) {
                 continue;
             }
             assert!(
@@ -1379,7 +2194,7 @@ mod tests {
     ) {
         let (server, addr, engine, dir) = listening(None);
 
-        let (mock, _ctrl) = crate::testutil::mock_serial::mock_serial(4096);
+        let (mock, _control) = crate::testutil::mock_serial::mock_serial(4096);
         let storage = Arc::new(std::sync::Mutex::new(
             crate::storage::SqliteStorage::open_memory().expect("storage"),
         ));
@@ -1593,6 +2408,337 @@ mod tests {
         );
     }
 
+    /// One POST with a JSON body, from the right host.
+    fn post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
+        send(
+            addr,
+            "POST",
+            path,
+            None,
+            Some(body),
+            Some(&addr.to_string()),
+        )
+    }
+
+    /// The write route hands the engine what the body said.
+    ///
+    /// A port the daemon holds for a mock has no hardware handle, so nothing
+    /// reaches a wire here and the hardware gate is where that is seen. What
+    /// this pins down is the step before it: an invalid hex string fails while
+    /// it is being decoded, which only happens when `hex` arrived as true, and
+    /// the same string without it is taken as text and gets to the port.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_write_route_hands_the_engine_what_the_body_said() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+        let path = "/v1/ports/mock_rest_port/write";
+
+        let hex = post(addr, path, r#"{"data":"zz","hex":true}"#);
+        assert!(hex.starts_with("HTTP/1.1 400"), "{hex}");
+        assert!(hex.contains("invalid hex digit 'zz'"), "{hex}");
+
+        let text = post(addr, path, r#"{"data":"zz"}"#);
+        assert!(text.contains("no hardware handle"), "{text}");
+
+        // A prefix says hex on its own, as it does everywhere else.
+        let prefixed = post(addr, path, r#"{"data":"0xzz"}"#);
+        assert!(prefixed.contains("invalid hex digit"), "{prefixed}");
+    }
+
+    /// Break, signals and macros are carried out by the engine.
+    ///
+    /// A mock port has no hardware handle, so the engine's own refusal is what
+    /// comes back. That refusal is the evidence: it can only be produced by a
+    /// request that reached the engine with the right port in it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn break_signals_and_macros_reach_the_engine() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+
+        let broken = post(
+            addr,
+            "/v1/ports/mock_rest_port/break",
+            r#"{"duration_ms":5}"#,
+        );
+        assert!(broken.starts_with("HTTP/1.1 400"), "{broken}");
+        assert!(broken.contains("no hardware handle"), "{broken}");
+
+        // Nothing to set is refused by the engine rather than passed on.
+        let nothing = post(addr, "/v1/ports/mock_rest_port/signals", "{}");
+        assert!(nothing.contains("at least one of dtr or rts"), "{nothing}");
+
+        let signalled = post(addr, "/v1/ports/mock_rest_port/signals", r#"{"dtr":true}"#);
+        assert!(signalled.contains("no hardware handle"), "{signalled}");
+
+        // The name in the path is the macro that is looked up: an unknown one
+        // is refused by name, a known one gets as far as the port.
+        let unknown = post(addr, "/v1/ports/mock_rest_port/macros/not-a-macro", "{}");
+        assert!(unknown.contains("unknown macro 'not-a-macro'"), "{unknown}");
+        let known = post(addr, "/v1/ports/mock_rest_port/macros/reset", "{}");
+        assert!(known.contains("no hardware handle"), "{known}");
+    }
+
+    /// A transfer reaches the engine in both directions.
+    ///
+    /// Against a port that does not exist, so the modem protocol never starts
+    /// and the test measures the route rather than the timing of a handshake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transfer_reaches_the_engine_in_both_directions() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+        let path = "/v1/ports/nope/transfers";
+
+        let sending = post(
+            addr,
+            path,
+            r#"{"direction":"send","path":"/tmp/does-not-matter.bin","protocol":"zmodem"}"#,
+        );
+        assert!(sending.starts_with("HTTP/1.1 400"), "{sending}");
+        assert!(
+            sending.contains("does-not-matter.bin"),
+            "the refusal names the file from the body: {sending}"
+        );
+
+        let receiving = post(
+            addr,
+            path,
+            r#"{"direction":"receive","directory":"/tmp","protocol":"ymodem"}"#,
+        );
+        assert!(receiving.starts_with("HTTP/1.1 400"), "{receiving}");
+        assert!(receiving.contains("nope"), "{receiving}");
+
+        // A direction the interface does not have is refused before anything
+        // touches a port.
+        let sideways = post(addr, path, r#"{"direction":"sideways","path":"/tmp/x"}"#);
+        assert!(
+            sideways.starts_with("HTTP/1.1 422") || sideways.starts_with("HTTP/1.1 400"),
+            "{sideways}"
+        );
+        assert!(!sideways.contains("nope"), "{sideways}");
+    }
+
+    /// The ESP routes are there with the feature and absent without it.
+    ///
+    /// The answer with the feature is a refusal on this machine, because there
+    /// is no board and usually no espflash either. What it is not is a 404,
+    /// which is the whole difference this test measures.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_esp_routes_follow_the_feature() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+        let answer = get(addr, "/v1/ports/mock_rest_port/esp", None);
+
+        #[cfg(feature = "esp")]
+        assert!(!answer.starts_with("HTTP/1.1 404"), "{answer}");
+        #[cfg(not(feature = "esp"))]
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+
+        let advertised = ROUTES.iter().any(|route| route.contains("/esp"));
+        assert_eq!(advertised, cfg!(feature = "esp"));
+    }
+
+    /// The flash route answers with a job, and the job's stream carries it.
+    ///
+    /// The flash cannot succeed here: there is no board, and usually no
+    /// espflash. That is what makes this a test of the job rather than of the
+    /// tool. A client that only ever got the `202` would be left waiting, so
+    /// the outcome has to arrive on the stream whatever it is.
+    #[cfg(feature = "esp")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_flash_route_answers_with_a_job_and_streams_its_outcome() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+
+        let started = post(
+            addr,
+            "/v1/ports/mock_rest_port/esp/flash",
+            r#"{"firmware":"/nonexistent/firmware.bin"}"#,
+        );
+        assert!(started.starts_with("HTTP/1.1 202"), "{started}");
+        let body = body_of(&started);
+        let job = body["job"]
+            .as_str()
+            .expect("the answer names a job")
+            .to_owned();
+        assert_eq!(body["stream"], format!("/v1/jobs/{job}/stream"));
+
+        let seen = stream_until(
+            addr,
+            &format!("/v1/jobs/{job}/stream"),
+            None,
+            "event: done",
+            1,
+        );
+        assert!(seen.starts_with("HTTP/1.1 200"), "{seen}");
+        assert!(seen.contains("text/event-stream"), "{seen}");
+        assert!(
+            seen.contains(r#""ok":false"#),
+            "the outcome has to reach the client: {seen}"
+        );
+
+        // A job nobody started is a refusal rather than a stream that never
+        // says anything.
+        let absent = get(addr, "/v1/jobs/nosuchjob/stream", None);
+        assert!(absent.starts_with("HTTP/1.1 404"), "{absent}");
+        assert!(absent.contains("no-such-job"), "{absent}");
+    }
+
+    /// Every route the interface advertises is actually mounted.
+    ///
+    /// The list is what `/v1/version` hands out and what the description is
+    /// built from, so a path in it that the router does not carry would be a
+    /// promise broken at a 404. The answers here are mostly refusals — an
+    /// empty body is not an export, and nothing can be flashed on this
+    /// machine — so what this looks at is whether anything is served at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_advertised_route_is_mounted() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+
+        // One route answers 404 by right: a job that was never started. So one
+        // is started, and the sweep asks about that.
+        #[cfg(feature = "esp")]
+        let flashing = {
+            let started = post(
+                addr,
+                "/v1/ports/mock_rest_port/esp/flash",
+                r#"{"firmware":"/nonexistent/firmware.bin"}"#,
+            );
+            body_of(&started)["job"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        #[cfg(not(feature = "esp"))]
+        let flashing = String::new();
+
+        for route in ROUTES {
+            let (method, template) = route.split_once(' ').expect("a method and a path");
+            let path = template
+                .replace("{port}", "mock_rest_port")
+                .replace("{name}", "reset")
+                .replace("{job}", &flashing);
+
+            // A stream never ends, so it is read only until it has said what
+            // it is.
+            let answer = if template.ends_with("/stream") {
+                stream_until(addr, &path, None, "HTTP/1.1", 1)
+            } else if method == "GET" {
+                get(addr, &path, None)
+            } else {
+                send(
+                    addr,
+                    method,
+                    &path,
+                    None,
+                    Some("{}"),
+                    Some(&addr.to_string()),
+                )
+            };
+
+            assert!(
+                answer.starts_with("HTTP/1.1 "),
+                "{route} answered nothing at all: {answer}"
+            );
+            assert!(
+                !answer.starts_with("HTTP/1.1 404"),
+                "{route} is advertised but not served"
+            );
+        }
+    }
+
+    /// The description covers every route the interface serves, and no more.
+    ///
+    /// This is the second ratchet. A route added to the list without a
+    /// sentence, or a description that drifts from the list, fails here rather
+    /// than being published as a specification nobody checked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_description_covers_every_route() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+
+        let response = get(addr, "/v1/openapi.json", None);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let document = body_of(&response);
+        assert_eq!(document["openapi"], "3.1.0");
+        // The server it names is the one it is answering on.
+        assert_eq!(
+            document["servers"][0]["url"],
+            format!("http://127.0.0.1:{}", addr.port())
+        );
+
+        let paths = document["paths"]
+            .as_object()
+            .expect("the document has paths");
+        let mut names = std::collections::BTreeSet::new();
+        for route in ROUTES {
+            let (method, path) = route
+                .split_once(' ')
+                .expect("a route is a method and a path");
+            let operation = paths
+                .get(path)
+                .and_then(|entry| entry.get(method.to_lowercase()))
+                .unwrap_or_else(|| panic!("{route} is served but not described"));
+
+            assert!(
+                operation["summary"].as_str().is_some_and(|s| !s.is_empty()),
+                "{route} is described without saying what it is for"
+            );
+            let name = operation["operationId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            assert!(!name.is_empty(), "{route} is described without a name");
+            assert!(
+                names.insert(name),
+                "{route} shares its name with another route"
+            );
+
+            // Every placeholder in the path is a parameter of the operation.
+            let declared: Vec<&str> = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["in"] == "path")
+                .filter_map(|p| p["name"].as_str())
+                .collect();
+            for placeholder in path
+                .split('/')
+                .filter_map(|s| s.strip_prefix('{')?.strip_suffix('}'))
+            {
+                assert!(
+                    declared.contains(&placeholder),
+                    "{route} hides {placeholder}"
+                );
+            }
+        }
+
+        // Nothing is described that is not served.
+        let described: usize = paths
+            .values()
+            .filter_map(serde_json::Value::as_object)
+            .map(serde_json::Map::len)
+            .sum();
+        assert_eq!(
+            described,
+            ROUTES.len(),
+            "the description and the route list disagree"
+        );
+
+        // The bodies come from the structs the handlers read, which is what
+        // makes this a description rather than a second hand-written list.
+        let write = &paths["/v1/ports/{port}/write"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"];
+        assert!(
+            write["properties"]["data"].is_object() && write["properties"]["hex"].is_object(),
+            "the write body is not described from its own struct: {write}"
+        );
+        let lines = &paths["/v1/ports/{port}/lines"]["get"]["parameters"];
+        let query: Vec<&str> = lines
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["in"] == "query")
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        for field in ["start", "after", "tail", "since", "limit", "wait_ms"] {
+            assert!(query.contains(&field), "{field} is not described: {lines}");
+        }
+    }
+
     /// Open a stream, read what arrives, and hang up.
     ///
     /// A streaming response never closes, so this reads until it has seen the
@@ -1603,6 +2749,7 @@ mod tests {
         addr: std::net::SocketAddr,
         path: &str,
         last_event_id: Option<i64>,
+        marker: &str,
         events: usize,
     ) -> String {
         use std::io::{Read as _, Write as _};
@@ -1626,7 +2773,7 @@ mod tests {
                 Ok(0) => break,
                 Ok(n) => {
                     seen.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if seen.matches("event: line").count() >= events {
+                    if seen.matches(marker).count() >= events {
                         break;
                     }
                 }
@@ -1642,7 +2789,7 @@ mod tests {
         let (_server, addr, _engine, _dir, storage) = listening_with_lines().await;
         let path = "/v1/ports/mock_rest_port/lines/stream";
 
-        let first = stream_until(addr, path, None, 3);
+        let first = stream_until(addr, path, None, "event: line", 3);
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
         assert!(
             first.contains("text/event-stream"),
@@ -1664,7 +2811,7 @@ mod tests {
 
         // Resuming from the second line gives the third and the new one, and
         // not the two the client already had.
-        let resumed = stream_until(addr, path, Some(2), 2);
+        let resumed = stream_until(addr, path, Some(2), "event: line", 2);
         assert_eq!(resumed.matches("event: line").count(), 2, "{resumed}");
         assert!(resumed.contains("Guru Meditation"), "{resumed}");
         assert!(resumed.contains("after the gap"), "{resumed}");
@@ -1685,7 +2832,13 @@ mod tests {
         let (_server, addr, engine, _dir, _storage) = listening_with_lines().await;
         let before = engine.shared_handles();
 
-        let seen = stream_until(addr, "/v1/ports/mock_rest_port/lines/stream", None, 3);
+        let seen = stream_until(
+            addr,
+            "/v1/ports/mock_rest_port/lines/stream",
+            None,
+            "event: line",
+            3,
+        );
         assert_eq!(seen.matches("event: line").count(), 3, "{seen}");
 
         // The socket is dropped by now. Give the server a moment to notice.

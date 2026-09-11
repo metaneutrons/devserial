@@ -962,6 +962,34 @@ impl CommandEngine {
         }
     }
 
+    /// Flash firmware while reporting the tool's output line by line.
+    ///
+    /// The same operation as [`RequestPayload::EspFlash`], down to releasing
+    /// the port and reopening it afterwards; the difference is that the tool's
+    /// lines go to `progress` while it runs. The HTTP interface needs that: a
+    /// flash takes tens of seconds, and a caller that hears nothing until the
+    /// end cannot tell a working flash from a hung one.
+    ///
+    /// The sender is taken by value and dropped when this returns, so a reader
+    /// of the other end sees the channel close exactly when the tool is done.
+    ///
+    /// # Errors
+    /// Returns an error when espflash is missing or the tool fails.
+    #[cfg(all(feature = "esp", feature = "rest"))]
+    pub async fn esp_flash_reporting(
+        &self,
+        port: String,
+        firmware_path: String,
+        baud: Option<u32>,
+        progress: crate::esp::Progress,
+    ) -> Result<ResponsePayload, EngineError> {
+        let log = format!("FLASH {firmware_path}");
+        self.esp_operation(&port, Some(log), |port| async move {
+            crate::esp::flash_with_progress(&port, &firmware_path, baud, Some(&progress)).await
+        })
+        .await
+    }
+
     /// Run an espflash operation with the port temporarily released.
     ///
     /// The availability check, the release, the reopen and the buffer note used
