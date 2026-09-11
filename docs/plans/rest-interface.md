@@ -249,9 +249,8 @@ Dependencies: M4
   that disconnects and reconnects across a write.
 - M5-A2: A client that disconnects does not leave the daemon holding work.
   Verified by a test asserting the task ends.
-- M5-A3: `POST /v1/ports/{port}/esp/flash` answers `202` with a job id and
-  streams the tool's output line by line on the same channel, using the reporting
-  `esp.rs` already produces.
+- M5-A3: moved to M6; see the decision log. M5 delivers the streaming
+  mechanism, M6 is where the ESP routes use it.
 
 ### M6: driving the device, and the specification
 
@@ -263,6 +262,9 @@ Dependencies: M5
   loopback or mock port.
 - M6-A2: The four ESP routes answer behind the `esp` feature, and are absent
   without it.
+- M6-A2b: `POST /v1/ports/{port}/esp/flash` answers `202` with a job id and
+  streams the tool's output line by line over the mechanism M5 built, using the
+  reporting `esp.rs` already produces.
 - M6-A3: `GET /v1/openapi.json` is generated from the route mapping, not
   hand-written, and a test fails when a route is missing from it.
 - M6-A4: The README documents the interface, the default port, the token rule
@@ -353,6 +355,18 @@ The flag would have been a verb for a thing that does not exist.
 What is lost is the convenience of a generated token for a non-loopback bind,
 which now has to be produced by hand. That is a fair trade against a second
 place where a secret lives.
+
+**11 September 2026, the flash stream moves from M5-A3 to M6-A2b.** M5 was
+scoped as "streaming" and given the flash job along with the line stream. Those
+are one mechanism and two users of it, and the flash route is an ESP route: its
+three siblings are in M6, behind the same feature gate, and splitting it off
+would put the `esp` gate and the job registry in two milestones instead of one.
+
+M5 still delivers everything streaming needs — the SSE route, resumption by
+line id, and the release of work when a client goes away — and M6 uses it
+rather than building a second mechanism. What the move costs is that nothing
+exercises the mechanism with a long-running producer until M6; the line stream
+exercises it with a fast one, which is the weaker of the two cases.
 
 **11 September 2026, hardware verification moved out of M1 into a gate of its
 own.** M1's other five criteria are met and its code has been on `main` since

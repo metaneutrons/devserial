@@ -39,10 +39,17 @@ pub const ROUTES: &[&str] = &[
     "GET /v1/ports/{port}",
     "GET /v1/ports/{port}/stats",
     "GET /v1/ports/{port}/lines",
+    "GET /v1/ports/{port}/lines/stream",
     "DELETE /v1/ports/{port}/lines",
     "GET /v1/ports/{port}/search",
     "POST /v1/ports/{port}/export",
 ];
+
+/// How long a stream parks on the engine when nothing is arriving.
+///
+/// The engine answers as soon as a line lands, so this is the cost of an idle
+/// port rather than a delay on a busy one.
+const STREAM_WAIT_MS: u64 = 5_000;
 
 /// Why a listener could not be bound, in words a person can act on.
 ///
@@ -265,6 +272,7 @@ fn router(guards: &Guards) -> axum::Router {
             "/v1/ports/{port}/lines",
             get(read_lines).delete(clear_lines),
         )
+        .route("/v1/ports/{port}/lines/stream", get(stream_lines))
         .route("/v1/ports/{port}/search", get(search))
         .route("/v1/ports/{port}/export", post(export))
         .with_state(guards.engine.clone())
@@ -564,6 +572,71 @@ async fn export(
         "path": path,
         "format": file_format,
     })))
+}
+
+/// The capture as it grows, one event per line.
+///
+/// Server-sent events rather than a WebSocket: the channel only ever runs one
+/// way, a plain `GET` reconnects on its own, and `Last-Event-ID` resumes from
+/// the line the client last saw. Writing is its own request, so the return
+/// channel a WebSocket would add has nothing to carry.
+///
+/// The loop asks the engine with `wait_ms`, so an idle port costs one parked
+/// request rather than a spin. When the client goes away the response future is
+/// dropped, the loop ends with it, and the engine is left holding nothing.
+async fn stream_lines(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<LinesQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    axum::response::Sse<
+        impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    axum::response::Response,
+> {
+    // `Last-Event-ID` is the resumption point a reconnecting browser sends by
+    // itself. An explicit `after` wins, so a caller that is not a browser can
+    // say where to start.
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok());
+
+    let window = query
+        .window()
+        .map_err(|e| problem(axum::http::StatusCode::BAD_REQUEST, "invalid-parameter", &e))?;
+    let mut after = window.after_id.or(resume).unwrap_or(0);
+    let wait_ms = window.wait_ms.or(Some(STREAM_WAIT_MS));
+
+    let stream = async_stream::stream! {
+        loop {
+            let payload = crate::protocol::RequestPayload::ReadLines {
+                port: port.clone(),
+                window: crate::protocol::ReadWindow {
+                    after_id: Some(after),
+                    wait_ms,
+                    ..crate::protocol::ReadWindow::default()
+                },
+            };
+            match engine.execute(payload).await {
+                Ok(crate::protocol::ResponsePayload::Lines(page)) => {
+                    for line in &page.lines {
+                        after = line.id;
+                        yield Ok(axum::response::sse::Event::default()
+                            .id(line.id.to_string())
+                            .event("line")
+                            .data(crate::export::line_object(line).to_string()));
+                    }
+                }
+                // A port that went away ends the stream rather than looping on
+                // an error the client cannot act on.
+                Ok(_) | Err(_) => break,
+            }
+        }
+    };
+
+    Ok(axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
 // ------------------------------------------------------------- parameters
@@ -913,19 +986,25 @@ mod tests {
     /// below then checks that whatever it names is a route the router actually
     /// serves. A request that grew a transport in the vocabulary but not on the
     /// wire would otherwise be invisible.
-    fn served_by(payload: &crate::protocol::RequestPayload) -> Result<&'static str, &'static str> {
+    fn served_by(
+        payload: &crate::protocol::RequestPayload,
+    ) -> Result<&'static [&'static str], &'static str> {
         use crate::protocol::RequestPayload as R;
         match payload {
-            R::Ping => Ok("GET /v1/health"),
-            R::ListPorts | R::ListHardware => Ok("GET /v1/ports"),
-            R::OpenPort { .. } | R::ReconfigurePort { .. } => Ok("PUT /v1/ports/{port}"),
-            R::ClosePort { .. } => Ok("DELETE /v1/ports/{port}"),
-            R::GetStatus { .. } => Ok("GET /v1/ports/{port}"),
-            R::GetStats { .. } => Ok("GET /v1/ports/{port}/stats"),
-            R::ReadLines { .. } => Ok("GET /v1/ports/{port}/lines"),
-            R::Clear { .. } => Ok("DELETE /v1/ports/{port}/lines"),
-            R::Search { .. } => Ok("GET /v1/ports/{port}/search"),
-            R::Export { .. } => Ok("POST /v1/ports/{port}/export"),
+            R::Ping => Ok(&["GET /v1/health"]),
+            R::ListPorts | R::ListHardware => Ok(&["GET /v1/ports"]),
+            R::OpenPort { .. } | R::ReconfigurePort { .. } => Ok(&["PUT /v1/ports/{port}"]),
+            R::ClosePort { .. } => Ok(&["DELETE /v1/ports/{port}"]),
+            R::GetStatus { .. } => Ok(&["GET /v1/ports/{port}"]),
+            R::GetStats { .. } => Ok(&["GET /v1/ports/{port}/stats"]),
+            // Two routes, one request: a page and the same page as it grows.
+            R::ReadLines { .. } => Ok(&[
+                "GET /v1/ports/{port}/lines",
+                "GET /v1/ports/{port}/lines/stream",
+            ]),
+            R::Clear { .. } => Ok(&["DELETE /v1/ports/{port}/lines"]),
+            R::Search { .. } => Ok(&["GET /v1/ports/{port}/search"]),
+            R::Export { .. } => Ok(&["POST /v1/ports/{port}/export"]),
 
             // Recorded exceptions, each with the reason it is one.
             R::Shutdown => Err(
@@ -1053,10 +1132,15 @@ mod tests {
     fn every_request_has_a_route_or_a_recorded_reason() {
         for payload in every_request() {
             match served_by(&payload) {
-                Ok(route) => assert!(
-                    ROUTES.contains(&route),
-                    "{payload:?} claims {route}, which the router does not serve"
-                ),
+                Ok(routes) => {
+                    assert!(!routes.is_empty(), "{payload:?} claims no route at all");
+                    for route in routes {
+                        assert!(
+                            ROUTES.contains(route),
+                            "{payload:?} claims {route}, which the router does not serve"
+                        );
+                    }
+                }
                 Err(reason) => assert!(
                     !reason.is_empty(),
                     "{payload:?} has neither a route nor a reason"
@@ -1074,6 +1158,8 @@ mod tests {
         let claimed: std::collections::BTreeSet<&str> = every_request()
             .iter()
             .filter_map(|payload| served_by(payload).ok())
+            .flat_map(<[&str]>::iter)
+            .copied()
             .collect();
         for route in ROUTES {
             // `/v1/version` describes the build rather than carrying out a
@@ -1504,6 +1590,114 @@ mod tests {
         assert!(
             engine.port_manager().list().await.is_empty(),
             "the daemon still holds the port the route said it closed"
+        );
+    }
+
+    /// Open a stream, read what arrives, and hang up.
+    ///
+    /// A streaming response never closes, so this reads until it has seen the
+    /// marker it was told to wait for or the deadline passes, then drops the
+    /// socket. Dropping is the point of the second test: it is what a client
+    /// going away looks like from the server's side.
+    fn stream_until(
+        addr: std::net::SocketAddr,
+        path: &str,
+        last_event_id: Option<i64>,
+        events: usize,
+    ) -> String {
+        use std::io::{Read as _, Write as _};
+
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        let resume =
+            last_event_id.map_or_else(String::new, |id| format!("Last-Event-ID: {id}\r\n"));
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n{resume}\r\n"
+        );
+        stream.write_all(request.as_bytes()).expect("write");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("timeout");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = String::new();
+        let mut buf = [0u8; 2048];
+        while std::time::Instant::now() < deadline {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if seen.matches("event: line").count() >= events {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        seen
+    }
+
+    /// The stream carries every line with its id, and resumes from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_stream_carries_line_ids_and_resumes_from_them() {
+        let (_server, addr, _engine, _dir, storage) = listening_with_lines().await;
+        let path = "/v1/ports/mock_rest_port/lines/stream";
+
+        let first = stream_until(addr, path, None, 3);
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(
+            first.contains("text/event-stream"),
+            "the stream has to say what it is: {first}"
+        );
+        assert_eq!(first.matches("event: line").count(), 3, "{first}");
+        assert!(
+            first.contains("id: 1") && first.contains("id: 3"),
+            "{first}"
+        );
+        assert!(first.contains("Guru Meditation"), "{first}");
+
+        // A line written while nobody was listening.
+        storage
+            .lock()
+            .expect("storage")
+            .insert_lines(&[(1_767_225_602_000_000_000, "after the gap")])
+            .expect("insert");
+
+        // Resuming from the second line gives the third and the new one, and
+        // not the two the client already had.
+        let resumed = stream_until(addr, path, Some(2), 2);
+        assert_eq!(resumed.matches("event: line").count(), 2, "{resumed}");
+        assert!(resumed.contains("Guru Meditation"), "{resumed}");
+        assert!(resumed.contains("after the gap"), "{resumed}");
+        assert!(
+            !resumed.contains("boot ok"),
+            "resuming replayed a line the client had already seen: {resumed}"
+        );
+    }
+
+    /// A client that goes away leaves the daemon holding nothing.
+    ///
+    /// Measured rather than assumed: the streaming response holds a clone of
+    /// the engine, so the count of engines sharing the listener state rises
+    /// while it runs and falls back when the socket is dropped. A loop that
+    /// kept running would keep its clone and the count would stay up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_hangs_up_releases_the_engine() {
+        let (_server, addr, engine, _dir, _storage) = listening_with_lines().await;
+        let before = engine.shared_handles();
+
+        let seen = stream_until(addr, "/v1/ports/mock_rest_port/lines/stream", None, 3);
+        assert_eq!(seen.matches("event: line").count(), 3, "{seen}");
+
+        // The socket is dropped by now. Give the server a moment to notice.
+        for _ in 0..100 {
+            if engine.shared_handles() == before {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "two seconds after the client hung up the daemon still holds {} engines, was {before}",
+            engine.shared_handles()
         );
     }
 }
