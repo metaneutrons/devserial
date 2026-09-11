@@ -4,6 +4,22 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.0](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.14...devserial-v0.2.0) (2026-09-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* the csv and jsonl exports change. The line id column is named id rather than line, timestamp carries nine fractional digits rather than three, and timestamp_ns is a string rather than a number.
+
+### Features
+
+* every monitor attaches to the daemon ([#69](https://github.com/metaneutrons/devserial/issues/69)) ([62b298a](https://github.com/metaneutrons/devserial/commit/62b298a08f2ae16cbe85f6661bb41ae6d0731e64))
+* one timestamp story ([#73](https://github.com/metaneutrons/devserial/issues/73)) ([6e8ec80](https://github.com/metaneutrons/devserial/commit/6e8ec806dfe9133de2b02c966c612d45a4e83f44))
+* **rest:** driving the device, and the specification ([#79](https://github.com/metaneutrons/devserial/issues/79)) ([2fb7b61](https://github.com/metaneutrons/devserial/commit/2fb7b611aa8f348f66c30c9b9c1608e1af240a6e))
+* **rest:** reading over HTTP ([#75](https://github.com/metaneutrons/devserial/issues/75)) ([a21bbb5](https://github.com/metaneutrons/devserial/commit/a21bbb52df4ec7c1b2dc25f98eb2befd4259524b))
+* **rest:** streaming the capture over SSE ([#78](https://github.com/metaneutrons/devserial/issues/78)) ([9842ba4](https://github.com/metaneutrons/devserial/commit/9842ba4773c286ee661dbce627f66adaae7ffe3b))
+* **rest:** the server and its switch ([#74](https://github.com/metaneutrons/devserial/issues/74)) ([efd9af7](https://github.com/metaneutrons/devserial/commit/efd9af7c25229bd80f33535086cd6e897f9a5c90))
+
 ## [0.1.14](https://github.com/metaneutrons/devserial/compare/devserial-v0.1.13...devserial-v0.1.14) (2026-09-06)
 
 
