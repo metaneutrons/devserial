@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "devserial"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "async-stream",

@@ -1,6 +1,6 @@
 [package]
 name = "devserial"
-version = "0.1.14"
+version = "0.2.0"
 edition = "2024"
 authors = ["Fabian Schmieder"]
 description = "Serial terminal for developers with SQLite-buffered output and a CLI, TUI, GUI and MCP interface"
