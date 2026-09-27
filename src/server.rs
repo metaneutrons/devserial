@@ -17,7 +17,7 @@ use std::sync::Arc;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -1119,8 +1119,8 @@ impl DevSerialServer {
 #[tool_handler(router = self.tool_router)]
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for DevSerialServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
