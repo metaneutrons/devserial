@@ -1719,17 +1719,26 @@ impl PortMonitorState {
         }
     }
 
-    /// Append a marker line to both the display buffer and the database.
+    /// Record a marker line in the database, where the display picks it up.
+    ///
+    /// The display follows the database: `update_lines` reads every new row on
+    /// the next frame and shows it, so a stored marker arrives there in its
+    /// place among the captured lines. Showing it here as well put it on screen
+    /// twice, once straight away and once when it was read back, and the first
+    /// copy could land ahead of lines that were stored before it.
+    ///
+    /// A marker that could not be stored will never be read back, so that one
+    /// is shown directly rather than not at all.
     fn note(&mut self, text: &str) {
         let timestamp_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.push_display_line(DisplayLine {
-            timestamp: crate::export::now_time_of_day(),
-            timestamp_ns,
-            payload: text.to_string(),
-            is_sent: false,
-        });
         if let Err(e) = self.storage.insert_lines(&[(timestamp_ns, text)]) {
             tracing::debug!(error = %e, "could not persist marker line");
+            self.push_display_line(DisplayLine {
+                timestamp: crate::export::format_time_of_day(timestamp_ns),
+                timestamp_ns,
+                payload: text.to_string(),
+                is_sent: false,
+            });
         }
     }
 
@@ -3943,5 +3952,85 @@ Error:   \u{d7} Error while connecting to device
     #[test]
     fn a_single_line_failure_is_itself() {
         assert_eq!(failure_summary("permission denied"), "permission denied");
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    /// A monitor on an empty buffer, with a switch that always works.
+    fn monitor() -> PortMonitorState {
+        let toggle: crate::standalone::ToggleConnectFn = Arc::new(|_: bool, _: &PortConfig| Ok(()));
+        let mut state = PortMonitorState::new_with_reconfigure(
+            "/dev/ttyTEST".to_string(),
+            "115200 8N1".to_string(),
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(toggle),
+            None,
+        );
+        // The first read only finds where the buffer ends. Lines stored after
+        // it are the ones a frame shows.
+        state.update_lines();
+        state
+    }
+
+    fn shown(state: &PortMonitorState) -> Vec<&str> {
+        state
+            .lines
+            .iter()
+            .map(|line| line.payload.as_str())
+            .collect()
+    }
+
+    /// A marker is on screen once, not once for each way it could get there.
+    #[test]
+    fn a_connection_marker_is_shown_once() {
+        let mut state = monitor();
+
+        state.toggle_connection();
+        // Two frames, so a second read cannot bring it back either.
+        state.update_lines();
+        state.update_lines();
+
+        let markers = shown(&state)
+            .iter()
+            .filter(|payload| payload.contains("PORT DISCONNECTED"))
+            .count();
+        assert_eq!(markers, 1, "{:?}", shown(&state));
+
+        // Stored once too, which is what an export or another client reads.
+        let stored = state.storage.read_lines(1, 100).expect("read");
+        assert_eq!(stored.len(), 1, "{stored:?}");
+    }
+
+    /// A marker lands after the lines that were stored before it.
+    ///
+    /// The daemon writes the capture while the window draws, so a line it
+    /// stored just before the click has to come first. That is where the
+    /// database puts it, and where the copy shown straight away did not.
+    #[test]
+    fn a_marker_keeps_its_place_among_the_captured_lines() {
+        let mut state = monitor();
+
+        state
+            .storage
+            .insert_lines(&[(1, "captured before the click")])
+            .expect("insert");
+        state.toggle_connection();
+        state.update_lines();
+
+        assert_eq!(
+            shown(&state),
+            [
+                "captured before the click",
+                "━━━ PORT DISCONNECTED: /dev/ttyTEST ━━━"
+            ],
+        );
     }
 }
