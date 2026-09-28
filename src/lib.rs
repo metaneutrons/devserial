@@ -10,6 +10,7 @@ pub const COPYRIGHT: &str = "\u{a9} 2026 Fabian Schmieder";
 
 pub mod assets;
 pub mod cli;
+pub mod color;
 pub mod config;
 pub mod engine;
 #[cfg(feature = "esp")]

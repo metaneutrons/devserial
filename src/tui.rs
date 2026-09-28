@@ -22,6 +22,7 @@ use ratatui::widgets::{
 
 use crate::cli::CliError;
 use crate::cli::output::authors;
+use crate::color::{self, Tone};
 use crate::config::PortConfig;
 use crate::modem::FileTransferProtocol;
 use crate::serial_params::{
@@ -209,6 +210,8 @@ struct AppState {
     link: Option<tokio::sync::watch::Receiver<crate::reader::ConnectionState>>,
     /// Render payloads as a hex dump instead of text.
     hex_view: bool,
+    /// Semantic colours in the capture buffer, independent of stored payloads.
+    color_enabled: bool,
 }
 
 impl AppState {
@@ -294,6 +297,7 @@ impl AppState {
             baud_index,
             show_timestamps: true,
             hex_view: false,
+            color_enabled: color::ui_enabled(),
         }
     }
 
@@ -640,6 +644,24 @@ fn run_app(
                         &format!("━━━ SERIAL BREAK ({DEFAULT_BREAK_MS}ms) SENT ━━━"),
                     ),
                     Err(e) => state.set_status(format!("BREAK failed: {e}")),
+                }
+                continue;
+            }
+            KeyCode::F(8) => {
+                if color::ui_is_locked() {
+                    state.set_status("Colour is controlled by --color or NO_COLOR");
+                } else {
+                    state.color_enabled = !state.color_enabled;
+                    match color::save_preference(state.color_enabled) {
+                        Ok(()) => state.set_status(if state.color_enabled {
+                            "Capture colours on"
+                        } else {
+                            "Capture colours off"
+                        }),
+                        Err(error) => {
+                            state.set_status(format!("Could not save colour preference: {error}"));
+                        }
+                    }
                 }
                 continue;
             }
@@ -1186,7 +1208,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Normal => (
             "> ",
             format!(
-                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F1 about | Ctrl+C quit ",
+                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | F8 color | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F1 about | Ctrl+C quit ",
                 crate::export::DISPLAY_ZONE_NOTE
             ),
         ),
@@ -1512,19 +1534,28 @@ fn render(frame: &mut Frame, state: &AppState) {
         .take(end.saturating_sub(state.scroll_offset))
         .map(|(timestamp, payload)| {
             let body = payload_text(payload, state.hex_view);
-            let colour = if state.hex_view {
-                Color::White
+            let tone = if state.hex_view {
+                Tone::Plain
             } else {
-                severity_color(payload)
+                color::classify(payload)
             };
             let mut spans = Vec::with_capacity(2);
             if state.show_timestamps {
                 spans.push(Span::styled(
                     format!("{timestamp} "),
-                    Style::default().fg(Color::DarkGray),
+                    if state.color_enabled {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    },
                 ));
             }
-            spans.push(Span::styled(body, Style::default().fg(colour)));
+            let style = if state.color_enabled {
+                Style::default().fg(tone_color(tone))
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(body, style));
             Line::from(spans)
         })
         .collect();
@@ -1568,21 +1599,13 @@ fn payload_text(payload: &str, hex_view: bool) -> String {
     }
 }
 
-/// Colour a line by the severity marker it carries.
-fn severity_color(payload: &str) -> Color {
-    if payload.contains("[ERROR]") || payload.contains("[PANIC]") {
-        Color::Red
-    } else if payload.contains("[WARN]") {
-        Color::Yellow
-    } else if payload.contains("[DEBUG]") {
-        Color::DarkGray
-    } else if payload.contains("TRANSFER")
-        || payload.contains("BREAK")
-        || payload.contains("RECONFIGURED")
-    {
-        Color::Cyan
-    } else {
-        Color::White
+const fn tone_color(tone: Tone) -> Color {
+    match tone {
+        Tone::Plain => Color::White,
+        Tone::Muted => Color::DarkGray,
+        Tone::Sent | Tone::Event => Color::Cyan,
+        Tone::Warning => Color::Yellow,
+        Tone::Error => Color::Red,
     }
 }
 
@@ -1907,9 +1930,9 @@ mod tests {
 
     #[test]
     fn severity_colours_are_distinct() {
-        assert_eq!(severity_color("[ERROR] boom"), Color::Red);
-        assert_eq!(severity_color("[WARN] hmm"), Color::Yellow);
-        assert_eq!(severity_color("plain"), Color::White);
+        assert_eq!(tone_color(color::classify("[ERROR] boom")), Color::Red);
+        assert_eq!(tone_color(color::classify("[WARN] hmm")), Color::Yellow);
+        assert_eq!(tone_color(color::classify("plain")), Color::White);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 
+use crate::color::{self, Tone};
 use crate::config::PortConfig;
 use crate::export::{self, ExportFormat};
 use crate::gui_ipc::{GuiCommand, MonitorEvent, OpenPortRequest};
@@ -1231,6 +1232,7 @@ pub struct PortMonitorState {
     line_ending: LineEnding,
     show_timestamps: bool,
     hex_view: bool,
+    color_enabled: bool,
     dtr_state: bool,
     rts_state: bool,
     last_id: i64,
@@ -1354,6 +1356,7 @@ impl PortMonitorState {
             line_ending: LineEnding::CrLf,
             show_timestamps: true,
             hex_view: false,
+            color_enabled: color::ui_enabled(),
             dtr_state: false,
             rts_state: false,
             last_id: i64::MAX,
@@ -3600,6 +3603,17 @@ impl PortMonitorState {
                     crate::export::DISPLAY_ZONE_NOTE
                 ));
             ui.checkbox(&mut self.hex_view, "Hex");
+            let color_toggle = ui.add_enabled(
+                !color::ui_is_locked(),
+                egui::Checkbox::new(&mut self.color_enabled, "Color"),
+            );
+            if color_toggle.changed()
+                && let Err(error) = color::save_preference(self.color_enabled)
+            {
+                tracing::warn!(%error, "could not save display colour preference");
+            }
+            color_toggle
+                .on_hover_text("Color only changes capture text, not stored data or exports");
             ui.separator();
 
             if ui.button("Clear").on_hover_text("Clear display").clicked() {
@@ -3705,18 +3719,21 @@ impl PortMonitorState {
                 };
                 ui.horizontal(|ui| {
                     if self.show_timestamps {
-                        ui.colored_label(egui::Color32::from_rgb(110, 110, 110), &line.timestamp);
+                        if self.color_enabled {
+                            ui.colored_label(ui.visuals().weak_text_color(), &line.timestamp);
+                        } else {
+                            ui.label(&line.timestamp);
+                        }
                         ui.add_space(6.0);
                     }
                     let resp = if line.is_sent {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!(">> {}", line.payload))
-                                    .color(egui::Color32::from_rgb(90, 190, 255))
-                                    .monospace(),
-                            )
-                            .selectable(true),
-                        )
+                        let text = egui::RichText::new(format!(">> {}", line.payload)).monospace();
+                        let text = if self.color_enabled {
+                            text.color(tone_color(Tone::Sent, ui.visuals().dark_mode))
+                        } else {
+                            text
+                        };
+                        ui.add(egui::Label::new(text).selectable(true))
                     } else if self.hex_view {
                         // Rendered from the payload itself. Keeping a second
                         // byte copy per line doubled the memory of the display
@@ -3726,7 +3743,14 @@ impl PortMonitorState {
                             egui::Label::new(egui::RichText::new(hex).monospace()).selectable(true),
                         )
                     } else {
-                        ui.add(egui::Label::new(colorize_label(&line.payload)).selectable(true))
+                        ui.add(
+                            egui::Label::new(colorize_label(
+                                &line.payload,
+                                self.color_enabled,
+                                ui.visuals().dark_mode,
+                            ))
+                            .selectable(true),
+                        )
                     };
 
                     resp.context_menu(|ui| {
@@ -4102,29 +4126,27 @@ impl PortMonitorState {
 
 // --- Helpers ---
 
-fn colorize_label(text: &str) -> egui::RichText {
-    if text.contains("[ERROR]") || text.contains("[PANIC]") || text.contains("error") {
-        egui::RichText::new(text)
-            .monospace()
-            .color(egui::Color32::from_rgb(255, 85, 85))
-    } else if text.contains("[WARN]") || text.contains("warning") {
-        egui::RichText::new(text)
-            .monospace()
-            .color(egui::Color32::from_rgb(255, 200, 60))
-    } else if text.contains("[DEBUG]") {
-        egui::RichText::new(text)
-            .monospace()
-            .color(egui::Color32::from_rgb(130, 130, 130))
-    } else if text.contains("[INFO]") {
-        egui::RichText::new(text)
-            .monospace()
-            .color(egui::Color32::from_rgb(200, 200, 200))
-    } else if text.contains("RECONFIGURED") {
-        egui::RichText::new(text)
-            .monospace()
-            .color(egui::Color32::from_rgb(100, 220, 255))
+fn colorize_label(text: &str, enabled: bool, dark_mode: bool) -> egui::RichText {
+    let rich = egui::RichText::new(text).monospace();
+    let tone = color::classify(text);
+    if enabled && tone != Tone::Plain {
+        rich.color(tone_color(tone, dark_mode))
     } else {
-        egui::RichText::new(text).monospace()
+        rich
+    }
+}
+
+const fn tone_color(tone: Tone, dark_mode: bool) -> egui::Color32 {
+    match (tone, dark_mode) {
+        (Tone::Muted, true) => egui::Color32::from_rgb(145, 145, 145),
+        (Tone::Muted, false) => egui::Color32::from_rgb(100, 100, 100),
+        (Tone::Sent | Tone::Event, true) => egui::Color32::from_rgb(100, 205, 245),
+        (Tone::Sent | Tone::Event, false) => egui::Color32::from_rgb(0, 95, 155),
+        (Tone::Warning, true) => egui::Color32::from_rgb(255, 200, 90),
+        (Tone::Warning, false) => egui::Color32::from_rgb(145, 90, 0),
+        (Tone::Error, true) => egui::Color32::from_rgb(255, 100, 100),
+        (Tone::Error, false) => egui::Color32::from_rgb(175, 35, 35),
+        (Tone::Plain, _) => egui::Color32::TRANSPARENT,
     }
 }
 

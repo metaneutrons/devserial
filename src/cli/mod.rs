@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::color::ColorMode;
 use crate::export::ExportFormat;
 use crate::modem::FileTransferProtocol;
 use crate::protocol::SearchMode;
@@ -105,6 +106,14 @@ impl LineOptions {
 #[derive(Parser)]
 #[command(name = "devserial", version, about)]
 pub struct Cli {
+    /// Colour human-readable output (auto enables it on a terminal).
+    #[arg(long, global = true, value_enum, conflicts_with = "no_color")]
+    pub color: Option<ColorMode>,
+
+    /// Disable colour in terminal monitors and GUI capture text.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     /// Path to a configuration file (default: ./devserial.toml, then the user config directory)
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -407,6 +416,11 @@ pub enum Command {
 /// Returns the command's error; `main` turns it into an exit code.
 pub fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
+    crate::color::set_cli_mode(if cli.no_color {
+        ColorMode::Never
+    } else {
+        cli.color.unwrap_or_default()
+    });
     dispatch(cli)
 }
 
@@ -486,7 +500,7 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
 
         Some(command) => {
             let session = handlers::Session::new(cli.socket, config_path)?;
-            handlers::run_remote(&session, command)
+            handlers::run_remote(&session, command, crate::color::terminal_enabled())
         }
     }
 }
@@ -550,6 +564,17 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn global_color_options_parse_and_conflict() {
+        let cli = Cli::try_parse_from(["devserial", "read", "COM1", "--no-color"]).unwrap();
+        assert!(cli.no_color);
+        let cli = Cli::try_parse_from(["devserial", "--color", "always", "read", "COM1"]).unwrap();
+        assert_eq!(cli.color, Some(ColorMode::Always));
+        assert!(
+            Cli::try_parse_from(["devserial", "--color", "never", "--no-color", "about"]).is_err()
+        );
     }
 
     #[test]

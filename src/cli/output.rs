@@ -4,19 +4,28 @@
 //! Terminal rendering for CLI results.
 
 use crate::cli::CliError;
+use crate::color::{self, Tone};
 use crate::protocol::PortInfoResponse;
 use crate::reader::ConnectionState;
 use crate::storage::{BufferStats, StoredLine};
 
 /// Print a stored serial line as text, timestamped text, or JSON.
-pub fn print_line(line: &StoredLine, timestamps: bool, json: bool) {
+pub fn print_line(line: &StoredLine, timestamps: bool, json: bool, color: bool) {
+    println!("{}", format_line(line, timestamps, json, color));
+}
+
+fn format_line(line: &StoredLine, timestamps: bool, json: bool, color: bool) -> String {
     if json {
-        println!("{}", serde_json::to_string(line).unwrap_or_default());
+        serde_json::to_string(line).unwrap_or_default()
     } else if timestamps {
         let ts = crate::export::format_time_of_day(line.timestamp_ns);
-        println!("[{ts}] {}", line.payload);
+        format!(
+            "{} {}",
+            color::ansi(&format!("[{ts}]"), Tone::Muted, color),
+            color::ansi(&line.payload, color::classify(&line.payload), color)
+        )
     } else {
-        println!("{}", line.payload);
+        color::ansi(&line.payload, color::classify(&line.payload), color)
     }
 }
 
@@ -150,5 +159,19 @@ mod tests {
         assert!(!authors().is_empty(), "Cargo.toml must declare authors");
         assert_eq!(env!("CARGO_PKG_LICENSE"), "GPL-3.0-or-later");
         assert!(env!("CARGO_PKG_REPOSITORY").starts_with("https://"));
+    }
+
+    #[test]
+    fn json_and_plain_lines_keep_their_exact_bytes_when_color_is_off() {
+        let line = StoredLine {
+            id: 7,
+            timestamp_ns: 0,
+            payload: "[ERROR] sensor fault".into(),
+        };
+        assert_eq!(format_line(&line, false, false, false), line.payload);
+        let json = format_line(&line, false, true, true);
+        assert_eq!(json, serde_json::to_string(&line).unwrap());
+        assert!(!json.contains('\x1b'));
+        assert!(format_line(&line, false, false, true).contains("\x1b[31m"));
     }
 }

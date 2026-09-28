@@ -93,6 +93,19 @@ fn help_lists_the_main_commands() {
 }
 
 #[test]
+fn forced_color_never_enters_json_output() {
+    let output = Sandbox::new()
+        .command()
+        .args(["--color", "always", "list", "--json"])
+        .output()
+        .expect("list as JSON");
+    assert!(output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value.get("managed").is_some());
+}
+
+#[test]
 fn version_is_reported() {
     Sandbox::new()
         .command()

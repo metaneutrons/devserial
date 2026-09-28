@@ -58,6 +58,8 @@ pub enum Capability {
     Timestamps,
     /// Show the buffer as hex.
     HexView,
+    /// Toggle semantic colours in the capture display.
+    ColorView,
     /// Stop following the tail and scroll back.
     ScrollBack,
     /// Narrow the view to matching lines.
@@ -102,6 +104,7 @@ impl Capability {
         Self::LinkState,
         Self::Timestamps,
         Self::HexView,
+        Self::ColorView,
         Self::ScrollBack,
         Self::Filter,
         Self::ClearBuffer,
@@ -133,6 +136,10 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::LinkState, "fn link_status"),
     (Capability::Timestamps, "\"Time\""),
     (Capability::HexView, "\"Hex\""),
+    (
+        Capability::ColorView,
+        "Checkbox::new(&mut self.color_enabled, \"Color\")",
+    ),
     (Capability::ScrollBack, "\"Auto-follow\""),
     (Capability::Filter, "\"Filter:\""),
     (Capability::ClearBuffer, "\"Clear\""),
@@ -154,6 +161,7 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::LinkState, "fn link_label"),
     (Capability::Timestamps, "show_timestamps"),
     (Capability::HexView, "hex_view"),
+    (Capability::ColorView, "KeyCode::F(8)"),
     (Capability::ScrollBack, "auto_follow"),
     (Capability::FileTransfer, "InputMode::SendFile"),
     (Capability::About, "InputMode::About"),
