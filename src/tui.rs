@@ -1551,7 +1551,7 @@ fn render(frame: &mut Frame, state: &AppState) {
                 ));
             }
             let style = if state.color_enabled {
-                Style::default().fg(tone_color(tone))
+                tone_color(tone).map_or_else(Style::default, |color| Style::default().fg(color))
             } else {
                 Style::default()
             };
@@ -1599,13 +1599,13 @@ fn payload_text(payload: &str, hex_view: bool) -> String {
     }
 }
 
-const fn tone_color(tone: Tone) -> Color {
+const fn tone_color(tone: Tone) -> Option<Color> {
     match tone {
-        Tone::Plain => Color::White,
-        Tone::Muted => Color::DarkGray,
-        Tone::Sent | Tone::Event => Color::Cyan,
-        Tone::Warning => Color::Yellow,
-        Tone::Error => Color::Red,
+        Tone::Plain => None,
+        Tone::Muted => Some(Color::DarkGray),
+        Tone::Sent | Tone::Event => Some(Color::Cyan),
+        Tone::Warning => Some(Color::Yellow),
+        Tone::Error => Some(Color::Red),
     }
 }
 
@@ -1930,9 +1930,15 @@ mod tests {
 
     #[test]
     fn severity_colours_are_distinct() {
-        assert_eq!(tone_color(color::classify("[ERROR] boom")), Color::Red);
-        assert_eq!(tone_color(color::classify("[WARN] hmm")), Color::Yellow);
-        assert_eq!(tone_color(color::classify("plain")), Color::White);
+        assert_eq!(
+            tone_color(color::classify("[ERROR] boom")),
+            Some(Color::Red)
+        );
+        assert_eq!(
+            tone_color(color::classify("[WARN] hmm")),
+            Some(Color::Yellow)
+        );
+        assert_eq!(tone_color(color::classify("plain")), None);
     }
 
     #[test]
