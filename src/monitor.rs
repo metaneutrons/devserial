@@ -27,6 +27,54 @@ use crate::serial_params::{
 /// Maximum lines kept in the display buffer.
 const MAX_DISPLAY_LINES: usize = 100_000;
 
+/// How often an open monitor asks the daemon for REST state.
+#[cfg(feature = "rest")]
+const REST_STATUS_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[cfg(feature = "rest")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestOperation {
+    Status,
+    Start,
+    Stop,
+}
+
+#[cfg(feature = "rest")]
+type RestWorkerMessage = (
+    u64,
+    RestOperation,
+    Result<crate::protocol::RestState, String>,
+);
+
+#[cfg(feature = "rest")]
+type RestWorkerReceiver = std::sync::mpsc::Receiver<RestWorkerMessage>;
+
+/// Wording for the global REST indicator, independent of serial-port state.
+#[cfg(feature = "rest")]
+fn rest_indicator_label(state: Option<&crate::protocol::RestState>, unavailable: bool) -> String {
+    if unavailable {
+        return "REST unavailable".to_string();
+    }
+    match state {
+        Some(state) if state.listening => format!("REST :{}", state.port),
+        Some(_) => "REST off".to_string(),
+        None => "REST checking…".to_string(),
+    }
+}
+
+/// Interpret the REST port field. An empty field means use the daemon config.
+#[cfg(feature = "rest")]
+fn parse_rest_port(text: &str) -> Result<Option<u16>, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match text.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(Some(port)),
+        _ => Err("Enter a port from 1 to 65535, or leave it blank for the configured port."),
+    }
+}
+
 /// Everything the firmware dialog needs to keep between frames.
 ///
 /// One struct rather than a dozen fields on the window, so the whole feature
@@ -1212,9 +1260,30 @@ pub struct PortMonitorState {
     /// What the daemon last said about the HTTP interface.
     #[cfg(feature = "rest")]
     rest_state: Option<crate::protocol::RestState>,
+    /// Result of the one REST request currently running off the UI thread.
+    #[cfg(feature = "rest")]
+    rest_sync_receiver: Option<RestWorkerReceiver>,
+    /// What the worker currently running on behalf of this monitor is doing.
+    #[cfg(feature = "rest")]
+    rest_sync_operation: Option<RestOperation>,
+    /// Invalidates an older status reply when the user starts or stops REST.
+    #[cfg(feature = "rest")]
+    rest_sync_generation: u64,
+    /// Next time a periodic REST status request may start.
+    #[cfg(feature = "rest")]
+    rest_next_sync: std::time::Instant,
+    /// Most recent status query error, separate from port settings feedback.
+    #[cfg(feature = "rest")]
+    rest_error: Option<String>,
+    /// Port validation and Start/Stop errors shown inside the REST API dialog.
+    #[cfg(feature = "rest")]
+    rest_dialog_error: Option<String>,
     /// The port typed into the window, before it is applied.
     #[cfg(feature = "rest")]
     rest_port: String,
+    /// Keeps periodic status updates from replacing a port being edited.
+    #[cfg(feature = "rest")]
+    rest_port_edited: bool,
     pub show_settings_dialog: bool,
     /// Live line settings; the single place this window keeps them.
     pub config: PortConfig,
@@ -1307,7 +1376,21 @@ impl PortMonitorState {
             #[cfg(feature = "rest")]
             rest_state: None,
             #[cfg(feature = "rest")]
+            rest_sync_receiver: None,
+            #[cfg(feature = "rest")]
+            rest_sync_operation: None,
+            #[cfg(feature = "rest")]
+            rest_sync_generation: 0,
+            #[cfg(feature = "rest")]
+            rest_next_sync: std::time::Instant::now(),
+            #[cfg(feature = "rest")]
+            rest_error: None,
+            #[cfg(feature = "rest")]
+            rest_dialog_error: None,
+            #[cfg(feature = "rest")]
             rest_port: String::new(),
+            #[cfg(feature = "rest")]
+            rest_port_edited: false,
             show_settings_dialog: false,
             settings_custom_baud: config.baudrate.to_string(),
             config,
@@ -1785,6 +1868,9 @@ impl PortMonitorState {
     }
 
     fn render_ui(&mut self, ui: &mut egui::Ui, icon_texture: Option<&egui::TextureHandle>) {
+        #[cfg(feature = "rest")]
+        self.refresh_rest(ui.ctx(), false);
+
         if platform::take_menu_request(MenuRequest::Export) {
             self.show_export_dialog = true;
             if self.export_path.is_empty() {
@@ -2662,21 +2748,190 @@ impl PortMonitorState {
         self.show_transfer_dialog = is_open && !close_requested;
     }
 
-    /// Ask the daemon what it says about the HTTP interface.
+    /// Keep the global REST indicator synchronized without making an IPC call
+    /// from the immediate-mode UI thread.
     ///
-    /// A failure leaves the last answer in place: a daemon that did not answer
-    /// has not said the interface is off.
+    /// There is at most one REST request in flight per monitor. Its reply is
+    /// collected with `try_recv`, and the worker requests a repaint when it is
+    /// ready. Failed status queries leave the last daemon state intact but mark
+    /// the indicator unavailable; a failed connection is not evidence that
+    /// REST is off.
     #[cfg(feature = "rest")]
-    fn refresh_rest(&mut self) {
-        if let Some(rest) = self.rest.as_ref() {
-            match rest(&crate::standalone::RestRequest::Status) {
-                Ok(state) => {
-                    if self.rest_port.is_empty() {
-                        self.rest_port = state.port.to_string();
+    fn refresh_rest(&mut self, ctx: &egui::Context, force: bool) {
+        let completed = self
+            .rest_sync_receiver
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        match completed {
+            Some(Ok((generation, operation, outcome))) => {
+                self.rest_sync_receiver = None;
+                self.rest_sync_operation = None;
+                if generation == self.rest_sync_generation {
+                    match operation {
+                        RestOperation::Status => {
+                            self.rest_next_sync =
+                                std::time::Instant::now() + REST_STATUS_SYNC_INTERVAL;
+                            match outcome {
+                                Ok(state) => self.set_rest_state(state),
+                                Err(error) => self.rest_error = Some(error),
+                            }
+                        }
+                        RestOperation::Start | RestOperation::Stop => match outcome {
+                            Ok(state) => {
+                                self.rest_port_edited = false;
+                                self.set_rest_state(state);
+                                self.rest_dialog_error = None;
+                                self.rest_next_sync =
+                                    std::time::Instant::now() + REST_STATUS_SYNC_INTERVAL;
+                            }
+                            Err(error) => {
+                                let verb = if operation == RestOperation::Start {
+                                    "start"
+                                } else {
+                                    "stop"
+                                };
+                                self.rest_dialog_error =
+                                    Some(format!("Could not {verb} REST API: {error}"));
+                                // A failed action can still have changed daemon
+                                // state (for example, a listener that failed to
+                                // bind). Ask for its current state immediately.
+                                self.rest_next_sync = std::time::Instant::now();
+                            }
+                        },
                     }
-                    self.rest_state = Some(state);
                 }
-                Err(e) => self.settings_status = Some((format!("REST unavailable: {e}"), true)),
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.rest_sync_receiver = None;
+                let operation = self
+                    .rest_sync_operation
+                    .take()
+                    .unwrap_or(RestOperation::Status);
+                match operation {
+                    RestOperation::Status => {
+                        self.rest_error =
+                            Some("status request ended without a response".to_string());
+                        self.rest_next_sync = std::time::Instant::now() + REST_STATUS_SYNC_INTERVAL;
+                    }
+                    RestOperation::Start | RestOperation::Stop => {
+                        let verb = if operation == RestOperation::Start {
+                            "start"
+                        } else {
+                            "stop"
+                        };
+                        self.rest_dialog_error = Some(format!(
+                            "Could not {verb} REST API: background request ended without a response."
+                        ));
+                        self.rest_next_sync = std::time::Instant::now();
+                    }
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return,
+            None => {}
+        }
+
+        if self.rest_sync_receiver.is_some()
+            || (!force && std::time::Instant::now() < self.rest_next_sync)
+        {
+            return;
+        }
+
+        let Some(rest) = self.rest.clone() else {
+            self.rest_error = Some("no daemon connection".to_string());
+            self.rest_next_sync = std::time::Instant::now() + REST_STATUS_SYNC_INTERVAL;
+            return;
+        };
+
+        let generation = self.rest_sync_generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let worker = std::thread::Builder::new()
+            .name("devserial-rest-status".to_string())
+            .spawn(move || {
+                let result = rest(&crate::standalone::RestRequest::Status);
+                let _ = sender.send((generation, RestOperation::Status, result));
+                ctx.request_repaint();
+            });
+
+        match worker {
+            Ok(_) => {
+                self.rest_sync_receiver = Some(receiver);
+                self.rest_sync_operation = Some(RestOperation::Status);
+            }
+            Err(error) => {
+                self.rest_error = Some(format!("could not start status request: {error}"));
+                self.rest_next_sync = std::time::Instant::now() + REST_STATUS_SYNC_INTERVAL;
+            }
+        }
+    }
+
+    /// Apply a state returned by either a background query or a user action.
+    #[cfg(feature = "rest")]
+    fn set_rest_state(&mut self, state: crate::protocol::RestState) {
+        if !self.rest_port_edited {
+            self.rest_port = state.port.to_string();
+        }
+        self.rest_state = Some(state);
+        self.rest_error = None;
+    }
+
+    /// Make a background reply started before a user action ineligible to
+    /// replace the newer state returned by that action.
+    #[cfg(feature = "rest")]
+    fn invalidate_rest_sync(&mut self) {
+        self.rest_sync_generation = self.rest_sync_generation.wrapping_add(1);
+        self.rest_sync_receiver = None;
+        self.rest_sync_operation = None;
+    }
+
+    /// Send a REST Start or Stop command off the GUI thread.
+    #[cfg(feature = "rest")]
+    fn start_rest_action(&mut self, ctx: &egui::Context, request: crate::standalone::RestRequest) {
+        let operation = match &request {
+            crate::standalone::RestRequest::Enable { .. } => RestOperation::Start,
+            crate::standalone::RestRequest::Disable => RestOperation::Stop,
+            crate::standalone::RestRequest::Status => return,
+        };
+
+        self.invalidate_rest_sync();
+        self.rest_dialog_error = None;
+        let Some(rest) = self.rest.clone() else {
+            let verb = if operation == RestOperation::Start {
+                "start"
+            } else {
+                "stop"
+            };
+            self.rest_dialog_error =
+                Some(format!("Could not {verb} REST API: no daemon connection."));
+            return;
+        };
+
+        let generation = self.rest_sync_generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let worker = std::thread::Builder::new()
+            .name("devserial-rest-action".to_string())
+            .spawn(move || {
+                let result = rest(&request);
+                let _ = sender.send((generation, operation, result));
+                ctx.request_repaint();
+            });
+
+        match worker {
+            Ok(_) => {
+                self.rest_sync_receiver = Some(receiver);
+                self.rest_sync_operation = Some(operation);
+            }
+            Err(error) => {
+                let verb = if operation == RestOperation::Start {
+                    "start"
+                } else {
+                    "stop"
+                };
+                self.rest_dialog_error = Some(format!(
+                    "Could not {verb} REST API: could not start worker: {error}"
+                ));
+                self.rest_next_sync = std::time::Instant::now();
             }
         }
     }
@@ -2692,7 +2947,7 @@ impl PortMonitorState {
         let mut close_requested = false;
         let mut request = None;
 
-        egui::Window::new("REST interface")
+        egui::Window::new("REST API")
             .open(&mut is_open)
             .resizable(false)
             .collapsible(false)
@@ -2701,12 +2956,21 @@ impl PortMonitorState {
             .show(ctx, |ui| {
                 ui.set_max_width(FORM_WIDTH);
                 let listening = self.rest_state.as_ref().is_some_and(|rest| rest.listening);
+                let state_available = self.rest_state.is_some() && self.rest_error.is_none();
+                let pending_action = matches!(
+                    self.rest_sync_operation,
+                    Some(RestOperation::Start | RestOperation::Stop)
+                );
 
                 ui.horizontal(|ui| {
-                    let (colour, label) = if listening {
+                    let (colour, label) = if self.rest_error.is_some() || self.rest.is_none() {
+                        (egui::Color32::from_rgb(255, 180, 60), "REST unavailable")
+                    } else if listening {
                         (egui::Color32::from_rgb(80, 200, 120), "● Listening")
-                    } else {
+                    } else if self.rest_state.is_some() {
                         (egui::Color32::from_rgb(150, 150, 150), "○ Off")
+                    } else {
+                        (egui::Color32::from_rgb(150, 150, 150), "Checking…")
                     };
                     ui.colored_label(colour, label);
                     if let Some(rest) = self.rest_state.as_ref() {
@@ -2716,6 +2980,14 @@ impl PortMonitorState {
                         );
                     }
                 });
+
+                if let Some(error) = &self.rest_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 180, 60),
+                        format!("Status unavailable: {error}"),
+                    );
+                }
 
                 if let Some(reason) = self
                     .rest_state
@@ -2738,10 +3010,14 @@ impl PortMonitorState {
                     // Frozen while it listens: changing the port of a running
                     // listener means restarting it, and the button below says
                     // so rather than doing it silently.
-                    ui.add_enabled(
-                        !listening,
+                    let response = ui.add_enabled(
+                        !listening && state_available && !pending_action,
                         egui::TextEdit::singleline(&mut self.rest_port).desired_width(90.0),
                     );
+                    if response.changed() {
+                        self.rest_port_edited = true;
+                        self.rest_dialog_error = None;
+                    }
                     if listening {
                         ui.label(
                             egui::RichText::new("stop first to change it")
@@ -2750,6 +3026,10 @@ impl PortMonitorState {
                         );
                     }
                 });
+
+                if let Some(error) = &self.rest_dialog_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 90, 90), error);
+                }
 
                 if let Some(rest) = self.rest_state.as_ref() {
                     ui.add_space(4.0);
@@ -2769,15 +3049,28 @@ impl PortMonitorState {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    if listening {
+                    if pending_action {
+                        let progress = if self.rest_sync_operation == Some(RestOperation::Start) {
+                            "Starting…"
+                        } else {
+                            "Stopping…"
+                        };
+                        ui.label(progress);
+                    } else if state_available && listening {
                         if ui.button("⏹ Stop").clicked() {
                             request = Some(crate::standalone::RestRequest::Disable);
                         }
-                    } else if ui.button("▶ Start").clicked() {
-                        request = Some(crate::standalone::RestRequest::Enable {
-                            bind: None,
-                            port: self.rest_port.trim().parse().ok(),
-                        });
+                    } else if state_available && ui.button("▶ Start").clicked() {
+                        match parse_rest_port(&self.rest_port) {
+                            Ok(port) => {
+                                self.rest_dialog_error = None;
+                                request = Some(crate::standalone::RestRequest::Enable {
+                                    bind: None,
+                                    port,
+                                });
+                            }
+                            Err(error) => self.rest_dialog_error = Some(error.to_string()),
+                        }
                     }
                     if ui.button("Close").clicked() {
                         close_requested = true;
@@ -2786,20 +3079,7 @@ impl PortMonitorState {
             });
 
         if let Some(request) = request {
-            let outcome = self.rest.as_ref().map_or_else(
-                || Err("no daemon connection".to_string()),
-                |rest| rest(&request),
-            );
-            match outcome {
-                Ok(state) => {
-                    self.rest_port = state.port.to_string();
-                    self.rest_state = Some(state);
-                }
-                Err(e) => {
-                    self.settings_status = Some((format!("REST: {e}"), true));
-                    self.refresh_rest();
-                }
-            }
+            self.start_rest_action(ctx, request);
         }
 
         self.show_rest_dialog = is_open && !close_requested;
@@ -3385,29 +3665,6 @@ impl PortMonitorState {
 
             ui.separator();
 
-            #[cfg(feature = "rest")]
-            {
-                // The label carries the state, so the toolbar answers "is it
-                // on" without a window having to be opened for it.
-                let listening = self.rest_state.as_ref().is_some_and(|rest| rest.listening);
-                let label = if listening {
-                    format!(
-                        "🌐 REST :{}",
-                        self.rest_state.as_ref().map_or(0, |rest| rest.port)
-                    )
-                } else {
-                    "🌐 REST".to_string()
-                };
-                if ui
-                    .button(label)
-                    .on_hover_text("Show and change the HTTP interface of the daemon")
-                    .clicked()
-                {
-                    self.show_rest_dialog = true;
-                    self.refresh_rest();
-                }
-            }
-
             if ui
                 .button("ℹ About")
                 .on_hover_text("About devserial (Author, Version, Repository)")
@@ -3655,6 +3912,36 @@ impl PortMonitorState {
                 ui.checkbox(&mut self.auto_follow, "Auto-follow");
                 ui.separator();
                 render_zoom_control(ui);
+
+                #[cfg(feature = "rest")]
+                {
+                    ui.separator();
+                    let unavailable = self.rest_error.is_some() || self.rest.is_none();
+                    let label = rest_indicator_label(self.rest_state.as_ref(), unavailable);
+                    let colour = if unavailable {
+                        egui::Color32::from_rgb(255, 180, 60)
+                    } else if self
+                        .rest_state
+                        .as_ref()
+                        .is_some_and(|state| state.listening)
+                    {
+                        egui::Color32::from_rgb(80, 200, 120)
+                    } else {
+                        egui::Color32::from_rgb(160, 160, 160)
+                    };
+                    let hover_text = self.rest_error.as_ref().map_or_else(
+                        || "Show and change the global REST API state".to_string(),
+                        |error| format!("REST status unavailable: {error}"),
+                    );
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new(label).color(colour)).small())
+                        .on_hover_text(hover_text)
+                        .clicked()
+                    {
+                        self.show_rest_dialog = true;
+                        self.refresh_rest(ui.ctx(), true);
+                    }
+                }
             });
         });
     }
@@ -4032,5 +4319,104 @@ mod marker_tests {
                 "━━━ PORT DISCONNECTED: /dev/ttyTEST ━━━"
             ],
         );
+    }
+}
+
+#[cfg(all(test, feature = "rest"))]
+mod rest_status_tests {
+    use super::{PortMonitorState, RestOperation, parse_rest_port, rest_indicator_label};
+    use crate::protocol::RestState;
+
+    fn state(listening: bool, port: u16) -> RestState {
+        RestState {
+            listening,
+            bind: "127.0.0.1".to_string(),
+            port,
+            reason: None,
+            token_required: false,
+        }
+    }
+
+    #[test]
+    fn listening_indicator_includes_the_active_port() {
+        assert_eq!(
+            rest_indicator_label(Some(&state(true, 8422)), false),
+            "REST :8422"
+        );
+    }
+
+    #[test]
+    fn stopped_indicator_is_explicitly_off() {
+        assert_eq!(
+            rest_indicator_label(Some(&state(false, 9600)), false),
+            "REST off"
+        );
+    }
+
+    #[test]
+    fn an_unknown_state_is_not_reported_as_off() {
+        assert_eq!(rest_indicator_label(None, false), "REST checking…");
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_reported_as_unavailable() {
+        assert_eq!(
+            rest_indicator_label(Some(&state(true, 8422)), true),
+            "REST unavailable"
+        );
+    }
+
+    #[test]
+    fn a_blank_port_uses_the_daemon_configuration() {
+        assert_eq!(parse_rest_port("  "), Ok(None));
+    }
+
+    #[test]
+    fn a_valid_port_is_trimmed_and_parsed() {
+        assert_eq!(parse_rest_port(" 8422 "), Ok(Some(8422)));
+    }
+
+    #[test]
+    fn malformed_zero_and_out_of_range_ports_are_rejected() {
+        for text in ["nope", "0", "65536", "-1"] {
+            assert!(parse_rest_port(text).is_err(), "'{text}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn a_stale_status_reply_cannot_replace_a_newer_rest_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::storage::SqliteStorage::open(&directory.path().join("capture.db")).unwrap();
+        let mut monitor = PortMonitorState::new(
+            "test".to_string(),
+            "test".to_string(),
+            storage,
+            Vec::new(),
+            None,
+        );
+        let ctx = eframe::egui::Context::default();
+        monitor.rest_next_sync = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        monitor.rest_sync_generation = 2;
+        monitor.rest_state = Some(state(true, 8422));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        monitor.rest_sync_receiver = Some(receiver);
+        monitor.rest_sync_operation = Some(RestOperation::Status);
+        sender
+            .send((1, RestOperation::Status, Ok(state(false, 9600))))
+            .unwrap();
+        monitor.refresh_rest(&ctx, false);
+        assert_eq!(monitor.rest_state.as_ref().unwrap().port, 8422);
+        assert!(monitor.rest_state.as_ref().unwrap().listening);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        monitor.rest_sync_receiver = Some(receiver);
+        monitor.rest_sync_operation = Some(RestOperation::Status);
+        sender
+            .send((2, RestOperation::Status, Ok(state(false, 9600))))
+            .unwrap();
+        monitor.refresh_rest(&ctx, false);
+        assert!(!monitor.rest_state.as_ref().unwrap().listening);
     }
 }
