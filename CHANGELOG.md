@@ -4,6 +4,14 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.2](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.1...devserial-v0.2.2) (2026-09-28)
+
+
+### Bug Fixes
+
+* **monitor:** make REST controls accurate and responsive ([b997910](https://github.com/metaneutrons/devserial/commit/b997910b112d4a1e9aeefdd2067c0e0edcd6f3bf))
+* **monitor:** one marker per event ([06840de](https://github.com/metaneutrons/devserial/commit/06840de7ef8fce54a1c3557a6eeff823ae4216c3))
+
 ## [0.2.1](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.0...devserial-v0.2.1) (2026-09-11)
 
 
