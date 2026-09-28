@@ -402,8 +402,9 @@ devserial rest --disable
 
 The switch is in all three surfaces and they show one state, because they all
 ask the daemon: `devserial rest` on the command line, `F7` in the terminal
-monitor, and a **REST** button in the window's toolbar that carries the port in
-its label while the interface is listening.
+monitor, and a clickable **REST** status entry in each window's bottom bar. It
+shows `REST off` when stopped and the listening port when active; click it to
+open the separate REST API window.
 
 **Port 9600, on `127.0.0.1`.** The number is the one a serial developer recalls
 without looking it up. `/etc/services` assigns it to `micromuse-ncpw`; that

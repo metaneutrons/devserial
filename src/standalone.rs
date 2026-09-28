@@ -192,6 +192,7 @@ struct SessionParts {
     /// `shared_storage` instead and never needs it.
     #[cfg(feature = "monitor")]
     storage: SqliteStorage,
+    #[cfg(feature = "tui")]
     shared_storage: Arc<Mutex<SqliteStorage>>,
     client: Arc<IpcClient>,
     keepalive: Arc<SessionKeepalive>,
@@ -343,8 +344,9 @@ fn daemon_toggle(
 /// The state is the daemon's, read on every call rather than cached, because
 /// another surface or the command line can change it while a window is open.
 #[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
-fn daemon_rest(client: &Arc<IpcClient>, runtime: tokio::runtime::Handle) -> RestControlFn {
+fn daemon_rest(client: &Arc<IpcClient>, runtime: &tokio::runtime::Handle) -> RestControlFn {
     let client = Arc::clone(client);
+    let runtime = runtime.clone();
     Arc::new(move |request: &RestRequest| {
         let payload = match request {
             RestRequest::Status => RequestPayload::RestStatus,
@@ -548,6 +550,7 @@ fn attach_session(
     let storage = SqliteStorage::open(&db_path)
         .map_err(|e| format!("failed to open capture database: {e}"))?;
     let history = storage.load_send_history(500).unwrap_or_default();
+    #[cfg(feature = "tui")]
     let shared_storage = Arc::new(Mutex::new(
         SqliteStorage::open(&db_path)
             .map_err(|e| format!("failed to open capture database: {e}"))?,
@@ -558,6 +561,7 @@ fn attach_session(
     Ok(SessionParts {
         #[cfg(feature = "monitor")]
         storage,
+        #[cfg(feature = "tui")]
         shared_storage,
         client,
         keepalive: SessionKeepalive::new(runtime, link, poller),
@@ -602,7 +606,7 @@ pub fn open_standalone_session(
     );
     #[cfg(feature = "rest")]
     {
-        monitor.rest = Some(daemon_rest(&parts.client, runtime));
+        monitor.rest = Some(daemon_rest(&parts.client, &runtime));
     }
     Ok(monitor)
 }
@@ -659,7 +663,7 @@ pub fn run_monitor_standalone(
         Box::new(writer),
         Arc::clone(&parts.keepalive),
         #[cfg(feature = "rest")]
-        Some(daemon_rest(&parts.client, runtime.clone())),
+        Some(daemon_rest(&parts.client, &runtime)),
     );
 
     match result {
@@ -735,7 +739,7 @@ fn run_tui_attached(
         reconfigure: Some(daemon_reconfigure(port, &parts.client, runtime.clone())),
         transfer: Some(daemon_transfer(port, &parts.client, runtime.clone())),
         #[cfg(feature = "rest")]
-        rest: Some(daemon_rest(&parts.client, runtime.clone())),
+        rest: Some(daemon_rest(&parts.client, runtime)),
     };
 
     crate::tui::run_tui(port, config, &parts.shared_storage, runtime, context)
