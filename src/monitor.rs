@@ -535,6 +535,12 @@ fn configure_style(ctx: &egui::Context) {
     }
 }
 
+/// Initialize the native app menu and reflect the current shared colour state.
+fn init_platform_app() {
+    platform::init_app();
+    platform::update_color_state(color::ui_enabled(), color::ui_is_locked());
+}
+
 /// Start the GUI socket server if this platform supports multiplexing.
 fn start_socket_server(
     tx: std::sync::mpsc::Sender<GuiCommand>,
@@ -567,7 +573,7 @@ fn start_socket_server(
 /// # Errors
 /// Returns an error if the window cannot be initialized.
 pub fn run_monitor_gui() -> Result<(), String> {
-    platform::init_app();
+    init_platform_app();
 
     let ctx_holder: Arc<std::sync::Mutex<Option<egui::Context>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -600,7 +606,7 @@ pub fn run_monitor_gui() -> Result<(), String> {
         "devserial",
         options,
         Box::new(move |cc| {
-            platform::init_app();
+            init_platform_app();
             configure_style(&cc.egui_ctx);
             if let Ok(mut guard) = ctx_holder.lock() {
                 *guard = Some(cc.egui_ctx.clone());
@@ -620,7 +626,7 @@ fn run_monitor_inner(
     keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
     #[cfg(feature = "rest")] rest: Option<crate::standalone::RestControlFn>,
 ) -> Result<(), String> {
-    platform::init_app();
+    init_platform_app();
 
     let ctx_holder: Arc<std::sync::Mutex<Option<egui::Context>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -681,7 +687,7 @@ fn run_monitor_inner(
         "devserial",
         options,
         Box::new(move |cc| {
-            platform::init_app();
+            init_platform_app();
             configure_style(&cc.egui_ctx);
             if let Ok(mut guard) = ctx_for_thread.lock() {
                 *guard = Some(cc.egui_ctx.clone());
@@ -1232,7 +1238,6 @@ pub struct PortMonitorState {
     line_ending: LineEnding,
     show_timestamps: bool,
     hex_view: bool,
-    color_enabled: bool,
     dtr_state: bool,
     rts_state: bool,
     last_id: i64,
@@ -1356,7 +1361,6 @@ impl PortMonitorState {
             line_ending: LineEnding::CrLf,
             show_timestamps: true,
             hex_view: false,
-            color_enabled: color::ui_enabled(),
             dtr_state: false,
             rts_state: false,
             last_id: i64::MAX,
@@ -2180,6 +2184,14 @@ impl MultiMonitorApp {
 
 impl eframe::App for MultiMonitorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if platform::take_menu_request(MenuRequest::ToggleColor) && !color::ui_is_locked() {
+            let color_enabled = !color::ui_enabled();
+            if let Err(error) = color::save_preference(color_enabled) {
+                tracing::warn!(%error, "could not save display colour preference");
+            }
+        }
+        platform::update_color_state(color::ui_enabled(), color::ui_is_locked());
+
         if platform::take_menu_request(MenuRequest::OpenPort) {
             self.open_connect_dialog();
         }
@@ -3603,14 +3615,17 @@ impl PortMonitorState {
                     crate::export::DISPLAY_ZONE_NOTE
                 ));
             ui.checkbox(&mut self.hex_view, "Hex");
+            let mut color_enabled = color::ui_enabled();
             let color_toggle = ui.add_enabled(
                 !color::ui_is_locked(),
-                egui::Checkbox::new(&mut self.color_enabled, "Color"),
+                egui::Checkbox::new(&mut color_enabled, "Color"),
             );
-            if color_toggle.changed()
-                && let Err(error) = color::save_preference(self.color_enabled)
-            {
+            let color_changed = color_toggle.changed();
+            if color_changed && let Err(error) = color::save_preference(color_enabled) {
                 tracing::warn!(%error, "could not save display colour preference");
+            }
+            if color_changed {
+                platform::update_color_state(color::ui_enabled(), color::ui_is_locked());
             }
             color_toggle
                 .on_hover_text("Color only changes capture text, not stored data or exports");
@@ -3693,6 +3708,7 @@ impl PortMonitorState {
     fn render_buffer(&mut self, ui: &mut egui::Ui) {
         let text_style = egui::TextStyle::Monospace;
         let row_height = ui.text_style_height(&text_style) + 2.0;
+        let color_enabled = color::ui_enabled();
 
         let indices: Vec<usize> = if self.filter_active {
             self.filtered_indices.clone()
@@ -3719,7 +3735,7 @@ impl PortMonitorState {
                 };
                 ui.horizontal(|ui| {
                     if self.show_timestamps {
-                        if self.color_enabled {
+                        if color_enabled {
                             ui.colored_label(ui.visuals().weak_text_color(), &line.timestamp);
                         } else {
                             ui.label(&line.timestamp);
@@ -3728,7 +3744,7 @@ impl PortMonitorState {
                     }
                     let resp = if line.is_sent {
                         let text = egui::RichText::new(format!(">> {}", line.payload)).monospace();
-                        let text = if self.color_enabled {
+                        let text = if color_enabled {
                             text.color(tone_color(Tone::Sent, ui.visuals().dark_mode))
                         } else {
                             text
@@ -3746,7 +3762,7 @@ impl PortMonitorState {
                         ui.add(
                             egui::Label::new(colorize_label(
                                 &line.payload,
-                                self.color_enabled,
+                                color_enabled,
                                 ui.visuals().dark_mode,
                             ))
                             .selectable(true),

@@ -6,6 +6,7 @@
 
 use std::io::IsTerminal as _;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,7 @@ pub enum Tone {
 }
 
 static CLI_MODE: OnceLock<ColorMode> = OnceLock::new();
+static UI_PREFERENCE: OnceLock<AtomicBool> = OnceLock::new();
 
 pub fn set_cli_mode(mode: ColorMode) {
     let _ = CLI_MODE.set(mode);
@@ -62,7 +64,13 @@ pub const fn terminal_enabled_for(mode: ColorMode, is_terminal: bool, no_color: 
 
 #[must_use]
 pub fn ui_enabled() -> bool {
-    ui_enabled_for(mode(), load_preference(), no_color_requested())
+    ui_enabled_for(mode(), current_preference(), no_color_requested())
+}
+
+fn current_preference() -> bool {
+    UI_PREFERENCE
+        .get_or_init(|| AtomicBool::new(load_preference()))
+        .load(Ordering::Acquire)
 }
 
 #[must_use]
@@ -141,6 +149,9 @@ fn load_preference_from(path: &std::path::Path) -> bool {
 /// Returns an error if the user data directory or preference file is not writable.
 pub fn save_preference(enabled: bool) -> std::io::Result<()> {
     let path = preference_path();
+    UI_PREFERENCE
+        .get_or_init(|| AtomicBool::new(load_preference_from(&path)))
+        .store(enabled, Ordering::Release);
     save_preference_to(&path, enabled)
 }
 

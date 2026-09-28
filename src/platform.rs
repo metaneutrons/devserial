@@ -46,6 +46,8 @@ pub enum MenuRequest {
     ZoomOut,
     /// Return the interface to its unscaled size.
     ZoomReset,
+    /// Toggle semantic colours in the monitor display.
+    ToggleColor,
 }
 
 impl MenuRequest {
@@ -58,6 +60,7 @@ impl MenuRequest {
         Self::ZoomIn,
         Self::ZoomOut,
         Self::ZoomReset,
+        Self::ToggleColor,
     ];
 }
 
@@ -84,6 +87,8 @@ mod macos {
         fn devserial_check_zoom_in_requested() -> bool;
         fn devserial_check_zoom_out_requested() -> bool;
         fn devserial_check_zoom_reset_requested() -> bool;
+        fn devserial_check_toggle_color_requested() -> bool;
+        fn devserial_update_color_state(color_enabled: bool, locked: bool);
         fn devserial_update_edit_state(
             is_text_focused: bool,
             has_text_selection: bool,
@@ -135,7 +140,16 @@ mod macos {
                 MenuRequest::ZoomIn => devserial_check_zoom_in_requested(),
                 MenuRequest::ZoomOut => devserial_check_zoom_out_requested(),
                 MenuRequest::ZoomReset => devserial_check_zoom_reset_requested(),
+                MenuRequest::ToggleColor => devserial_check_toggle_color_requested(),
             }
+        }
+    }
+
+    pub fn update_color_state(color_enabled: bool, locked: bool) {
+        // SAFETY: see the block contract. Scalar arguments only.
+        #[allow(unsafe_code)]
+        unsafe {
+            devserial_update_color_state(color_enabled, locked);
         }
     }
 
@@ -170,6 +184,8 @@ mod fallback {
         false
     }
 
+    pub const fn update_color_state(_color_enabled: bool, _locked: bool) {}
+
     pub const fn update_edit_state(_state: EditState) {}
 }
 
@@ -179,12 +195,12 @@ use macos as imp;
 #[cfg(not(target_os = "macos"))]
 use fallback as imp;
 
-// The four wrappers below cannot be const: on macOS `imp` is the Objective-C
+// The wrappers below cannot be const: on macOS `imp` is the Objective-C
 // FFI. Off macOS `imp` is the no-op fallback, and clippy's nursery lint
 // `missing_const_for_fn` then rightly observes that the wrapper could be const
 // there. Marking them const would break the macOS build, and making the
 // attribute conditional on the target would put the platform split in two
-// places instead of one. The allow sits on each function so a fifth wrapper
+// places instead of one. The allow sits on each function so a new wrapper
 // does not inherit it silently.
 
 /// Initialize native application integration (dock icon, menus, about panel).
@@ -212,6 +228,12 @@ pub fn clipboard_text() -> Option<String> {
 #[allow(clippy::missing_const_for_fn)]
 pub fn take_menu_request(request: MenuRequest) -> bool {
     imp::take_menu_request(request)
+}
+
+/// Publish the monitor colour setting and whether the native control is locked.
+#[allow(clippy::missing_const_for_fn)]
+pub fn update_color_state(color_enabled: bool, locked: bool) {
+    imp::update_color_state(color_enabled, locked);
 }
 
 /// Publish the current edit state so native menu items enable and disable.
@@ -255,6 +277,7 @@ mod tests {
             MenuRequest::ZoomIn => ("devserial_check_zoom_in_requested", "zoomIn:"),
             MenuRequest::ZoomOut => ("devserial_check_zoom_out_requested", "zoomOut:"),
             MenuRequest::ZoomReset => ("devserial_check_zoom_reset_requested", "zoomReset:"),
+            MenuRequest::ToggleColor => ("devserial_check_toggle_color_requested", "toggleColor:"),
         }
     }
 
@@ -294,6 +317,16 @@ mod tests {
                 "macos.m has no menu item calling {selector}"
             );
         }
+    }
+
+    #[test]
+    fn the_color_menu_tracks_enabled_and_locked_state() {
+        assert!(MACOS_SOURCE.contains("initWithTitle:@\"Color\""));
+        assert!(MACOS_SOURCE.contains(
+            "[g_colorMenuItem setState:color_enabled ? NSControlStateValueOn : NSControlStateValueOff];"
+        ));
+        assert!(MACOS_SOURCE.contains("[g_colorMenuItem setEnabled:!locked];"));
+        assert!(MACOS_SOURCE.contains("return !g_colorLocked;"));
     }
 
     #[test]

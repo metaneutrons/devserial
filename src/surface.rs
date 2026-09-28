@@ -138,7 +138,7 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::HexView, "\"Hex\""),
     (
         Capability::ColorView,
-        "Checkbox::new(&mut self.color_enabled, \"Color\")",
+        "Checkbox::new(&mut color_enabled, \"Color\")",
     ),
     (Capability::ScrollBack, "\"Auto-follow\""),
     (Capability::Filter, "\"Filter:\""),
