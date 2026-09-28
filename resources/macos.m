@@ -214,7 +214,7 @@ static void forward_edit_action(id target, unsigned short keyCode, NSString *cha
 
 @end
 
-@interface DevSerialAboutHandler : NSObject
+@interface DevSerialAboutHandler : NSObject <NSMenuItemValidation>
 - (void)showAbout:(id)sender;
 - (void)openHelp:(id)sender;
 - (void)exportBuffer:(id)sender;
@@ -224,6 +224,7 @@ static void forward_edit_action(id target, unsigned short keyCode, NSString *cha
 - (void)zoomIn:(id)sender;
 - (void)zoomOut:(id)sender;
 - (void)zoomReset:(id)sender;
+- (void)toggleColor:(id)sender;
 @end
 
 static BOOL g_exportRequested = NO;
@@ -233,8 +234,15 @@ static BOOL g_toggleConnectRequested = NO;
 static BOOL g_zoomInRequested = NO;
 static BOOL g_zoomOutRequested = NO;
 static BOOL g_zoomResetRequested = NO;
+static BOOL g_toggleColorRequested = NO;
+static NSMenuItem *g_colorMenuItem = nil;
+static BOOL g_colorLocked = NO;
 
 @implementation DevSerialAboutHandler
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if ([item action] == @selector(toggleColor:)) return !g_colorLocked;
+    return YES;
+}
 - (void)showAbout:(id)sender {
     (void)sender;
     NSMutableDictionary *options = [NSMutableDictionary dictionary];
@@ -288,6 +296,11 @@ static BOOL g_zoomResetRequested = NO;
 - (void)zoomReset:(id)sender {
     (void)sender;
     g_zoomResetRequested = YES;
+}
+
+- (void)toggleColor:(id)sender {
+    (void)sender;
+    g_toggleColorRequested = YES;
 }
 @end
 
@@ -347,6 +360,22 @@ BOOL devserial_check_zoom_reset_requested(void) {
         return YES;
     }
     return NO;
+}
+
+BOOL devserial_check_toggle_color_requested(void) {
+    if (g_toggleColorRequested) {
+        g_toggleColorRequested = NO;
+        return YES;
+    }
+    return NO;
+}
+
+void devserial_update_color_state(BOOL color_enabled, BOOL locked) {
+    g_colorLocked = locked;
+    if (g_colorMenuItem) {
+        [g_colorMenuItem setState:color_enabled ? NSControlStateValueOn : NSControlStateValueOff];
+        [g_colorMenuItem setEnabled:!locked];
+    }
 }
 
 const char *devserial_get_clipboard_text(void) {
@@ -572,6 +601,14 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
         NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
         [viewMenuItem setSubmenu:viewMenu];
         [mainMenu addItem:viewMenuItem];
+
+        NSMenuItem *colorItem = [[NSMenuItem alloc] initWithTitle:@"Color"
+                                                           action:@selector(toggleColor:)
+                                                    keyEquivalent:@""];
+        [colorItem setTarget:g_aboutHandler];
+        g_colorMenuItem = colorItem;
+        [viewMenu addItem:colorItem];
+        [viewMenu addItem:[NSMenuItem separatorItem]];
 
         // Zoom In (Cmd++), Zoom Out (Cmd+-), Actual Size (Cmd+0).
         //
