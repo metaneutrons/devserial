@@ -215,7 +215,7 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Windows and sessions.** All sessions live in one process with one Dock icon. A second `devserial monitor` invocation opens a window in the running instance instead of starting a second application. Ports already shown are marked and cannot be opened twice. A port the daemon already holds keeps its line settings when a monitor attaches to it; use the settings dialog or `devserial open` to change them.
 
-**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS toggles, timestamp and hex views, pause and auto-follow, clearing the view without touching the capture, and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
+**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS toggles, timestamp, hex and color views, pause and auto-follow, clearing the view without touching the capture, and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
 
 **Runtime reconfiguration.** Baud rate, framing and flow control can be changed while the session is open, without losing the buffer. The change is recorded as a marker line in the capture.
 
@@ -261,6 +261,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
 | `F5` | Run a configured macro |
 | `F6` | Flash firmware to an ESP device |
+| `F8` | Toggle semantic colors in the capture display |
 | `Ctrl+K` | Release the port, or take it back |
 | `Ctrl+F` | Filter the view, `Esc` clears the filter |
 | `Ctrl+L` | Clear the view; the capture on disk is untouched |
@@ -308,7 +309,9 @@ Every command talks to the background daemon and starts it if it is not running.
 | `mcp` | Run as an MCP server |
 | `about` | Version, author, license, repository |
 
-Two options are global. `--socket` selects the IPC endpoint, `--config` a configuration file. Both are validated before anything else happens.
+Global options include `--socket` for the IPC endpoint, `--config` for a configuration file, and `--color auto|always|never` (or `--no-color`) for human-readable output. `auto` is the default: colors appear on a terminal, not in a pipe. `NO_COLOR` also disables automatic coloring; explicit `--color always` overrides it. The GUI's Color checkbox and the TUI's `F8` key save a shared display preference. A command-line color override locks the interactive switch for that process.
+
+Only recognized leading `[ERROR]`, `[PANIC]`, `[WARN]`, `[DEBUG]` and `[TRACE]` markers and application event separators receive semantic colors. Arbitrary device text, including a sentence containing “error”, stays neutral. JSON, exports, stored lines, REST and MCP responses never gain ANSI escapes.
 
 ### Ports
 

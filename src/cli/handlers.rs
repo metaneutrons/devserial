@@ -88,7 +88,7 @@ fn unexpected(payload: &ResponsePayload) -> CliError {
 /// # Errors
 /// Returns the handler's error.
 #[allow(clippy::too_many_lines)]
-pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
+pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<(), CliError> {
     match command {
         Command::List { json } => list(session, json),
 
@@ -146,11 +146,11 @@ pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
                 wait_ms: Some(wait_ms),
             };
             if follow {
-                follow_port(session, &port, window, timestamps, json)
+                follow_port(session, &port, window, timestamps, json, color)
             } else {
                 let page = read_page(session, &port, window)?;
                 for line in &page.lines {
-                    output::print_line(line, timestamps, json);
+                    output::print_line(line, timestamps, json, color);
                 }
                 Ok(())
             }
@@ -272,6 +272,7 @@ pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
             parse_time(end.as_deref())?,
             limit,
             json,
+            color,
         ),
 
         Command::Export {
@@ -335,7 +336,7 @@ pub fn run_remote(session: &Session, command: Command) -> Result<(), CliError> {
             firmware,
             baud,
             monitor,
-        } => flash(session, &port, &firmware, baud, monitor),
+        } => flash(session, &port, &firmware, baud, monitor, color),
 
         // Handled before reaching this router.
         Command::Mcp | Command::Daemon { .. } | Command::About => {
@@ -486,6 +487,7 @@ fn follow_port(
     window: ReadWindow,
     timestamps: bool,
     json: bool,
+    color: bool,
 ) -> Result<(), CliError> {
     // Seed from the requested window, then continue by id.
     let initial = ReadWindow {
@@ -495,7 +497,7 @@ fn follow_port(
     };
     let mut page = read_page(session, port, initial)?;
     for line in &page.lines {
-        output::print_line(line, timestamps, json);
+        output::print_line(line, timestamps, json, color);
     }
     let mut last_id = page.next_after_id;
 
@@ -521,7 +523,7 @@ fn follow_port(
                         return Err(unexpected(&response));
                     };
                     for line in &next.lines {
-                        output::print_line(line, timestamps, json);
+                        output::print_line(line, timestamps, json, color);
                     }
                     if !next.lines.is_empty() {
                         last_id = next.next_after_id;
@@ -592,6 +594,7 @@ fn search(
     end_ns: Option<i64>,
     limit: u32,
     json: bool,
+    color: bool,
 ) -> Result<(), CliError> {
     let response = session.request(RequestPayload::Search {
         port: port.to_string(),
@@ -604,17 +607,21 @@ fn search(
     let ResponsePayload::SearchResults(outcome) = response else {
         return Err(unexpected(&response));
     };
-    print_search(&outcome, json)
+    print_search(&outcome, json, color)
 }
 
-fn print_search(outcome: &SearchOutcome, json: bool) -> Result<(), CliError> {
+fn print_search(outcome: &SearchOutcome, json: bool, color: bool) -> Result<(), CliError> {
     if json {
         println!("{}", serde_json::to_string_pretty(outcome)?);
         return Ok(());
     }
     println!("Found {} matching lines:", outcome.results.len());
     for line in &outcome.results {
-        println!("  [{}] {}", line.id, line.payload);
+        println!(
+            "  [{}] {}",
+            line.id,
+            crate::color::ansi(&line.payload, crate::color::classify(&line.payload), color)
+        );
     }
     if outcome.truncated {
         println!("(scan limit reached; later lines were not examined)");
@@ -629,6 +636,7 @@ fn flash(
     firmware: &str,
     baud: Option<u32>,
     monitor: bool,
+    color: bool,
 ) -> Result<(), CliError> {
     println!("Flashing firmware {firmware} to {port}...");
     let response = session.request(RequestPayload::EspFlash {
@@ -643,7 +651,7 @@ fn flash(
 
     if monitor {
         println!("\n━━━ Following serial output (Ctrl+C to exit) ━━━\n");
-        return follow_port(session, port, ReadWindow::default(), false, false);
+        return follow_port(session, port, ReadWindow::default(), false, false, color);
     }
     Ok(())
 }
