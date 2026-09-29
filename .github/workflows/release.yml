@@ -837,6 +837,8 @@ jobs:
           AUR_SSH_KNOWN_HOSTS: ${{ vars.AUR_SSH_KNOWN_HOSTS }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          ARCHIVE_DISPATCH_CLIENT_ID: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
+          ARCHIVE_DISPATCH_PRIVATE_KEY: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           status=0
@@ -850,6 +852,8 @@ jobs:
           require AUR_SSH_KNOWN_HOSTS "${AUR_SSH_KNOWN_HOSTS:-}"
           require HOMEBREW_TAP_TOKEN "${HOMEBREW_TAP_TOKEN:-}"
           require AUR_SSH_PRIVATE_KEY "${AUR_SSH_PRIVATE_KEY:-}"
+          require ARCHIVE_DISPATCH_CLIENT_ID "${ARCHIVE_DISPATCH_CLIENT_ID:-}"
+          require ARCHIVE_DISPATCH_PRIVATE_KEY "${ARCHIVE_DISPATCH_PRIVATE_KEY:-}"
           if [[ -n "${HOMEBREW_TAP_REPO:-}" ]] &&
              ! printf '%s' "$HOMEBREW_TAP_REPO" | grep -Eq '^[A-Za-z0-9._-]+/homebrew-[A-Za-z0-9._-]+$'; then
             echo "::error::preflight-format: HOMEBREW_TAP_REPO is not owner/homebrew-name"
@@ -902,6 +906,31 @@ jobs:
             exit 1
           fi
           echo "the AUR accepts the key"
+
+      # The App installation is restricted to metaneutrons/apt-archive. The
+      # token needs Actions write only to dispatch its publish workflow; the
+      # signing key and R2 credentials remain in the archive repository.
+      - name: Mint a token from the archive dispatch App
+        id: archive-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
+          private-key: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: apt-archive
+          permission-actions: write
+
+      - name: The archive workflow is dispatchable
+        env:
+          GH_TOKEN: ${{ steps.archive-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          state=$(gh api repos/metaneutrons/apt-archive/actions/workflows/publish.yml --jq .state)
+          if [[ "$state" != active ]]; then
+            echo "::error::preflight-apt: the archive publish workflow is $state, not active"
+            exit 1
+          fi
+          echo "the archive publish workflow is active"
 
   verify-aur:
     name: Build the AUR binary package
@@ -1466,3 +1495,45 @@ jobs:
             exit 1
           fi
           echo "promoted to latest"
+
+  # The archive reads only stable releases, so this consumer runs after the
+  # release has been promoted. A failure leaves the stable release intact and
+  # makes the missing APT import visible in this workflow's result.
+  notify-apt-archive:
+    name: Import and verify the APT package
+    needs: [metadata, preflight, promote]
+    if: ${{ needs.metadata.outputs.is_prerelease == 'false' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mint a token from the archive dispatch App
+        id: archive-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
+          private-key: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: apt-archive
+          permission-actions: write
+
+      - name: Ask the archive to import this release
+        env:
+          GH_TOKEN: ${{ steps.archive-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          jq -n '{ref:"main",inputs:{domain:"metaneutrons.cc",project:"devserial"}}' \
+            | gh api repos/metaneutrons/apt-archive/actions/workflows/publish.yml/dispatches --input -
+          echo "::notice::dispatched the devserial APT import"
+
+      - name: Verify both public package indexes and payloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          scripts/release/verify-apt-publication.sh --version "$VERSION" --tag "$TAG"
