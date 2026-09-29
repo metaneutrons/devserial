@@ -255,6 +255,7 @@ mod tests {
 
     const PLATFORM_SOURCE: &str = include_str!("platform.rs");
     const MACOS_SOURCE: &str = include_str!("../resources/macos.m");
+    const BUILD_SOURCE: &str = include_str!("../build.rs");
 
     /// The native function that reports a request, and the selector the menu
     /// item calls to raise it.
@@ -346,5 +347,27 @@ mod tests {
                 "{title} does not carry {expected}"
             );
         }
+    }
+
+    #[test]
+    fn sparkle_menu_loads_the_bundled_framework_at_runtime() {
+        assert!(MACOS_SOURCE.contains("Contents/Frameworks/Sparkle.framework"));
+        assert!(MACOS_SOURCE.contains("[sparkleBundle loadAndReturnError:&error]"));
+        assert!(MACOS_SOURCE.contains("NSClassFromString(@\"SPUStandardUpdaterController\")"));
+        assert!(MACOS_SOURCE.contains("@\"initWithUpdaterDelegate:userDriverDelegate:\""));
+        assert!(MACOS_SOURCE.contains("initWithTitle:@\"Check for Updates…\""));
+        assert!(MACOS_SOURCE.contains("@\"checkForUpdates:\""));
+        assert!(MACOS_SOURCE.contains("if (![NSThread isMainThread])"));
+        assert!(MACOS_SOURCE.contains("static id g_sparkleUpdaterController = nil;"));
+        assert!(
+            MACOS_SOURCE.contains("[checkForUpdatesItem setTarget:g_sparkleUpdaterController];")
+        );
+
+        // A direct Sparkle import or link would make the same executable fail
+        // to start when used as a CLI outside the app bundle.
+        assert!(!MACOS_SOURCE.contains("#import <Sparkle/"));
+        assert!(!MACOS_SOURCE.contains("#include <Sparkle/"));
+        assert!(!MACOS_SOURCE.contains("@import Sparkle"));
+        assert!(!BUILD_SOURCE.contains("rustc-link-lib=framework=Sparkle"));
     }
 }

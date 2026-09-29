@@ -31,6 +31,9 @@ jobs:
         with:
           key: quality
       - run: cargo fmt --all -- --check
+      - name: Sparkle feed safety probes
+        run: python3 -m unittest discover -s scripts/release -p 'test_publish_sparkle.py' -v
+      - run: bash -n scripts/release/fetch-sparkle.sh scripts/release/make-macos-app.sh
 
       # A broken hook configuration otherwise only shows up on the machine of
       # whoever installs it next.

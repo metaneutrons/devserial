@@ -80,6 +80,14 @@ it opens the port manager instead of an MCP server. They can be installed side
 by side, and the bundle carries the same program as the archives, fused into one
 universal binary.
 
+The app requires macOS 12 or newer. Its native app menu includes **Check for
+Updates…**; Sparkle checks the signed feed at
+[`devserial.metaneutrons.cc/appcast.xml`](https://devserial.metaneutrons.cc/appcast.xml)
+daily. The Homebrew cask acknowledges in-app updates; the CLI formula is
+updated separately through Homebrew. The feed becomes available with the first
+Sparkle-enabled release. The [update and signing procedure](docs/sparkle-updates.md) describes the
+release boundary.
+
 The bundle is notarized and the ticket is stapled, so Gatekeeper accepts it
 without a network. The plain archives below are **not** notarized; on macOS
 either use Homebrew or clear the quarantine flag by hand.

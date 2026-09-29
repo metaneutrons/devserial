@@ -23,17 +23,18 @@
 set -euo pipefail
 
 BUNDLE_ID="com.metaneutrons.devserial"
-MIN_MACOS="11.0"
+MIN_MACOS="12.0"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
-version=""; arm64_bin=""; x86_64_bin=""; output_dir=""
+version=""; arm64_bin=""; x86_64_bin=""; output_dir=""; sparkle_framework=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)    version=${2:?}; shift 2 ;;
     --arm64)      arm64_bin=${2:?}; shift 2 ;;
     --x86_64)     x86_64_bin=${2:?}; shift 2 ;;
     --output-dir) output_dir=${2:?}; shift 2 ;;
+    --sparkle-framework) sparkle_framework=${2:?}; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -57,6 +58,15 @@ icon="$repo_root/resources/icon.icns"
 app="$output_dir/devserial.app"
 rm -rf -- "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+if [[ -n "$sparkle_framework" ]]; then
+  [[ -d "$sparkle_framework" ]] || die "Sparkle.framework is missing: $sparkle_framework"
+  mkdir -p "$app/Contents/Frameworks"
+  ditto "$sparkle_framework" "$app/Contents/Frameworks/Sparkle.framework"
+  [[ -f "$(dirname "$sparkle_framework")/Sparkle-LICENSE" ]] \
+    || die 'Sparkle licence is missing'
+  cp "$(dirname "$sparkle_framework")/Sparkle-LICENSE" \
+    "$app/Contents/Resources/Sparkle-LICENSE"
+fi
 
 # One universal binary, not two bundles. `lipo` discards the per-architecture
 # ad-hoc signature the linker applied, so the result is unsigned here and gets
@@ -94,6 +104,14 @@ cat > "$app/Contents/Info.plist" <<PLIST
 	<string>${MIN_MACOS}</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>SUFeedURL</key>
+	<string>https://devserial.metaneutrons.cc/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>FrwLhvSMcMvuRFsyivyt5Vf59lVHekpT9NRaY8iRyAQ=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright (C) 2026 Fabian Schmieder. GPL-3.0-or-later.</string>
 </dict>

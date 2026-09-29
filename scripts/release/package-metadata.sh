@@ -180,8 +180,9 @@ cask "${PACKAGE}-app" do
   desc "${DESCRIPTION}"
   homepage "${HOMEPAGE}"
 
-  # A minimum of Big Sur is redundant to Homebrew and fails `brew style`.
-  depends_on :macos
+  depends_on macos: :monterey
+
+  auto_updates true
 
   app "devserial.app"
 
