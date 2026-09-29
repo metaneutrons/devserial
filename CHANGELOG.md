@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.4](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.3...devserial-v0.2.4) (2026-09-29)
+
+
+### Bug Fixes
+
+* **packaging:** use supported macOS cask dependency ([#98](https://github.com/metaneutrons/devserial/issues/98)) ([1a3857b](https://github.com/metaneutrons/devserial/commit/1a3857b10c88ae082787b80b84707a4a38312ce0))
+
 ## [0.2.3](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.2...devserial-v0.2.3) (2026-09-29)
 
 
