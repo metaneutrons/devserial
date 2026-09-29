@@ -6,7 +6,12 @@
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::crc32;
+use super::{MAX_RECEIVE_BYTES, check_receive_growth, crc32};
+
+/// Maximum decoded bytes in one peer-controlled ZMODEM subpacket.
+const MAX_DATA_SUBPACKET_BYTES: usize = 64 * 1024;
+/// File metadata contains only a name and size; keep it far below payload size.
+const MAX_FILE_INFO_BYTES: usize = 16 * 1024;
 
 // ZMODEM Constants
 const ZPAD: u8 = 0x2A; // '*'
@@ -138,7 +143,7 @@ where
             return Ok((String::new(), Vec::new()));
         }
         if frame_type == ZFILE {
-            let (file_info, _) = read_subpacket32(stream).await?;
+            let (file_info, _) = read_subpacket32(stream, MAX_FILE_INFO_BYTES).await?;
             let info_str = String::from_utf8_lossy(&file_info);
             let parts: Vec<&str> = info_str.split('\0').collect();
             if !parts.is_empty() {
@@ -148,6 +153,11 @@ where
                 let meta_parts: Vec<&str> = parts[1].split_whitespace().collect();
                 if !meta_parts.is_empty() {
                     expected_size = meta_parts[0].parse::<usize>().unwrap_or(0);
+                    if expected_size > MAX_RECEIVE_BYTES {
+                        return Err(format!(
+                            "received file exceeds the {MAX_RECEIVE_BYTES}-byte limit"
+                        ));
+                    }
                 }
             }
             break;
@@ -164,10 +174,16 @@ where
     }
 
     // 5. Stream subpackets until ZEOF
-    let mut received = Vec::with_capacity(expected_size);
+    let mut received = Vec::new();
 
     loop {
-        let (data, frame_end) = read_subpacket32(stream).await?;
+        let remaining = MAX_RECEIVE_BYTES.saturating_sub(received.len());
+        let (data, frame_end) =
+            read_subpacket32(stream, remaining.min(MAX_DATA_SUBPACKET_BYTES)).await?;
+        check_receive_growth(received.len(), data.len(), 0)?;
+        received
+            .try_reserve(data.len())
+            .map_err(|e| format!("could not reserve receive buffer: {e}"))?;
         received.extend_from_slice(&data);
         on_progress(received.len(), expected_size);
 
@@ -253,7 +269,7 @@ where
     Ok(())
 }
 
-async fn read_subpacket32<S>(stream: &mut S) -> Result<(Vec<u8>, u8), String>
+async fn read_subpacket32<S>(stream: &mut S, max_bytes: usize) -> Result<(Vec<u8>, u8), String>
 where
     S: AsyncRead + Unpin,
 {
@@ -269,9 +285,17 @@ where
                     frame_end = b.0;
                     break;
                 }
-                other => data.push(other),
+                other => {
+                    if data.len() >= max_bytes {
+                        return Err("ZMODEM subpacket exceeds the receive limit".to_string());
+                    }
+                    data.push(other);
+                }
             }
         } else {
+            if data.len() >= max_bytes {
+                return Err("ZMODEM subpacket exceeds the receive limit".to_string());
+            }
             data.push(b.0);
         }
     }
@@ -402,5 +426,20 @@ mod tests {
         assert_eq!(sent_bytes, test_data.len());
         assert_eq!(recv_name, filename);
         assert_eq!(recv_data, test_data);
+    }
+
+    #[tokio::test]
+    async fn oversized_subpacket_is_rejected_before_buffering_it() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut sender, mut receiver) = tokio::io::duplex(MAX_FILE_INFO_BYTES + 2);
+        sender
+            .write_all(&vec![b'A'; MAX_FILE_INFO_BYTES + 1])
+            .await
+            .unwrap();
+        let error = read_subpacket32(&mut receiver, MAX_FILE_INFO_BYTES)
+            .await
+            .unwrap_err();
+        assert!(error.contains("receive limit"), "{error}");
     }
 }

@@ -356,6 +356,11 @@ devserial send /dev/ttyUSB0 boot.bin --protocol xmodem-1k
 devserial recv /dev/ttyUSB0 --output ./downloads --protocol zmodem
 ```
 
+Received YMODEM and ZMODEM filenames must be single file names. A received
+file never replaces an existing file or symlink, and a transfer is rejected
+once its payload exceeds 256 MiB. These limits also apply through REST and
+MCP.
+
 Built-in macros are `reset`, `enter_bootloader` and `break`. A macro of the same name in the configuration file replaces the built-in one.
 
 ### Searching and exporting
@@ -419,7 +424,11 @@ running with the reason retrievable rather than taking it down.
 **No token on loopback.** A request to `127.0.0.1` is served as it stands. That
 is a step down from the IPC socket, which is `0600` and refuses another user, and
 it is a deliberate one: every local process can reach the interface. A bind to
-any other address requires a token and refuses to start without one.
+any other address requires a token and refuses to start without one. HTTP does
+not encrypt that token or the serial data. Use a trusted network or a TLS
+reverse proxy for non-loopback access; do not expose the listener directly to
+the public internet. A reverse proxy must send the listener's IP and port in
+its upstream `Host` header.
 
 ```toml
 [rest]
@@ -470,10 +479,9 @@ fails when one has neither a route nor a recorded reason for not having one, a
 second one calls every advertised route and fails on a 404, and a third checks
 the description against the route list.
 
-`/v1/openapi.json` is generated rather than maintained: the paths come from the
-route list, the parameters and bodies from the very structs the handlers read,
-and the only sentence written by hand is the one-line summary. The document
-names the port it is answering on.
+`/v1/openapi.json` is generated from the route list and the handlers' input
+schemas. It also describes response bodies and authentication. Its server URL
+uses the validated request host, so it is usable on a wildcard bind.
 
 ```bash
 PORT=%2Fdev%2Fcu.usbmodem1101
@@ -517,17 +525,18 @@ one way, a plain `GET` reconnects on its own, and the event id is the line id, s
 request, so the return channel a WebSocket would add has nothing to carry.
 
 A line on the wire is the record the `jsonl` export writes, from the same
-function, so a file and a response carry the same fields. Every field of the
-read window is reachable: `start`, `after`, `tail`, `since`, `limit` and
-`wait_ms`, with `since`, `from` and `to` as RFC 3339.
+function, so a file and a response carry the same fields. Page reads accept
+`start`, `after`, `tail`, `since`, `limit` and `wait_ms`. The live stream accepts
+`after` and `wait_ms`, or `Last-Event-ID` for resumption. The `since`, `from`
+and `to` timestamps use RFC 3339.
 
-**Two headers are checked**, and they are what make the missing token safe. A
+**Two headers are checked** on loopback, and they are what make the missing token safe. A
 body has to declare `Content-Type: application/json`, which a form POST cannot
 set and a cross-origin `fetch` cannot send without a preflight this server never
-grants. And the `Host` header has to name this listener on a loopback name,
-which is what stops DNS rebinding: an attacker's hostname resolving to
-`127.0.0.1` still carries their name in that header. Errors are
-`application/problem+json` with a typed `type`.
+grants. The `Host` header must name the listener: a loopback name for a local
+bind, or an IP address for a network bind. This stops DNS rebinding because an
+attacker's hostname remains in that header even when it resolves to the
+listener's address. Errors are `application/problem+json` with a typed `type`.
 
 The plan for the rest is
 [`docs/plans/rest-interface.md`](docs/plans/rest-interface.md).
@@ -537,6 +546,9 @@ The plan for the rest is
 ## MCP server
 
 `devserial` implements the Model Context Protocol over stdio. Invoked with a piped stdin it runs as an MCP server automatically; `devserial mcp` forces it.
+The MCP process starts or attaches to the same daemon used by the CLI and
+monitors. It does not open a second handle to the serial device. Global
+`--socket` and `--config` options also apply to `devserial mcp`.
 
 ```json
 {

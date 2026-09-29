@@ -67,6 +67,8 @@ pub enum EngineError {
     UnknownMacro { name: String, available: String },
     #[error("file transfer failed: {0}")]
     Transfer(String),
+    #[error(transparent)]
+    Ipc(#[from] crate::ipc::IpcError),
     #[error("{0}")]
     Tool(String),
     #[error("internal task failed: {0}")]
@@ -92,6 +94,34 @@ impl From<tokio::task::JoinError> for EngineError {
     }
 }
 
+/// IPC time budget for an MCP operation forwarded to the daemon.
+///
+/// Captures and configuration are quick, while a modem transfer or ESP flash
+/// can legitimately take minutes. A forwarded MCP call must not gain the
+/// default 30-second CLI timeout merely because it uses IPC.
+fn remote_timeout(payload: &RequestPayload) -> std::time::Duration {
+    const LONG: std::time::Duration = std::time::Duration::from_hours(1);
+    match payload {
+        RequestPayload::ReadLines { window, .. } => {
+            std::time::Duration::from_millis(window.wait_ms.unwrap_or(0).min(60 * 60 * 1000))
+                .saturating_add(crate::ipc::DEFAULT_REQUEST_TIMEOUT)
+        }
+        RequestPayload::SendBreak { duration_ms, .. } => std::time::Duration::from_millis(
+            duration_ms.unwrap_or(DEFAULT_BREAK_MS).min(60 * 60 * 1000),
+        )
+        .saturating_add(crate::ipc::DEFAULT_REQUEST_TIMEOUT),
+        RequestPayload::SendFile { .. }
+        | RequestPayload::ReceiveFile { .. }
+        | RequestPayload::ExecuteMacro { .. } => LONG,
+        #[cfg(feature = "esp")]
+        RequestPayload::EspFlash { .. }
+        | RequestPayload::EspInfo { .. }
+        | RequestPayload::EspErase { .. }
+        | RequestPayload::EspWriteBin { .. } => LONG,
+        _ => crate::ipc::DEFAULT_REQUEST_TIMEOUT,
+    }
+}
+
 /// Shared storage handle for one port.
 type SharedStorage = Arc<Mutex<SqliteStorage>>;
 
@@ -101,6 +131,8 @@ pub struct CommandEngine {
     port_manager: PortManagerHandle,
     state_db: Arc<Mutex<StateDb>>,
     config: Arc<Config>,
+    /// MCP can use the daemon as its sole port owner through this IPC client.
+    remote: Option<crate::ipc::IpcClient>,
     /// The HTTP interface, shared with every clone of this engine.
     ///
     /// One listener per daemon, not one per clone: the engine is cloned into
@@ -132,9 +164,19 @@ impl CommandEngine {
             port_manager,
             state_db,
             config,
+            remote: None,
             #[cfg(feature = "rest")]
             rest,
         }
+    }
+
+    /// Route operations to the daemon instead of opening hardware in this
+    /// process. The remaining fields still supply configuration and database
+    /// paths to MCP's presentation layer.
+    #[must_use]
+    pub fn with_remote(mut self, client: crate::ipc::IpcClient) -> Self {
+        self.remote = Some(client);
+        self
     }
 
     /// Access the underlying port manager handle.
@@ -166,6 +208,16 @@ impl CommandEngine {
     /// # Errors
     /// Returns the operation's error.
     pub async fn execute(&self, payload: RequestPayload) -> Result<ResponsePayload, EngineError> {
+        if let Some(client) = &self.remote {
+            client.ensure_daemon().await?;
+            let timeout = remote_timeout(&payload);
+            return client
+                .clone()
+                .with_timeout(timeout)
+                .send(payload)
+                .await
+                .map_err(Into::into);
+        }
         match payload {
             RequestPayload::Ping => Ok(ResponsePayload::Pong),
             RequestPayload::ListPorts => self.list_ports().await,
@@ -408,20 +460,19 @@ impl CommandEngine {
     ) -> Result<LinesPage, EngineError> {
         self.with_storage(port, move |storage| {
             let total_lines = storage.line_count()?;
+            let start = resolve_start(&window, storage)?;
             let lines = if let Some(since) = window.since_ns {
-                storage.search_time_range(since, i64::MAX, limit)?
+                storage.read_lines_since(start, since, limit)?
             } else {
-                let start = resolve_start(&window, total_lines);
                 storage.read_lines(start, limit)?
             };
-            let next_after_id = lines.last().map_or_else(
-                || {
-                    window
-                        .after_id
-                        .unwrap_or_else(|| i64::try_from(total_lines).unwrap_or(i64::MAX))
-                },
-                |l| l.id,
-            );
+            let next_after_id = if let Some(line) = lines.last() {
+                line.id
+            } else if let Some(after) = window.after_id {
+                after
+            } else {
+                storage.last_id()?
+            };
             Ok(LinesPage {
                 lines,
                 total_lines,
@@ -781,14 +832,7 @@ impl CommandEngine {
         drop(guard);
         let (file_name, data) = received?;
 
-        let dir = Path::new(output_dir);
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| EngineError::io(dir, e))?;
-        let out_path = dir.join(&file_name);
-        tokio::fs::write(&out_path, &data)
-            .await
-            .map_err(|e| EngineError::io(&out_path, e))?;
+        let out_path = write_received_file(Path::new(output_dir), &file_name, &data).await?;
 
         let bytes_transferred = u64::try_from(data.len()).unwrap_or(u64::MAX);
         self.log_to_buffer(
@@ -1100,19 +1144,17 @@ fn time_range(start_ns: Option<i64>, end_ns: Option<i64>) -> Option<TimeRange> {
 }
 
 /// Translate a read window into a first line id.
-fn resolve_start(window: &ReadWindow, total_lines: u64) -> i64 {
-    let total = i64::try_from(total_lines).unwrap_or(i64::MAX);
+fn resolve_start(window: &ReadWindow, storage: &SqliteStorage) -> Result<i64, StorageError> {
     if let Some(tail) = window.tail {
-        let tail = i64::from(tail);
-        return (total - tail + 1).max(1);
+        return storage.start_id_from_end(u64::from(tail));
     }
     if let Some(after) = window.after_id {
-        return after.saturating_add(1).max(1);
+        return Ok(after.saturating_add(1).max(1));
     }
     match window.start_id {
-        Some(start) if start < 0 => (total + start + 1).max(1),
-        Some(start) => start.max(1),
-        None => 1,
+        Some(start) if start < 0 => storage.start_id_from_end(start.unsigned_abs()),
+        Some(start) => Ok(start.max(1)),
+        None => Ok(1),
     }
 }
 
@@ -1136,6 +1178,46 @@ fn validate_output_path(path: &Path) -> Result<(), EngineError> {
         )));
     }
     Ok(())
+}
+
+/// Write a received file only under the caller's chosen directory.
+///
+/// The sender controls the protocol filename. `create_new` also prevents an
+/// existing file or symlink with that name from being overwritten.
+async fn write_received_file(
+    dir: &Path,
+    file_name: &str,
+    data: &[u8],
+) -> Result<PathBuf, EngineError> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let name = Path::new(file_name);
+    let mut components = name.components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(EngineError::invalid(
+            "received filename must be a single file name without directories",
+        ));
+    }
+
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| EngineError::io(dir, e))?;
+    let out_path = dir.join(name);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out_path)
+        .await
+        .map_err(|e| EngineError::io(&out_path, e))?;
+    file.write_all(data)
+        .await
+        .map_err(|e| EngineError::io(&out_path, e))?;
+    file.flush()
+        .await
+        .map_err(|e| EngineError::io(&out_path, e))?;
+    Ok(out_path)
 }
 
 /// Convenience alias used by transports that need a plain string error.
@@ -1368,6 +1450,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_buffer_tail_and_negative_start_use_retained_positions() {
+        let (engine, _dir) = make_test_engine();
+        let ctrl = open_mock(&engine, "p").await;
+        ctrl.feed_lines(&["a", "b", "c", "d", "e"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        engine
+            .with_storage("p", |storage| storage.trim_lines(2))
+            .await
+            .unwrap();
+
+        for window in [
+            ReadWindow {
+                tail: Some(1),
+                ..ReadWindow::default()
+            },
+            ReadWindow {
+                start_id: Some(-1),
+                ..ReadWindow::default()
+            },
+        ] {
+            let ResponsePayload::Lines(page) = engine
+                .execute(RequestPayload::ReadLines {
+                    port: "p".into(),
+                    window,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("expected lines");
+            };
+            assert_eq!(page.lines.len(), 1);
+            assert_eq!(page.lines[0].payload, "e");
+        }
+    }
+
+    #[tokio::test]
+    async fn timestamp_and_id_cursor_advance_together() {
+        let (engine, _dir) = make_test_engine();
+        let ctrl = open_mock(&engine, "p").await;
+        ctrl.feed_lines(&["a", "b", "c"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let ResponsePayload::Lines(first) = engine
+            .execute(RequestPayload::ReadLines {
+                port: "p".into(),
+                window: ReadWindow {
+                    since_ns: Some(i64::MIN),
+                    limit: Some(1),
+                    ..ReadWindow::default()
+                },
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected lines");
+        };
+        assert_eq!(first.lines.len(), 1);
+
+        let ResponsePayload::Lines(second) = engine
+            .execute(RequestPayload::ReadLines {
+                port: "p".into(),
+                window: ReadWindow {
+                    since_ns: Some(i64::MIN),
+                    after_id: Some(first.next_after_id),
+                    limit: Some(1),
+                    ..ReadWindow::default()
+                },
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected lines");
+        };
+        assert_eq!(second.lines.len(), 1);
+        assert_eq!(second.lines[0].payload, "b");
+    }
+
+    #[tokio::test]
     async fn regex_search_finds_matches_beyond_the_first_page() {
         let (engine, _dir) = make_test_engine();
         let ctrl = open_mock(&engine, "p").await;
@@ -1513,6 +1673,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn received_filenames_cannot_escape_or_replace_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("received");
+        let valid = write_received_file(&destination, "firmware.bin", b"first")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&valid).await.unwrap(), b"first");
+
+        for name in ["../outside.bin", "subdir/file.bin", "", ".", ".."] {
+            assert!(
+                write_received_file(&destination, name, b"unsafe")
+                    .await
+                    .is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+        let absolute = dir.path().join("absolute.bin");
+        assert!(
+            write_received_file(&destination, absolute.to_str().unwrap(), b"unsafe")
+                .await
+                .is_err()
+        );
+        assert!(!absolute.exists());
+        assert!(!dir.path().join("outside.bin").exists());
+
+        assert!(
+            write_received_file(&destination, "firmware.bin", b"replacement")
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(&valid).await.unwrap(), b"first");
+    }
+
+    #[tokio::test]
     async fn unknown_macro_lists_available_ones() {
         let (engine, _dir) = make_test_engine();
         let _ctrl = open_mock(&engine, "p").await;
@@ -1584,18 +1778,39 @@ mod tests {
 
     #[test]
     fn resolve_start_handles_every_window_shape() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let lines: Vec<(i64, &str)> = (0..10).map(|id| (id, "line")).collect();
+        storage.insert_lines(&lines).unwrap();
         let w = |f: fn(&mut ReadWindow)| {
             let mut w = ReadWindow::default();
             f(&mut w);
             w
         };
-        assert_eq!(resolve_start(&ReadWindow::default(), 10), 1);
-        assert_eq!(resolve_start(&w(|w| w.tail = Some(3)), 10), 8);
-        assert_eq!(resolve_start(&w(|w| w.tail = Some(30)), 10), 1);
-        assert_eq!(resolve_start(&w(|w| w.after_id = Some(5)), 10), 6);
-        assert_eq!(resolve_start(&w(|w| w.start_id = Some(-2)), 10), 9);
-        assert_eq!(resolve_start(&w(|w| w.start_id = Some(0)), 10), 1);
-        assert_eq!(resolve_start(&w(|w| w.start_id = Some(7)), 10), 7);
+        assert_eq!(resolve_start(&ReadWindow::default(), &storage).unwrap(), 1);
+        assert_eq!(
+            resolve_start(&w(|w| w.tail = Some(3)), &storage).unwrap(),
+            8
+        );
+        assert_eq!(
+            resolve_start(&w(|w| w.tail = Some(30)), &storage).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_start(&w(|w| w.after_id = Some(5)), &storage).unwrap(),
+            6
+        );
+        assert_eq!(
+            resolve_start(&w(|w| w.start_id = Some(-2)), &storage).unwrap(),
+            9
+        );
+        assert_eq!(
+            resolve_start(&w(|w| w.start_id = Some(0)), &storage).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_start(&w(|w| w.start_id = Some(7)), &storage).unwrap(),
+            7
+        );
     }
 
     #[test]
