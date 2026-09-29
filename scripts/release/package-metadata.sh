@@ -180,9 +180,8 @@ cask "${PACKAGE}-app" do
   desc "${DESCRIPTION}"
   homepage "${HOMEPAGE}"
 
-  # Stanza order and the bare symbol are what \`brew style\` demands; it
-  # autocorrects anything else, and a generated file cannot be autocorrected.
-  depends_on macos: :big_sur
+  # A minimum of Big Sur is redundant to Homebrew and fails `brew style`.
+  depends_on :macos
 
   app "devserial.app"
 

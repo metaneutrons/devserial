@@ -150,3 +150,17 @@ fn the_description_is_short_enough_for_homebrew() {
         manifest.len()
     );
 }
+
+#[test]
+fn the_cask_uses_the_homebrew_supported_macos_dependency() {
+    assert!(
+        PACKAGE_METADATA
+            .lines()
+            .any(|line| line.trim() == "depends_on :macos"),
+        "the generated cask must declare macOS without a redundant minimum version"
+    );
+    assert!(
+        !PACKAGE_METADATA.contains("depends_on macos:"),
+        "a versioned macOS dependency fails `brew style` when it names Homebrew's minimum"
+    );
+}
