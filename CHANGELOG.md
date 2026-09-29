@@ -4,6 +4,20 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.3](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.2...devserial-v0.2.3) (2026-09-29)
+
+
+### Features
+
+* **display:** add semantic capture colors ([d497fe6](https://github.com/metaneutrons/devserial/commit/d497fe62d85399470b9c5d6e5166c7d0573e182a))
+
+
+### Bug Fixes
+
+* **gui:** add native macOS color menu toggle ([#93](https://github.com/metaneutrons/devserial/issues/93)) ([2424260](https://github.com/metaneutrons/devserial/commit/2424260c2a51d18867f1b22bfa40bd125b556888))
+* harden REST and MCP interfaces ([#95](https://github.com/metaneutrons/devserial/issues/95)) ([c4e6a28](https://github.com/metaneutrons/devserial/commit/c4e6a28560c38631def66b104b0987e832eaadcc))
+* make repeated REST enable idempotent ([#97](https://github.com/metaneutrons/devserial/issues/97)) ([a25b8f3](https://github.com/metaneutrons/devserial/commit/a25b8f36f2ca15fcafc0891c4138255b9d55d88b))
+
 ## [0.2.2](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.1...devserial-v0.2.2) (2026-09-28)
 
 
