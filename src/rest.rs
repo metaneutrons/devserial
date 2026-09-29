@@ -171,6 +171,22 @@ impl RestServer {
             ));
         }
 
+        // A repeated enable with the same listener and credentials is already
+        // successful. Binding first would report an address-in-use error for
+        // the listener this server itself owns.
+        let same_listener = self.state.listening
+            && self.state.port == config.port
+            && self.state.bind.parse::<std::net::IpAddr>().ok() == Some(addr.ip())
+            && self.token == config.token
+            && self
+                .running
+                .as_ref()
+                .is_some_and(|running| !running.task.is_finished());
+        if same_listener {
+            self.state.reason = None;
+            return Ok(self.state.clone());
+        }
+
         let listener = match std::net::TcpListener::bind(addr) {
             Ok(listener) => listener,
             Err(error) => {
@@ -2138,11 +2154,25 @@ mod tests {
         assert!(refused.contains("localhost"), "{refused}");
     }
 
+    /// Enabling an already active listener with unchanged settings succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_enable_of_the_same_listener_is_idempotent() {
+        let (mut server, addr, engine, _dir) = listening(None);
+        let state = server
+            .enable(&config("127.0.0.1", addr.port()), &engine)
+            .expect("the requested listener is already serving");
+        assert!(state.listening);
+        assert_eq!(state.port, addr.port());
+        assert!(state.reason.is_none());
+        assert!(get(addr, "/v1/health", None).starts_with("HTTP/1.1 200"));
+    }
+
     /// A replacement bind failure leaves the listener that is still serving intact.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_same_address_retry_preserves_the_running_state() {
+    async fn a_failed_token_change_preserves_the_running_state() {
         let (mut server, addr, engine, _dir) = listening(None);
-        let retry = config("127.0.0.1", addr.port());
+        let mut retry = config("127.0.0.1", addr.port());
+        retry.token = Some("replacement-token".to_owned());
 
         let refused = server
             .enable(&retry, &engine)
@@ -2152,12 +2182,21 @@ mod tests {
         assert!(state.listening, "the original listener is still serving");
         assert_eq!(state.port, addr.port());
         assert!(
+            !state.token_required,
+            "the original listener needs no token"
+        );
+        assert!(
             state
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("in use"))
         );
-        assert!(get(addr, "/v1/health", None).starts_with("HTTP/1.1 200"));
+        assert!(get(addr, "/v1/version", None).starts_with("HTTP/1.1 200"));
+
+        let recovered = server
+            .enable(&config("127.0.0.1", addr.port()), &engine)
+            .expect("the original listener is still serving");
+        assert!(recovered.reason.is_none());
     }
 
     /// A name is not loopback, however much it looks like one.

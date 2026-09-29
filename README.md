@@ -408,6 +408,10 @@ devserial rest --enable --port 8422
 devserial rest --disable
 ```
 
+Repeating `--enable` with the same address and token returns the active listener.
+Changing the token on that same address requires disabling the listener first;
+the old listener stays active if a replacement bind fails.
+
 The switch is in all three surfaces and they show one state, because they all
 ask the daemon: `devserial rest` on the command line, `F7` in the terminal
 monitor, and a clickable **REST** status entry in each window's bottom bar. It
