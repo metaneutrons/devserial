@@ -2,10 +2,68 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 #import <Cocoa/Cocoa.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 static NSString *g_version = @"0.1.4";
 static NSImage *g_icon = nil;
+
+// Sparkle is loaded only by the app bundle. The controller is initialized and
+// retained on the main thread because SPUStandardUpdaterController is a
+// main-thread API and the application menu uses it as its target.
+static NSBundle *g_sparkleBundle = nil;
+static id g_sparkleUpdaterController = nil;
+static BOOL g_sparkleLoadAttempted = NO;
+
+static BOOL devserial_load_sparkle_updater(void) {
+    if (![NSThread isMainThread]) {
+        return NO;
+    }
+    if (g_sparkleUpdaterController) {
+        return YES;
+    }
+    if (g_sparkleLoadAttempted) {
+        return NO;
+    }
+    g_sparkleLoadAttempted = YES;
+
+    NSBundle *mainBundle = [NSBundle mainBundle];
+    NSString *appPath = [mainBundle bundlePath];
+    if (![[appPath pathExtension] isEqualToString:@"app"]) {
+        return NO;
+    }
+
+    NSString *frameworkPath = [appPath stringByAppendingPathComponent:
+        @"Contents/Frameworks/Sparkle.framework"];
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:frameworkPath isDirectory:&isDirectory] || !isDirectory) {
+        return NO;
+    }
+
+    NSBundle *sparkleBundle = [NSBundle bundleWithPath:frameworkPath];
+    NSError *error = nil;
+    if (!sparkleBundle || ![sparkleBundle loadAndReturnError:&error]) {
+        if (error) {
+            NSLog(@"Unable to load bundled Sparkle.framework: %@", error);
+        }
+        return NO;
+    }
+    g_sparkleBundle = [sparkleBundle retain];
+
+    Class updaterControllerClass = NSClassFromString(@"SPUStandardUpdaterController");
+    SEL initializer = NSSelectorFromString(@"initWithUpdaterDelegate:userDriverDelegate:");
+    SEL checkForUpdates = NSSelectorFromString(@"checkForUpdates:");
+    if (!updaterControllerClass ||
+        ![updaterControllerClass instancesRespondToSelector:initializer] ||
+        ![updaterControllerClass instancesRespondToSelector:checkForUpdates]) {
+        return NO;
+    }
+
+    id (*sendInitializer)(id, SEL, id, id) = (id (*)(id, SEL, id, id))objc_msgSend;
+    g_sparkleUpdaterController = sendInitializer(
+        [updaterControllerClass alloc], initializer, nil, nil);
+    return g_sparkleUpdaterController != nil;
+}
 
 @implementation NSMenuItem (DevSerialMenuFix)
 
@@ -452,6 +510,17 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
                                                     keyEquivalent:@""];
         [aboutItem setTarget:g_aboutHandler];
         [appMenu addItem:aboutItem];
+
+        // The CLI binary can run outside an app bundle, so keep Sparkle out of
+        // the linker's dependency graph and load it only from this app bundle.
+        if (devserial_load_sparkle_updater()) {
+            NSMenuItem *checkForUpdatesItem = [[NSMenuItem alloc]
+                initWithTitle:@"Check for Updates…"
+                action:NSSelectorFromString(@"checkForUpdates:")
+                keyEquivalent:@""];
+            [checkForUpdatesItem setTarget:g_sparkleUpdaterController];
+            [appMenu addItem:checkForUpdatesItem];
+        }
 
         [appMenu addItem:[NSMenuItem separatorItem]];
 

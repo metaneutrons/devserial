@@ -152,15 +152,15 @@ fn the_description_is_short_enough_for_homebrew() {
 }
 
 #[test]
-fn the_cask_uses_the_homebrew_supported_macos_dependency() {
+fn the_cask_requires_macos_12_and_allows_sparkle_updates() {
     assert!(
         PACKAGE_METADATA
             .lines()
-            .any(|line| line.trim() == "depends_on :macos"),
-        "the generated cask must declare macOS without a redundant minimum version"
+            .any(|line| line.trim() == "depends_on macos: :monterey"),
+        "the generated cask must declare the app's macOS 12 minimum"
     );
     assert!(
-        !PACKAGE_METADATA.contains("depends_on macos:"),
-        "a versioned macOS dependency fails `brew style` when it names Homebrew's minimum"
+        PACKAGE_METADATA.contains("auto_updates true"),
+        "the cask must acknowledge the in-app Sparkle updater"
     );
 }

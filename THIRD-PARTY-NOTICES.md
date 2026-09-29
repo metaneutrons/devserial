@@ -47,3 +47,10 @@ that crate ships. The four typeface files themselves are unchanged between
 On macOS the GUI prefers the system UI face and reads it from
 `/System/Library/Fonts` at run time. Nothing is embedded or redistributed in
 that case, so no notice applies.
+
+## macOS application updater
+
+The macOS application bundle includes Sparkle 2.10.0. Its complete licence,
+including notices for bundled components, is in
+`devserial.app/Contents/Resources/Sparkle-LICENSE`. The standalone CLI
+archives do not include Sparkle.
