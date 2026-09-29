@@ -659,9 +659,13 @@ fn flash(
 fn parse_time(value: Option<&str>) -> Result<Option<i64>, CliError> {
     value
         .map(|text| {
-            chrono::DateTime::parse_from_rfc3339(text)
-                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-                .map_err(|e| CliError::msg(format!("invalid timestamp '{text}': {e}")))
+            let datetime = chrono::DateTime::parse_from_rfc3339(text)
+                .map_err(|e| CliError::msg(format!("invalid timestamp '{text}': {e}")))?;
+            datetime.timestamp_nanos_opt().ok_or_else(|| {
+                CliError::msg(format!(
+                    "timestamp '{text}' is outside the supported nanosecond range"
+                ))
+            })
         })
         .transpose()
 }
@@ -675,6 +679,7 @@ mod tests {
         assert!(parse_time(Some("2026-01-15T10:00:00Z")).unwrap().is_some());
         assert!(parse_time(None).unwrap().is_none());
         assert!(parse_time(Some("yesterday")).is_err());
+        assert!(parse_time(Some("9999-12-31T23:59:59Z")).is_err());
     }
 
     #[test]

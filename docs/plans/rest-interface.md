@@ -26,9 +26,9 @@ Measured baseline, devserial 0.1.14:
 In scope: the HTTP transport and its 22 routes, the control surface in four
 places, the daemon-side switch and its failure reporting, and the two changes
 the decisions pull in with them (every monitor attaching to the daemon, and the
-export format). Out of scope: TLS, authentication beyond a bearer token for
-non-loopback binds, remote access as a supported configuration, a client
-library, and any web UI.
+export format). Out of scope: built-in TLS, authentication beyond a bearer token
+for non-loopback binds, deployment on untrusted networks without a TLS reverse
+proxy, a client library, and any web UI.
 
 ## Design and decisions
 
@@ -39,11 +39,11 @@ section records what was decided and why, so the plan stands on its own where
 it constrains delivery.
 
 **The server lives in the daemon.** `engine.rs` is where an operation is carried
-out, and a `CommandEngine` exists only in the daemon, the MCP server and the
-in-process path the CLI starts. REST is a transport over that engine and
-contains no operation logic, which is what keeps the transports behaving
-identically. A second server hosted by a standalone monitor was rejected: it
-would double the listener and give two answers to `GET /v1/ports`.
+out. REST is a transport over the daemon's engine and contains no operation
+logic, which keeps the transports behaving identically. MCP now forwards its
+engine requests to that same daemon instead of opening a second hardware handle.
+A second server hosted by a standalone monitor was rejected: it would double
+the listener and give two answers to `GET /v1/ports`.
 
 **Every port becomes a daemon port.** A serial port can be opened once, so a
 port a standalone window held could not also be served. `devserial monitor PORT`
@@ -69,8 +69,10 @@ mitigations become mandatory in consequence, because a browser can reach
 `127.0.0.1` from any page the user has open: every state-changing route requires
 `Content-Type: application/json`, which a form POST cannot set and a
 cross-origin `fetch` cannot send without a preflight the server refuses; and the
-`Host` header must be `127.0.0.1:9600` or `localhost:9600`, which defeats DNS
-rebinding.
+`Host` header must name the listener: a loopback name on a loopback bind, or an
+IP literal on a non-loopback bind. This defeats DNS rebinding. HTTP does not
+encrypt tokens or data; non-loopback access is intended for a trusted network
+or a TLS reverse proxy, not direct internet exposure.
 
 **Server-sent events, not WebSocket.** Following the capture and watching a
 flash are both one-directional, and SSE is a plain `GET` that resumes from

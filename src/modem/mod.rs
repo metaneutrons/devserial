@@ -36,6 +36,31 @@ pub(crate) const MAX_RETRIES: u32 = 10;
 /// Per-byte timeout during a transfer.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum payload accepted from a serial peer during one receive operation.
+///
+/// The implementation buffers a transfer before writing it, so an unbounded
+/// peer-controlled size would let a device exhaust the daemon's memory.
+pub const MAX_RECEIVE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Check the next receive chunk before allocating or appending it.
+pub(crate) fn check_receive_growth(
+    current: usize,
+    incoming: usize,
+    padding_allowance: usize,
+) -> Result<(), String> {
+    let maximum = MAX_RECEIVE_BYTES.saturating_add(padding_allowance);
+    if current
+        .checked_add(incoming)
+        .is_some_and(|next| next <= maximum)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "received file exceeds the {MAX_RECEIVE_BYTES}-byte limit"
+        ))
+    }
+}
+
 /// Read a single byte with a timeout.
 ///
 /// Shared by all three protocols so their timeout behaviour cannot drift.
@@ -270,5 +295,13 @@ mod tests {
     #[test]
     fn test_crc32() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn receive_limit_accepts_boundary_and_rejects_overflow() {
+        assert!(check_receive_growth(MAX_RECEIVE_BYTES - 1, 1, 0).is_ok());
+        assert!(check_receive_growth(MAX_RECEIVE_BYTES, 1, 0).is_err());
+        assert!(check_receive_growth(MAX_RECEIVE_BYTES, 1024, 1024).is_ok());
+        assert!(check_receive_growth(usize::MAX, 1, 1024).is_err());
     }
 }

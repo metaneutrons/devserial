@@ -7,8 +7,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{
-    ACK, CAN, CRC_C, EOT, MAX_RETRIES, NAK, PAD, SOH, STX, TIMEOUT, checksum8, crc16_ccitt,
-    read_byte_with_timeout,
+    ACK, CAN, CRC_C, EOT, MAX_RETRIES, NAK, PAD, SOH, STX, TIMEOUT, check_receive_growth,
+    checksum8, crc16_ccitt, read_byte_with_timeout,
 };
 
 /// Send data using XMODEM.
@@ -157,6 +157,7 @@ where
                 return Err("XMODEM cancelled by sender".to_string());
             }
             // Handle SOH / STX block
+            check_receive_growth(received.len(), if b == STX { 1024 } else { 128 }, 0)?;
             handle_incoming_block(stream, b, expected_block, use_crc, &mut received).await?;
             expected_block = expected_block.wrapping_add(1);
             on_progress(received.len());
@@ -180,6 +181,7 @@ where
             return Err("XMODEM cancelled by sender".to_string());
         }
         if b == SOH || b == STX {
+            check_receive_growth(received.len(), if b == STX { 1024 } else { 128 }, 0)?;
             match handle_incoming_block(stream, b, expected_block, use_crc, &mut received).await {
                 Ok(true) => {
                     expected_block = expected_block.wrapping_add(1);
@@ -248,6 +250,9 @@ where
     }
 
     if blk == expected_block {
+        output
+            .try_reserve(data.len())
+            .map_err(|e| format!("could not reserve receive buffer: {e}"))?;
         output.extend_from_slice(data);
         stream.write_all(&[ACK]).await.ok();
         stream.flush().await.ok();

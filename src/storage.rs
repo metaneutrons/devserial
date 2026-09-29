@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 /// Maximum send history entries kept per port.
@@ -178,6 +178,39 @@ impl SqliteStorage {
         Ok(id)
     }
 
+    /// First ID in a window of the last `count` retained rows.
+    ///
+    /// IDs are not positions: trimming and clearing leave gaps in an
+    /// AUTOINCREMENT sequence. An offset in descending ID order finds the
+    /// requested row even after either operation.
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` failure.
+    pub fn start_id_from_end(&self, count: u64) -> Result<i64, StorageError> {
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if count == 0 {
+            let last: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id), 0) FROM lines", [], |r| r.get(0))?;
+            return Ok(last.saturating_add(1));
+        }
+        let offset = i64::try_from(count.saturating_sub(1)).unwrap_or(i64::MAX);
+        let selected: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM lines ORDER BY id DESC LIMIT 1 OFFSET ?1",
+                params![offset],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = selected {
+            return Ok(id);
+        }
+        conn.query_row("SELECT COALESCE(MIN(id), 1) FROM lines", [], |r| r.get(0))
+            .map_err(Into::into)
+    }
+
     /// Insert a batch of lines in a single transaction.
     ///
     /// # Errors
@@ -213,6 +246,31 @@ impl SqliteStorage {
             "SELECT id, timestamp_ns, payload FROM lines WHERE id >= ?1 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![start_id, count], map_row)?;
+        let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
+        drop(stmt);
+        drop(conn);
+        res
+    }
+
+    /// Read from an ID while also applying a timestamp lower bound.
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` failure.
+    pub fn read_lines_since(
+        &self,
+        start_id: i64,
+        since_ns: i64,
+        count: u32,
+    ) -> Result<Vec<StoredLine>, StorageError> {
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, timestamp_ns, payload FROM lines \
+             WHERE id >= ?1 AND timestamp_ns >= ?2 ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![start_id, since_ns, count], map_row)?;
         let res = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
         drop(stmt);
         drop(conn);
@@ -264,7 +322,13 @@ impl SqliteStorage {
         time_range: Option<TimeRange>,
         limit: u32,
     ) -> Result<Vec<StoredLine>, StorageError> {
-        let pattern = format!("%{query}%");
+        // LIKE metacharacters are data in substring mode, not user-supplied
+        // pattern syntax. Regex mode is the explicit pattern-search surface.
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let conn = self
             .read_conn
             .lock()
@@ -273,7 +337,7 @@ impl SqliteStorage {
         let res = if let Some(tr) = time_range {
             let mut stmt = conn.prepare_cached(
                 "SELECT id, timestamp_ns, payload FROM lines \
-                 WHERE payload LIKE ?1 AND timestamp_ns >= ?2 AND timestamp_ns <= ?3 \
+                 WHERE payload LIKE ?1 ESCAPE '\\' AND timestamp_ns >= ?2 AND timestamp_ns <= ?3 \
                  ORDER BY id LIMIT ?4",
             )?;
             let rows = stmt.query_map(params![pattern, tr.start_ns, tr.end_ns, limit], map_row)?;
@@ -283,7 +347,7 @@ impl SqliteStorage {
         } else {
             let mut stmt = conn.prepare_cached(
                 "SELECT id, timestamp_ns, payload FROM lines \
-                 WHERE payload LIKE ?1 ORDER BY id LIMIT ?2",
+                 WHERE payload LIKE ?1 ESCAPE '\\' ORDER BY id LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![pattern, limit], map_row)?;
             let r = rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
@@ -629,6 +693,31 @@ mod tests {
     }
 
     #[test]
+    fn substring_search_treats_sql_wildcards_as_literal_text() {
+        let s = make_storage();
+        s.insert_lines(&[(1000, "A_B 100% \\ path"), (2000, "AxB 1000 path")])
+            .unwrap();
+
+        for query in ["A_B", "100%", "\\"] {
+            let results = s.search_substring(query, None, 10).unwrap();
+            assert_eq!(results.len(), 1, "query {query}");
+            assert_eq!(results[0].id, 1);
+
+            let timed = s
+                .search_substring(
+                    query,
+                    Some(TimeRange {
+                        start_ns: 0,
+                        end_ns: 2000,
+                    }),
+                    10,
+                )
+                .unwrap();
+            assert_eq!(timed.len(), 1, "timed query {query}");
+        }
+    }
+
+    #[test]
     fn test_search_substring_with_time_range() {
         let s = make_storage();
         s.insert_lines(&[
@@ -662,6 +751,39 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].payload, "b");
         assert_eq!(results[1].payload, "c");
+    }
+
+    #[test]
+    fn retained_row_positions_use_ids_not_row_count() {
+        let s = make_storage();
+        s.insert_lines(&[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
+            .unwrap();
+        s.trim_lines(3).unwrap();
+
+        assert_eq!(s.line_count().unwrap(), 3);
+        assert_eq!(s.start_id_from_end(2).unwrap(), 4);
+        assert_eq!(s.start_id_from_end(10).unwrap(), 3);
+        assert_eq!(s.start_id_from_end(0).unwrap(), 6);
+        let recent = s.read_lines(s.start_id_from_end(2).unwrap(), 10).unwrap();
+        assert_eq!(
+            recent.iter().map(|line| line.id).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+
+        s.clear(None).unwrap();
+        s.insert_lines(&[(6, "after clear")]).unwrap();
+        assert_eq!(s.start_id_from_end(1).unwrap(), 6);
+    }
+
+    #[test]
+    fn timestamp_filter_and_id_cursor_intersect() {
+        let s = make_storage();
+        s.insert_lines(&[(1000, "old"), (2000, "first"), (3000, "second")])
+            .unwrap();
+        let page = s.read_lines_since(3, 2000, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].payload, "second");
+        assert!(s.read_lines_since(4, 2000, 10).unwrap().is_empty());
     }
 
     #[test]

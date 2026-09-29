@@ -444,7 +444,7 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
             if windowed && !matches!(cli.command, Some(Command::Mcp)) {
                 return interactive_default();
             }
-            mcp::run_mcp(config_path.as_deref())
+            mcp::run_mcp(cli.socket, config_path.as_deref())
         }
 
         Some(Command::Daemon { status, stop }) => {

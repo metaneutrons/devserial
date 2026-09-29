@@ -28,7 +28,8 @@ async fn test_daemon_full_rpc_lifecycle() {
     let mut config = Config::default();
     config.global.data_dir = dir.path().to_path_buf();
     config.global.archive_dir = dir.path().join("archive");
-    let engine = CommandEngine::new(pm.clone(), state_db, Arc::new(config));
+    let config = Arc::new(config);
+    let engine = CommandEngine::new(pm.clone(), state_db, Arc::clone(&config));
 
     let server = IpcServer::new(engine, socket_path.clone(), pid_path.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -41,6 +42,12 @@ async fn test_daemon_full_rpc_lifecycle() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = IpcClient::new(socket_path);
+    let mcp_engine = CommandEngine::new(
+        PortManagerHandle::new(),
+        Arc::new(Mutex::new(StateDb::open_memory().unwrap())),
+        config,
+    )
+    .with_remote(client.clone());
 
     // 1. Ping
     let pong = client.send(RequestPayload::Ping).await.unwrap();
@@ -66,6 +73,13 @@ async fn test_daemon_full_rpc_lifecycle() {
     } else {
         panic!("expected PortList");
     }
+    let via_mcp = mcp_engine.execute(RequestPayload::ListPorts).await.unwrap();
+    let ResponsePayload::PortList(mcp_ports) = via_mcp else {
+        panic!("expected PortList through MCP engine");
+    };
+    assert_eq!(mcp_ports.len(), 1);
+    assert_eq!(mcp_ports[0].name, "mock_daemon_port");
+    assert!(mcp_engine.port_manager().list().await.is_empty());
 
     // 4. Feed data into mock serial
     handle

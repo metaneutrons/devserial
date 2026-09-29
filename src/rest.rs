@@ -171,17 +171,31 @@ impl RestServer {
             ));
         }
 
-        let listener = std::net::TcpListener::bind(addr).map_err(|e| {
-            let reason = bind_failure(addr, &e);
-            self.state = RestState {
-                listening: false,
-                bind: config.bind.clone(),
-                port: config.port,
-                reason: Some(reason.clone()),
-                token_required: token_required(config),
-            };
-            reason
-        })?;
+        let listener = match std::net::TcpListener::bind(addr) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let reason = bind_failure(addr, &error);
+                // A failed replacement does not stop the listener already
+                // answering requests. Keep its state aligned with reality.
+                let listener_is_running = self
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| !running.task.is_finished());
+                if listener_is_running {
+                    self.state.reason = Some(reason.clone());
+                } else {
+                    self.stop_running();
+                    self.state = RestState {
+                        listening: false,
+                        bind: config.bind.clone(),
+                        port: config.port,
+                        reason: Some(reason.clone()),
+                        token_required: token_required(config),
+                    };
+                }
+                return Err(reason);
+            }
+        };
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("could not prepare the listener: {e}"))?;
@@ -209,8 +223,10 @@ impl RestServer {
         // the process.
         let router = router(&Guards {
             token: token.clone(),
+            bind_ip: addr.ip(),
             port: bound.port(),
             engine: engine.clone(),
+            bound_addr: bound,
         });
         let task = tokio::spawn(async move {
             let served = axum::serve(listener, router)
@@ -264,8 +280,10 @@ impl Drop for RestServer {
 #[derive(Clone)]
 struct Guards {
     token: Option<String>,
+    bind_ip: std::net::IpAddr,
     port: u16,
     engine: crate::engine::CommandEngine,
+    bound_addr: std::net::SocketAddr,
 }
 
 /// What a handler reaches: the engine, and the jobs running on it.
@@ -276,16 +294,25 @@ struct Guards {
 #[derive(Clone)]
 struct Api {
     engine: crate::engine::CommandEngine,
-    port: u16,
+    bound_addr: std::net::SocketAddr,
+    bind_ip: std::net::IpAddr,
+    token_configured: bool,
     #[cfg(feature = "esp")]
     jobs: Jobs,
 }
 
 impl Api {
-    fn new(engine: crate::engine::CommandEngine, port: u16) -> Self {
+    fn new(
+        engine: crate::engine::CommandEngine,
+        bound_addr: std::net::SocketAddr,
+        bind_ip: std::net::IpAddr,
+        token_configured: bool,
+    ) -> Self {
         Self {
             engine,
-            port,
+            bound_addr,
+            bind_ip,
+            token_configured,
             #[cfg(feature = "esp")]
             jobs: Jobs::default(),
         }
@@ -347,7 +374,12 @@ fn router(guards: &Guards) -> axum::Router {
         .route("/v1/jobs/{job}/stream", get(job_stream));
 
     let guarded = guarded
-        .with_state(Api::new(guards.engine.clone(), guards.port))
+        .with_state(Api::new(
+            guards.engine.clone(),
+            guards.bound_addr,
+            guards.bind_ip,
+            guards.token.is_some(),
+        ))
         .layer(axum::middleware::from_fn_with_state(
             Arc::new(guards.clone()),
             require_token,
@@ -359,6 +391,7 @@ fn router(guards: &Guards) -> axum::Router {
             require_local_host,
         ))
         .layer(axum::middleware::from_fn(require_json_body))
+        .layer(axum::middleware::from_fn(normalize_problem_response))
 }
 
 /// Liveness, and the one route that never needs a token.
@@ -462,19 +495,30 @@ async fn open_port(
     axum::extract::Path(port): axum::extract::Path<String>,
     axum::Json(settings): axum::Json<crate::protocol::PortSettings>,
 ) -> Reply {
-    use crate::protocol::{RequestPayload, ResponsePayload};
+    use crate::protocol::RequestPayload;
 
-    let ResponsePayload::PortOpened {
-        name,
-        config_summary,
-    } = run(
+    let answer = run(
         &engine,
         RequestPayload::OpenPort {
             name: port,
             settings,
         },
     )
-    .await?
+    .await?;
+    port_open_response(answer)
+}
+
+fn port_open_response(answer: crate::protocol::ResponsePayload) -> Reply {
+    use crate::protocol::ResponsePayload;
+
+    let (ResponsePayload::PortOpened {
+        name,
+        config_summary,
+    }
+    | ResponsePayload::PortReconfigured {
+        name,
+        config_summary,
+    }) = answer
     else {
         return Err(unexpected());
     };
@@ -659,7 +703,7 @@ async fn export(
 async fn stream_lines(
     axum::extract::State(engine): Engine,
     axum::extract::Path(port): axum::extract::Path<String>,
-    axum::extract::Query(query): axum::extract::Query<LinesQuery>,
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<
     axum::response::Sse<
@@ -675,11 +719,8 @@ async fn stream_lines(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok());
 
-    let window = query
-        .window()
-        .map_err(|e| problem(axum::http::StatusCode::BAD_REQUEST, "invalid-parameter", &e))?;
-    let mut after = window.after_id.or(resume).unwrap_or(0);
-    let wait_ms = window.wait_ms.or(Some(STREAM_WAIT_MS));
+    let mut after = query.after.or(resume).unwrap_or(0);
+    let wait_ms = query.wait_ms.or(Some(STREAM_WAIT_MS));
 
     let stream = async_stream::stream! {
         loop {
@@ -1160,13 +1201,13 @@ fn job_id() -> String {
 
 // ---------------------------------------------------------- the description
 //
-// `/v1/openapi.json` is built from `ROUTES` and from the very structs the
-// handlers deserialize. Nothing about a route is described in two places: the
-// path and method come from the list, the parameters and bodies from the
-// types, and the only sentence written by hand is the summary.
+// `/v1/openapi.json` takes paths from `ROUTES`, query and body schemas from the
+// extractor types, and response schemas from the JSON each handler emits.
+// Summaries and response shapes are maintained here, with tests checking that
+// the published description stays aligned with the served routes.
 
 /// The interface as `OpenAPI`, for a reader or a generator.
-fn openapi_document(port: u16) -> serde_json::Value {
+fn openapi_document(server_url: &str, token_configured: bool) -> serde_json::Value {
     let mut paths = serde_json::Map::new();
     for route in ROUTES {
         let Some((method, path)) = route.split_once(' ') else {
@@ -1178,6 +1219,9 @@ fn openapi_document(port: u16) -> serde_json::Value {
             "operationId": operation_id(method, path),
             "parameters": parameters(path, query.as_ref()),
         });
+        if token_configured && *route != "GET /v1/health" {
+            operation["security"] = serde_json::json!([{ "token": [] }]);
+        }
         if let Some(body) = body {
             operation["requestBody"] = serde_json::json!({
                 "required": true,
@@ -1191,34 +1235,43 @@ fn openapi_document(port: u16) -> serde_json::Value {
             .or_insert_with(|| serde_json::json!({}))[method.to_lowercase()] = operation;
     }
 
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
             "title": "devserial",
             "version": env!("CARGO_PKG_VERSION"),
             "summary": "The serial daemon over HTTP.",
-            "description": "Every request carries Host: localhost:PORT or the \
-                            loopback address on the bound port, and every body \
-                            declares Content-Type: application/json. A bearer \
-                            token is required unless the listener is on \
-                            loopback without one configured.",
+            "description": "Every request names this listener in its Host header, and every body declares Content-Type: application/json. A bearer token is required when configured.",
             "license": { "name": "GPL-3.0-or-later" },
         },
-        "servers": [{ "url": format!("http://127.0.0.1:{port}") }],
-        "components": {
+        "servers": [{ "url": server_url }],
+        "paths": paths,
+    });
+    if token_configured {
+        document["components"] = serde_json::json!({
             "securitySchemes": {
                 "token": { "type": "http", "scheme": "bearer" },
             },
-        },
-        "paths": paths,
-    })
+        });
+    }
+    document
 }
 
 /// The interface, described for a generator.
 async fn openapi(
     axum::extract::State(api): axum::extract::State<Api>,
+    headers: axum::http::HeaderMap,
 ) -> axum::Json<serde_json::Value> {
-    axum::Json(openapi_document(api.port))
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let server_url = host
+        .filter(|host| host_matches_listener(host, api.bind_ip, api.bound_addr.port()))
+        .map_or_else(
+            || format!("http://{}", api.bound_addr),
+            |host| format!("http://{host}"),
+        );
+    axum::Json(openapi_document(&server_url, api.token_configured))
 }
 
 /// What one route is for, in one sentence.
@@ -1268,9 +1321,8 @@ fn shapes(route: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>)
     let body = |schema: serde_json::Value| (None, Some(schema));
     match route {
         "GET /v1/ports" => query(schema_of::<PortsQuery>()),
-        "GET /v1/ports/{port}/lines" | "GET /v1/ports/{port}/lines/stream" => {
-            query(schema_of::<LinesQuery>())
-        }
+        "GET /v1/ports/{port}/lines" => query(schema_of::<LinesQuery>()),
+        "GET /v1/ports/{port}/lines/stream" => query(schema_of::<StreamQuery>()),
         "DELETE /v1/ports/{port}/lines" => query(schema_of::<ClearQuery>()),
         "GET /v1/ports/{port}/search" => query(schema_of::<SearchQuery>()),
         "PUT /v1/ports/{port}" => body(schema_of::<crate::protocol::PortSettings>()),
@@ -1312,11 +1364,14 @@ fn parameters(path: &str, query: Option<&serde_json::Value>) -> Vec<serde_json::
     let properties = query
         .and_then(|schema| schema.get("properties"))
         .and_then(serde_json::Value::as_object);
+    let required = query
+        .and_then(|schema| schema.get("required"))
+        .and_then(serde_json::Value::as_array);
     for (name, schema) in properties.into_iter().flatten() {
         parameters.push(serde_json::json!({
             "name": name,
             "in": "query",
-            "required": false,
+            "required": required.is_some_and(|fields| fields.iter().any(|field| field == name)),
             "schema": schema,
         }));
     }
@@ -1336,13 +1391,235 @@ fn responses(route: &str) -> serde_json::Value {
     } else {
         ("200", "the request was carried out")
     };
+    let content = if route.ends_with("/stream") {
+        serde_json::json!({
+            "text/event-stream": {
+                "schema": {
+                    "type": "string",
+                    "description": "A UTF-8 server-sent event stream.",
+                },
+            },
+        })
+    } else {
+        serde_json::json!({
+            "application/json": { "schema": success_schema(route) },
+        })
+    };
     serde_json::json!({
-        code: { "description": description },
+        code: { "description": description, "content": content },
         "default": {
             "description": "a problem document (RFC 9457)",
-            "content": { "application/problem+json": {} },
+            "content": {
+                "application/problem+json": { "schema": problem_schema() },
+            },
         },
     })
+}
+
+/// The JSON schema for one response body as the handler actually emits it.
+fn success_schema(route: &str) -> serde_json::Value {
+    use serde_json::json;
+
+    let string = || json!({ "type": "string" });
+    let integer = || json!({ "type": "integer", "format": "int64" });
+    let unsigned = || json!({ "type": "integer", "minimum": 0 });
+    let strings = || json!({ "type": "array", "items": string() });
+    match route {
+        "GET /v1/health" => object_schema(json!({ "status": string() }), &["status"]),
+        "GET /v1/version" => object_schema(
+            json!({
+                "name": string(),
+                "version": string(),
+                "api": string(),
+                "features": strings(),
+                "routes": strings(),
+            }),
+            &["name", "version", "api", "features", "routes"],
+        ),
+        "GET /v1/ports" => object_schema(
+            json!({
+                "ports": { "type": "array", "items": port_info_schema() },
+                "hardware": strings(),
+            }),
+            &["ports"],
+        ),
+        "PUT /v1/ports/{port}" => object_schema(
+            json!({ "port": string(), "settings": string() }),
+            &["port", "settings"],
+        ),
+        "DELETE /v1/ports/{port}" => object_schema(json!({ "port": string() }), &["port"]),
+        "GET /v1/ports/{port}" => object_schema(
+            json!({
+                "port": string(),
+                "state": connection_state_schema(),
+                "stats": buffer_stats_schema(),
+            }),
+            &["port", "state", "stats"],
+        ),
+        "GET /v1/ports/{port}/stats" => buffer_stats_schema(),
+        "GET /v1/ports/{port}/lines" => object_schema(
+            json!({
+                "total_lines": unsigned(),
+                "next_after_id": integer(),
+                "lines": { "type": "array", "items": stored_line_schema() },
+            }),
+            &["total_lines", "next_after_id", "lines"],
+        ),
+        "DELETE /v1/ports/{port}/lines" => object_schema(
+            json!({
+                "lines_cleared": unsigned(),
+                "archive": { "type": ["string", "null"] },
+            }),
+            &["lines_cleared", "archive"],
+        ),
+        "GET /v1/ports/{port}/search" => object_schema(
+            json!({
+                "truncated": { "type": "boolean" },
+                "results": { "type": "array", "items": stored_line_schema() },
+            }),
+            &["truncated", "results"],
+        ),
+        _ => action_response_schema(route),
+    }
+}
+
+/// Response schemas for actions and optional hardware operations.
+fn action_response_schema(route: &str) -> serde_json::Value {
+    use serde_json::json;
+
+    let string = || json!({ "type": "string" });
+    let unsigned = || json!({ "type": "integer", "minimum": 0 });
+    let strings = || json!({ "type": "array", "items": string() });
+    match route {
+        "POST /v1/ports/{port}/export" => object_schema(
+            json!({
+                "lines_exported": unsigned(),
+                "path": string(),
+                "format": schema_of::<crate::export::ExportFormat>(),
+            }),
+            &["lines_exported", "path", "format"],
+        ),
+        "POST /v1/ports/{port}/write" => {
+            object_schema(json!({ "bytes_written": unsigned() }), &["bytes_written"])
+        }
+        "POST /v1/ports/{port}/break" => {
+            object_schema(json!({ "duration_ms": unsigned() }), &["duration_ms"])
+        }
+        "POST /v1/ports/{port}/signals" => {
+            object_schema(json!({ "applied": strings() }), &["applied"])
+        }
+        "POST /v1/ports/{port}/macros/{name}" => {
+            object_schema(json!({ "executed": strings() }), &["executed"])
+        }
+        "POST /v1/ports/{port}/transfers" => object_schema(
+            json!({
+                "bytes_transferred": unsigned(),
+                "file_name": string(),
+                "protocol": {
+                    "type": "string",
+                    "enum": ["xmodem", "xmodem-crc", "xmodem1k", "ymodem", "zmodem"],
+                },
+                "path": { "type": ["string", "null"] },
+            }),
+            &["bytes_transferred", "file_name", "protocol", "path"],
+        ),
+        "GET /v1/openapi.json" => json!({ "type": "object" }),
+        #[cfg(feature = "esp")]
+        "GET /v1/ports/{port}/esp"
+        | "POST /v1/ports/{port}/esp/erase"
+        | "POST /v1/ports/{port}/esp/write-bin" => {
+            object_schema(json!({ "output": string() }), &["output"])
+        }
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/flash" => object_schema(
+            json!({ "job": string(), "stream": string() }),
+            &["job", "stream"],
+        ),
+        _ => panic!("missing success schema for REST route '{route}'"),
+    }
+}
+
+fn object_schema(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "required": required,
+    });
+    schema["properties"] = properties;
+    schema
+}
+
+fn port_info_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "name": { "type": "string" },
+            "state": connection_state_schema(),
+            "total_lines": { "type": "integer", "minimum": 0 },
+        }),
+        &["name", "state", "total_lines"],
+    )
+}
+
+fn connection_state_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            { "type": "string", "enum": ["Connected", "Reconnecting"] },
+            {
+                "type": "object",
+                "properties": {
+                    "Disconnected": {
+                        "type": "object",
+                        "properties": {
+                            "since_ms": { "type": "integer", "minimum": 0 },
+                            "attempts": { "type": "integer", "minimum": 0 },
+                        },
+                        "required": ["since_ms", "attempts"],
+                    },
+                },
+                "required": ["Disconnected"],
+            },
+        ],
+    })
+}
+
+fn buffer_stats_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "total_lines": { "type": "integer", "minimum": 0 },
+            "total_bytes": { "type": "integer", "minimum": 0 },
+            "last_timestamp_ns": { "type": ["integer", "null"] },
+            "db_size_bytes": { "type": "integer", "minimum": 0 },
+        }),
+        &[
+            "total_lines",
+            "total_bytes",
+            "last_timestamp_ns",
+            "db_size_bytes",
+        ],
+    )
+}
+
+fn stored_line_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "id": { "type": "integer" },
+            "timestamp": { "type": "string" },
+            "timestamp_ns": { "type": "string" },
+            "payload": { "type": "string" },
+        }),
+        &["id", "timestamp", "timestamp_ns", "payload"],
+    )
+}
+
+fn problem_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "type": { "type": "string", "format": "uri-reference" },
+            "title": { "type": "string" },
+            "status": { "type": "integer", "minimum": 400, "maximum": 599 },
+            "detail": { "type": "string" },
+        }),
+        &["type", "title", "status", "detail"],
+    )
 }
 
 /// A name for one route, built from its method and path.
@@ -1482,6 +1759,18 @@ struct LinesQuery {
     wait_ms: Option<u64>,
 }
 
+/// `GET /v1/ports/{port}/lines/stream`
+///
+/// The live stream supports incremental resumption and a per-read wait. A
+/// finite start, tail, timestamp or limit applies to a page, not an open-ended
+/// stream, so those fields are deliberately absent here.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StreamQuery {
+    after: Option<i64>,
+    wait_ms: Option<u64>,
+}
+
 impl LinesQuery {
     fn window(self) -> Result<crate::protocol::ReadWindow, String> {
         Ok(crate::protocol::ReadWindow {
@@ -1525,9 +1814,11 @@ impl SearchQuery {
 fn parse_time(value: Option<&str>) -> Result<Option<i64>, String> {
     value
         .map(|text| {
-            chrono::DateTime::parse_from_rfc3339(text)
-                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-                .map_err(|e| format!("invalid time '{text}': {e}"))
+            let parsed = chrono::DateTime::parse_from_rfc3339(text)
+                .map_err(|e| format!("invalid time '{text}': {e}"))?;
+            parsed
+                .timestamp_nanos_opt()
+                .ok_or_else(|| format!("time '{text}' is outside the supported timestamp range"))
         })
         .transpose()
 }
@@ -1605,13 +1896,51 @@ async fn require_json_body(
     )
 }
 
-/// Refuse a request that did not come from this machine's own loopback name.
+/// Turn Axum extractor rejections into the same problem format as handler errors.
+async fn normalize_problem_response(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(request).await;
+    if !response.status().is_client_error() && !response.status().is_server_error() {
+        return response;
+    }
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if content_type
+        .split(';')
+        .next()
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/problem+json"))
+    {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let detail = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or_else(|| "the request could not be decoded".to_owned());
+    let mut normalized = problem(status, "invalid-request", &detail);
+    if let Some(allow) = parts.headers.get(axum::http::header::ALLOW) {
+        normalized
+            .headers_mut()
+            .insert(axum::http::header::ALLOW, allow.clone());
+    }
+    normalized
+}
+
+/// Refuse a Host header that does not name the bound listener.
 ///
-/// This is the other half of the loopback decision, and it is not optional.
-/// A page in the user's browser can reach `127.0.0.1`, and DNS rebinding lets
-/// an attacker's hostname resolve there and carry their origin along. Checking
-/// the `Host` header against the names this listener answers to is what stops
-/// that, because the browser sends the name it dialled, not the address.
+/// A page in the user's browser can reach loopback, and DNS rebinding lets an
+/// attacker's hostname resolve there and carry their origin along. Loopback
+/// therefore uses a strict allowlist. A network bind accepts its IP address,
+/// while a wildcard bind accepts IP literals only.
 async fn require_local_host(
     axum::extract::State(guards): axum::extract::State<Arc<Guards>>,
     request: axum::extract::Request,
@@ -1623,14 +1952,14 @@ async fn require_local_host(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
 
-    if host_is_local(host, guards.port) {
+    if host_matches_listener(host, guards.bind_ip, guards.port) {
         return next.run(request).await;
     }
 
     problem(
         axum::http::StatusCode::MISDIRECTED_REQUEST,
         "host-not-local",
-        "this interface answers only to localhost and 127.0.0.1",
+        "the Host header does not name this listener",
     )
 }
 
@@ -1639,22 +1968,60 @@ async fn require_local_host(
 /// A missing port means the default for the scheme, which is never ours, so a
 /// header without one is refused rather than assumed.
 fn host_is_local(host: &str, port: u16) -> bool {
-    let (name, given_port) = match host.rsplit_once(':') {
-        // An IPv6 literal carries colons of its own; the port is the part
-        // after the last one only when the name is bracketed.
-        Some((name, _)) if !name.ends_with(']') && name.contains(':') => (host, None),
-        Some((name, tail)) => (name, tail.parse::<u16>().ok()),
-        None => (host, None),
-    };
-
-    if given_port != Some(port) {
+    let Some((name, given_port)) = host_and_port(host) else {
         return false;
+    };
+    given_port == port && matches!(name, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Whether a Host header names this listener's configured address.
+///
+/// A loopback listener keeps the strict local-name allowlist that prevents
+/// DNS rebinding. A non-loopback listener accepts its concrete address; a
+/// wildcard listener accepts only IP-literal destinations of its address
+/// family, never an arbitrary DNS name.
+fn host_matches_listener(host: &str, bind_ip: std::net::IpAddr, port: u16) -> bool {
+    if bind_ip.is_loopback() {
+        return host_is_local(host, port);
     }
 
-    matches!(
-        name.trim_start_matches('[').trim_end_matches(']'),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+    let Some((name, given_port)) = host_and_port(host) else {
+        return false;
+    };
+    if given_port != port {
+        return false;
+    }
+    if bind_ip.is_unspecified() && host_is_local(host, port) {
+        return true;
+    }
+    let Ok(host_ip) = name.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+
+    match bind_ip {
+        std::net::IpAddr::V4(bind) if bind.is_unspecified() => {
+            matches!(host_ip, std::net::IpAddr::V4(host) if !host.is_unspecified() && !host.is_loopback())
+        }
+        std::net::IpAddr::V6(bind) if bind.is_unspecified() => {
+            matches!(host_ip, std::net::IpAddr::V6(host) if !host.is_unspecified() && !host.is_loopback())
+        }
+        _ => host_ip == bind_ip,
+    }
+}
+
+/// Split an authority into its host and explicit port.
+fn host_and_port(host: &str) -> Option<(&str, u16)> {
+    if let Some(bracketed) = host.strip_prefix('[') {
+        let (name, suffix) = bracketed.split_once(']')?;
+        let port = suffix.strip_prefix(':')?.parse().ok()?;
+        return Some((name, port));
+    }
+
+    let (name, port) = host.rsplit_once(':')?;
+    if name.contains(':') {
+        return None;
+    }
+    Some((name, port.parse().ok()?))
 }
 
 /// An error in the shape RFC 9457 describes.
@@ -1769,6 +2136,28 @@ mod tests {
             .enable(&config("localhost", 0), &test_engine().0)
             .expect_err("a name is not an address");
         assert!(refused.contains("localhost"), "{refused}");
+    }
+
+    /// A replacement bind failure leaves the listener that is still serving intact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_same_address_retry_preserves_the_running_state() {
+        let (mut server, addr, engine, _dir) = listening(None);
+        let retry = config("127.0.0.1", addr.port());
+
+        let refused = server
+            .enable(&retry, &engine)
+            .expect_err("the existing socket cannot be bound twice");
+        assert!(refused.contains("in use"), "{refused}");
+        let state = server.state();
+        assert!(state.listening, "the original listener is still serving");
+        assert_eq!(state.port, addr.port());
+        assert!(
+            state
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("in use"))
+        );
+        assert!(get(addr, "/v1/health", None).starts_with("HTTP/1.1 200"));
     }
 
     /// A name is not loopback, however much it looks like one.
@@ -1995,10 +2384,30 @@ mod tests {
         assert!(host_is_local("127.0.0.1:9600", 9600));
         assert!(host_is_local("localhost:9600", 9600));
         assert!(host_is_local("[::1]:9600", 9600));
+        assert!(host_matches_listener(
+            "192.168.1.9:9600",
+            "192.168.1.9".parse().unwrap(),
+            9600
+        ));
+        assert!(host_matches_listener(
+            "192.168.1.12:9600",
+            "0.0.0.0".parse().unwrap(),
+            9600
+        ));
 
         // A rebound name, the attack this guard exists for.
         assert!(!host_is_local("localhost.attacker.example:9600", 9600));
         assert!(!host_is_local("evil.example:9600", 9600));
+        assert!(!host_matches_listener(
+            "192.168.1.9:9600",
+            "127.0.0.1".parse().unwrap(),
+            9600
+        ));
+        assert!(!host_matches_listener(
+            "attacker.example:9600",
+            "0.0.0.0".parse().unwrap(),
+            9600
+        ));
         // The right name on the wrong port is not this listener.
         assert!(!host_is_local("127.0.0.1:9601", 9600));
         // No port means the scheme default, which is never ours.
@@ -2124,6 +2533,64 @@ mod tests {
         // A path nothing serves is a 404 rather than something else.
         let absent = get(addr, "/v1/nothing-here", None);
         assert!(absent.starts_with("HTTP/1.1 404"), "{absent}");
+    }
+
+    /// A non-loopback listener accepts an IP Host header when the token is valid.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_protected_wildcard_listener_accepts_its_lan_host() {
+        let mut config = config("0.0.0.0", 0);
+        config.token = Some("lan-secret".to_owned());
+        let (engine, _dir) = test_engine();
+        let mut server = RestServer::new(&config);
+        let state = server
+            .enable(&config, &engine)
+            .expect("wildcard bind with token");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", state.port)
+            .parse()
+            .expect("loopback address for the wildcard listener");
+        let lan_host = format!("192.168.1.44:{}", state.port);
+
+        let allowed = send(
+            addr,
+            "GET",
+            "/v1/version",
+            Some("lan-secret"),
+            None,
+            Some(&lan_host),
+        );
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+
+        let openapi = send(
+            addr,
+            "GET",
+            "/v1/openapi.json",
+            Some("lan-secret"),
+            None,
+            Some(&lan_host),
+        );
+        assert!(openapi.starts_with("HTTP/1.1 200"), "{openapi}");
+        let document = body_of(&openapi);
+        assert_eq!(document["servers"][0]["url"], format!("http://{lan_host}"));
+        assert_eq!(
+            document["paths"]["/v1/ports"]["get"]["security"][0]["token"],
+            serde_json::json!([])
+        );
+        assert!(document["paths"]["/v1/health"]["get"]["security"].is_null());
+        assert_eq!(
+            document["components"]["securitySchemes"]["token"]["scheme"],
+            "bearer"
+        );
+
+        // A DNS name is still refused on a wildcard bind, even with a token.
+        let rebound = send(
+            addr,
+            "GET",
+            "/v1/version",
+            Some("lan-secret"),
+            None,
+            Some(&format!("attacker.example:{}", state.port)),
+        );
+        assert!(rebound.starts_with("HTTP/1.1 421"), "{rebound}");
     }
 
     /// A configured token is enforced, and health stays reachable without it.
@@ -2335,6 +2802,19 @@ mod tests {
         let bad = get(addr, &format!("{base}?since=yesterday"), None);
         assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
         assert!(bad.contains("yesterday"), "{bad}");
+
+        // RFC 3339 can represent dates outside the nanosecond range stored by
+        // the engine; those must be rejected rather than mapped to epoch zero.
+        let out_of_range = get(
+            addr,
+            &format!("{base}?since=2500-01-01T00%3A00%3A00Z"),
+            None,
+        );
+        assert!(out_of_range.starts_with("HTTP/1.1 400"), "{out_of_range}");
+        assert!(
+            out_of_range.contains("supported timestamp range"),
+            "{out_of_range}"
+        );
     }
 
     /// The two guards refuse what they exist to refuse.
@@ -2387,6 +2867,33 @@ mod tests {
         assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
     }
 
+    /// Extractor rejections use the same problem media type as handler failures.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extractor_errors_are_problem_documents() {
+        let (_server, addr, _engine, _dir, _storage) = listening_with_lines().await;
+
+        let bad_query = get(addr, "/v1/ports?hardware=perhaps", None);
+        assert!(bad_query.starts_with("HTTP/1.1 400"), "{bad_query}");
+        assert!(
+            bad_query.contains("application/problem+json"),
+            "{bad_query}"
+        );
+        assert_eq!(body_of(&bad_query)["status"], 400);
+
+        let bad_json = post(addr, "/v1/ports/mock_rest_port/write", r#"{"data":"#);
+        assert!(bad_json.starts_with("HTTP/1.1 400"), "{bad_json}");
+        assert!(bad_json.contains("application/problem+json"), "{bad_json}");
+        assert_eq!(body_of(&bad_json)["status"], 400);
+
+        let wrong_method = get(addr, "/v1/ports/mock_rest_port/write", None);
+        assert!(wrong_method.starts_with("HTTP/1.1 405"), "{wrong_method}");
+        assert!(
+            wrong_method.to_ascii_lowercase().contains("allow: post"),
+            "{wrong_method}"
+        );
+        assert_eq!(body_of(&wrong_method)["status"], 405);
+    }
+
     /// Opening and closing a port over HTTP reaches the daemon's port manager.
     #[tokio::test(flavor = "multi_thread")]
     async fn closing_a_port_over_http_closes_it_on_the_daemon() {
@@ -2406,6 +2913,20 @@ mod tests {
             engine.port_manager().list().await.is_empty(),
             "the daemon still holds the port the route said it closed"
         );
+    }
+
+    /// The PUT response handles the engine's already-open-port result.
+    #[test]
+    fn put_response_accepts_a_reconfigured_port() {
+        use axum::response::IntoResponse as _;
+
+        let response = port_open_response(crate::protocol::ResponsePayload::PortReconfigured {
+            name: "ttyUSB0".to_owned(),
+            config_summary: "115200 8N1".to_owned(),
+        })
+        .expect("a reconfiguration is a successful PUT")
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     /// One POST with a JSON body, from the right host.
@@ -2737,6 +3258,87 @@ mod tests {
         for field in ["start", "after", "tail", "since", "limit", "wait_ms"] {
             assert!(query.contains(&field), "{field} is not described: {lines}");
         }
+
+        assert_openapi_metadata(&document);
+    }
+
+    /// Check query contracts, success bodies, errors and feature-dependent security.
+    fn assert_openapi_metadata(document: &serde_json::Value) {
+        let paths = &document["paths"];
+
+        let search = &paths["/v1/ports/{port}/search"]["get"];
+        let q = search["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|parameter| parameter["name"] == "q")
+            .expect("search query has q");
+        assert_eq!(q["required"], true, "q is required by SearchQuery");
+
+        let stream = &paths["/v1/ports/{port}/lines/stream"]["get"];
+        let stream_query: Vec<&str> = stream["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|parameter| parameter["in"] == "query")
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert_eq!(stream_query, ["after", "wait_ms"]);
+        let stream_success = &stream["responses"]["200"]["content"];
+        assert!(stream_success["text/event-stream"]["schema"].is_object());
+        assert!(stream_success["application/json"].is_null());
+
+        let json_success = &paths["/v1/ports"]["get"]["responses"]["200"]["content"];
+        assert!(json_success["application/json"]["schema"]["properties"]["ports"].is_object());
+        assert_eq!(
+            json_success["application/json"]["schema"]["required"],
+            serde_json::json!(["ports"]),
+            "hardware is omitted unless requested"
+        );
+        assert!(json_success["application/json"]["schema"]["properties"]["hardware"].is_object());
+        let line_schema = &paths["/v1/ports/{port}/lines"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["lines"]["items"];
+        assert_eq!(line_schema["properties"]["timestamp"]["type"], "string");
+        assert_eq!(line_schema["properties"]["timestamp_ns"]["type"], "string");
+        assert_eq!(
+            line_schema["required"],
+            serde_json::json!(["id", "timestamp", "timestamp_ns", "payload"])
+        );
+        assert!(json_success["text/event-stream"].is_null());
+        assert!(
+            paths["/v1/ports"]["get"]["responses"]["default"]["content"]["application/problem+json"]["schema"].is_object()
+        );
+        let transfer_schema = &paths["/v1/ports/{port}/transfers"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        let protocols = [
+            crate::modem::FileTransferProtocol::Xmodem,
+            crate::modem::FileTransferProtocol::XmodemCrc,
+            crate::modem::FileTransferProtocol::Xmodem1k,
+            crate::modem::FileTransferProtocol::Ymodem,
+            crate::modem::FileTransferProtocol::Zmodem,
+        ]
+        .into_iter()
+        .map(|protocol| serde_json::to_value(protocol).expect("serialize transfer protocol"))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            transfer_schema["properties"]["protocol"]["enum"],
+            serde_json::Value::Array(protocols)
+        );
+        assert_eq!(
+            serde_json::to_value(crate::modem::FileTransferProtocol::Xmodem1k)
+                .expect("serialize transfer protocol"),
+            "xmodem1k"
+        );
+        assert_eq!(
+            transfer_schema["properties"]["path"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            transfer_schema["required"],
+            serde_json::json!(["bytes_transferred", "file_name", "protocol", "path"])
+        );
+        assert!(document["components"].is_null());
+        assert!(paths["/v1/ports"]["get"]["security"].is_null());
     }
 
     /// Open a stream, read what arrives, and hang up.
@@ -2788,6 +3390,13 @@ mod tests {
     async fn the_stream_carries_line_ids_and_resumes_from_them() {
         let (_server, addr, _engine, _dir, storage) = listening_with_lines().await;
         let path = "/v1/ports/mock_rest_port/lines/stream";
+
+        let unsupported = get(addr, &format!("{path}?tail=1"), None);
+        assert!(unsupported.starts_with("HTTP/1.1 400"), "{unsupported}");
+        assert!(
+            unsupported.contains("application/problem+json"),
+            "{unsupported}"
+        );
 
         let first = stream_until(addr, path, None, "event: line", 3);
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");

@@ -14,10 +14,14 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResponse, CallToolResult, ContentBlock, Implementation, ServerCapabilities,
+        ServerConfig,
+    },
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -88,6 +92,8 @@ impl DevSerialServer {
         let router = Self::core_tools();
         #[cfg(feature = "esp")]
         let router = router + Self::esp_tools();
+        #[cfg(feature = "monitor")]
+        let router = router + Self::monitor_tools();
         router
     }
 
@@ -97,6 +103,35 @@ impl DevSerialServer {
             .execute(payload)
             .await
             .map_err(|e| to_error_data(&e))
+    }
+}
+
+/// Failure raised while a valid tool call is being executed.
+///
+/// rmcp treats `ErrorData` returned from a tool handler as a JSON-RPC error,
+/// which hides the useful message from MCP clients. Wrapping the engine or
+/// validation error makes rmcp encode it as a normal `CallToolResult` with
+/// `isError: true`.
+#[derive(Debug)]
+struct ToolExecutionError(rmcp::ErrorData);
+
+impl From<rmcp::ErrorData> for ToolExecutionError {
+    fn from(error: rmcp::ErrorData) -> Self {
+        Self(error)
+    }
+}
+
+impl std::ops::Deref for ToolExecutionError {
+    type Target = rmcp::ErrorData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl IntoCallToolResult for ToolExecutionError {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, rmcp::ErrorData> {
+        Ok(CallToolResult::error(vec![ContentBlock::text(self.0.message)]).into())
     }
 }
 
@@ -137,11 +172,38 @@ fn stop_bits(value: Option<u8>) -> Result<Option<StopBits>, rmcp::ErrorData> {
 fn parse_time(value: Option<&str>) -> Result<Option<i64>, rmcp::ErrorData> {
     value
         .map(|text| {
-            chrono::DateTime::parse_from_rfc3339(text)
-                .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-                .map_err(|e| bad_params(format!("invalid time '{text}': {e}")))
+            let datetime = chrono::DateTime::parse_from_rfc3339(text)
+                .map_err(|e| bad_params(format!("invalid time '{text}': {e}")))?;
+            datetime.timestamp_nanos_opt().ok_or_else(|| {
+                bad_params(format!(
+                    "invalid time '{text}': timestamp is outside the supported nanosecond range"
+                ))
+            })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod parse_time_tests {
+    use super::parse_time;
+
+    #[test]
+    fn rfc3339_timestamp_outside_nanosecond_range_is_rejected() {
+        let error = parse_time(Some("9999-12-31T23:59:59Z")).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("outside the supported nanosecond range")
+        );
+    }
+
+    #[test]
+    fn rfc3339_timestamp_preserves_nanoseconds() {
+        assert_eq!(
+            parse_time(Some("2026-01-02T03:04:05.123456789Z")).unwrap(),
+            Some(1_767_323_045_123_456_789)
+        );
+    }
 }
 
 // ------------------------------------------------------------------ params
@@ -396,12 +458,13 @@ pub struct EspWriteBinParams {
 impl DevSerialServer {
     /// Read captured serial data.
     #[tool(
-        description = "Read captured serial data. Returns a metadata header plus lines. Use after_line for efficient incremental polling."
+        description = "Read captured serial data. Returns a metadata header plus lines. Use after_line for efficient incremental polling.",
+        annotations(read_only_hint = true)
     )]
     async fn serial_read(
         &self,
         Parameters(params): Parameters<ReadBufferParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let window = ReadWindow {
             start_id: params.start_line,
             after_id: params.after_line,
@@ -418,7 +481,7 @@ impl DevSerialServer {
             })
             .await?;
         let ResponsePayload::Lines(page) = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
 
         Ok(render_lines(
@@ -429,19 +492,20 @@ impl DevSerialServer {
 
     /// Port status: connection state and buffer statistics.
     #[tool(
-        description = "Get serial port status: connection state, total lines, bytes, last activity and database size."
+        description = "Get serial port status: connection state, total lines, bytes, last activity and database size.",
+        annotations(read_only_hint = true)
     )]
     async fn serial_status(
         &self,
         Parameters(params): Parameters<PortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let response = self
             .run(RequestPayload::GetStatus {
                 port: params.port_name,
             })
             .await?;
         let ResponsePayload::Status { name, state, stats } = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
 
         let json = serde_json::json!({
@@ -455,17 +519,18 @@ impl DevSerialServer {
             "db_size_bytes": stats.db_size_bytes,
         });
         serde_json::to_string_pretty(&json)
-            .map_err(|e| to_error_data(&EngineError::Tool(e.to_string())))
+            .map_err(|e| to_error_data(&EngineError::Tool(e.to_string())).into())
     }
 
     /// Search captured serial data.
     #[tool(
-        description = "Search serial data by substring, exact match or regular expression, with optional time bounds."
+        description = "Search serial data by substring, exact match or regular expression, with optional time bounds.",
+        annotations(read_only_hint = true)
     )]
     async fn serial_search(
         &self,
         Parameters(params): Parameters<SearchBufferParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let response = self
             .run(RequestPayload::Search {
                 port: params.port_name,
@@ -477,7 +542,7 @@ impl DevSerialServer {
             })
             .await?;
         let ResponsePayload::SearchResults(outcome) = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
 
         let mut out = String::new();
@@ -503,12 +568,17 @@ impl DevSerialServer {
 
     /// Export captured serial data to a file.
     #[tool(
-        description = "Export serial data to a file as txt (raw lines), csv (RFC 4180) or jsonl."
+        description = "Export serial data to a file as txt (raw lines), csv (RFC 4180) or jsonl.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_export(
         &self,
         Parameters(params): Parameters<ExportBufferParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let response = self
             .run(RequestPayload::Export {
                 port: params.port_name,
@@ -524,7 +594,7 @@ impl DevSerialServer {
             file_format,
         } = response
         else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!(
             "Exported {lines_exported} lines to {path} (format: {file_format})"
@@ -533,12 +603,17 @@ impl DevSerialServer {
 
     /// Clear captured serial data.
     #[tool(
-        description = "Clear captured serial data. Optionally archives the database into the configured archive directory first."
+        description = "Clear captured serial data. Optionally archives the database into the configured archive directory first.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_clear(
         &self,
         Parameters(params): Parameters<ClearBufferParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let response = self
             .run(RequestPayload::Clear {
                 port: params.port_name,
@@ -550,7 +625,7 @@ impl DevSerialServer {
             archive_path,
         } = response
         else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(archive_path.map_or_else(
             || format!("Cleared buffer ({lines_cleared} lines removed)"),
@@ -559,15 +634,18 @@ impl DevSerialServer {
     }
 
     /// List system serial ports and managed connections.
-    #[tool(description = "List system serial ports and managed connections with their state.")]
-    async fn serial_list(&self) -> Result<String, rmcp::ErrorData> {
+    #[tool(
+        description = "List system serial ports and managed connections with their state.",
+        annotations(read_only_hint = true)
+    )]
+    async fn serial_list(&self) -> Result<String, ToolExecutionError> {
         let ResponsePayload::HardwarePorts(hardware) =
             self.run(RequestPayload::ListHardware).await?
         else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         let ResponsePayload::PortList(managed) = self.run(RequestPayload::ListPorts).await? else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
 
         let mut out = String::from("System ports:\n");
@@ -594,12 +672,17 @@ impl DevSerialServer {
 
     /// Open or reconfigure a serial port.
     #[tool(
-        description = "Open a serial port with the given line settings. Idempotent: reconfigures the port when it is already open."
+        description = "Open a serial port with the given line settings. Idempotent: reconfigures the port when it is already open.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn serial_open(
         &self,
         Parameters(params): Parameters<ConfigurePortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let settings = PortSettings {
             baudrate: params.baudrate,
             data_bits: data_bits(params.data_bits)?,
@@ -624,35 +707,47 @@ impl DevSerialServer {
                 name,
                 config_summary,
             } => format!("Reconfigured {name} ({config_summary})"),
-            _ => return Err(unexpected()),
+            _ => return Err(unexpected().into()),
         })
     }
 
     /// Close a managed serial port.
-    #[tool(description = "Close a managed serial port and stop capturing from it.")]
+    #[tool(
+        description = "Close a managed serial port and stop capturing from it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn serial_close(
         &self,
         Parameters(params): Parameters<PortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let response = self
             .run(RequestPayload::ClosePort {
                 name: params.port_name,
             })
             .await?;
         let ResponsePayload::PortClosed { name } = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!("Closed {name}"))
     }
 
     /// Write data to a serial port.
     #[tool(
-        description = "Write data to a serial port. Accepts UTF-8 text or hex-encoded bytes prefixed with 0x."
+        description = "Write data to a serial port. Accepts UTF-8 text or hex-encoded bytes prefixed with 0x.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_write(
         &self,
         Parameters(params): Parameters<WritePortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let port = params.port_name.clone();
         let response = self
             .run(RequestPayload::WriteData {
@@ -662,17 +757,24 @@ impl DevSerialServer {
             })
             .await?;
         let ResponsePayload::WriteSuccess { bytes_written } = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!("Wrote {bytes_written} bytes to {port}"))
     }
 
     /// Set DTR and RTS signals.
-    #[tool(description = "Set the DTR and/or RTS control lines of a serial port.")]
+    #[tool(
+        description = "Set the DTR and/or RTS control lines of a serial port.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn serial_signal(
         &self,
         Parameters(params): Parameters<SetControlLinesParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let port = params.port_name.clone();
         let response = self
             .run(RequestPayload::SetSignal {
@@ -682,19 +784,24 @@ impl DevSerialServer {
             })
             .await?;
         let ResponsePayload::SignalSuccess { applied } = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!("Set {} on {port}", applied.join(", ")))
     }
 
     /// Send an RS-232 BREAK pulse.
     #[tool(
-        description = "Send an RS-232 BREAK pulse (TX held low) for a duration in milliseconds (default 250)."
+        description = "Send an RS-232 BREAK pulse (TX held low) for a duration in milliseconds (default 250).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
     )]
     async fn serial_break(
         &self,
         Parameters(params): Parameters<SerialBreakParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let port = params.port_name.clone();
         let response = self
             .run(RequestPayload::SendBreak {
@@ -703,7 +810,7 @@ impl DevSerialServer {
             })
             .await?;
         let ResponsePayload::BreakSuccess { duration_ms } = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!(
             "Sent serial BREAK pulse ({duration_ms}ms) on {port}"
@@ -712,12 +819,17 @@ impl DevSerialServer {
 
     /// Send a file over serial.
     #[tool(
-        description = "Send a file over a serial port using ZMODEM (default), YMODEM, XMODEM-1K, XMODEM-CRC or XMODEM."
+        description = "Send a file over a serial port using ZMODEM (default), YMODEM, XMODEM-1K, XMODEM-CRC or XMODEM.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_send_file(
         &self,
         Parameters(params): Parameters<SerialSendFileParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let port = params.port_name.clone();
         let response = self
             .run(RequestPayload::SendFile {
@@ -733,7 +845,7 @@ impl DevSerialServer {
             ..
         } = response
         else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!(
             "Sent {bytes_transferred} bytes ('{file_name}') to {port} via {protocol:?}"
@@ -742,12 +854,17 @@ impl DevSerialServer {
 
     /// Receive a file over serial.
     #[tool(
-        description = "Receive a file over a serial port using ZMODEM (default), YMODEM, XMODEM-1K, XMODEM-CRC or XMODEM."
+        description = "Receive a file over a serial port using ZMODEM (default), YMODEM, XMODEM-1K, XMODEM-CRC or XMODEM.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_receive_file(
         &self,
         Parameters(params): Parameters<SerialReceiveFileParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let port = params.port_name.clone();
         let response = self
             .run(RequestPayload::ReceiveFile {
@@ -763,7 +880,7 @@ impl DevSerialServer {
             ..
         } = response
         else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         let location = path.unwrap_or(file_name);
         Ok(format!(
@@ -773,12 +890,17 @@ impl DevSerialServer {
 
     /// Run a macro sequence.
     #[tool(
-        description = "Run a macro sequence on a serial port. Built-in: 'reset', 'enter_bootloader', 'break'; user-defined macros come from the configuration file."
+        description = "Run a macro sequence on a serial port. Built-in: 'reset', 'enter_bootloader', 'break'; user-defined macros come from the configuration file.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_macro(
         &self,
         Parameters(params): Parameters<TriggerMacroParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         let port = params.port_name.clone();
         let name = params.macro_name.clone();
         let response = self
@@ -788,7 +910,7 @@ impl DevSerialServer {
             })
             .await?;
         let ResponsePayload::MacroSuccess { executed_steps } = response else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(format!(
             "Executed '{name}' on {port} ({} steps: {})",
@@ -796,24 +918,40 @@ impl DevSerialServer {
             executed_steps.join(" → ")
         ))
     }
+}
 
+#[cfg(feature = "monitor")]
+#[tool_router(router = monitor_tools, vis = "pub")]
+impl DevSerialServer {
     /// Open a GUI monitor window.
     #[tool(
-        description = "Open a native GUI monitor window showing live serial data. The user can send data from that window."
+        description = "Open a native GUI monitor window showing live serial data. The user can send data from that window.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
     )]
     async fn serial_monitor_open(
         &self,
         Parameters(params): Parameters<PortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         self.monitor_open_impl(&params.port_name).await
     }
 
     /// Close a GUI monitor window.
-    #[tool(description = "Close the native GUI monitor window for a serial port.")]
+    #[tool(
+        description = "Close the native GUI monitor window for a serial port.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
     async fn serial_monitor_close(
         &self,
         Parameters(params): Parameters<PortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         self.monitor_close_impl(&params.port_name).await
     }
 }
@@ -823,12 +961,17 @@ impl DevSerialServer {
 impl DevSerialServer {
     /// Flash firmware to an ESP device.
     #[tool(
-        description = "Flash firmware to an ESP device via espflash. The port is released for the duration and reopened afterwards."
+        description = "Flash firmware to an ESP device via espflash. The port is released for the duration and reopened afterwards.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_esp_flash(
         &self,
         Parameters(params): Parameters<EspFlashParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         self.esp_output(RequestPayload::EspFlash {
             port: params.port_name,
             firmware_path: params.firmware_path,
@@ -838,11 +981,14 @@ impl DevSerialServer {
     }
 
     /// Get ESP chip and board information.
-    #[tool(description = "Get ESP chip and board information (chip type, flash size, MAC).")]
+    #[tool(
+        description = "Get ESP chip and board information (chip type, flash size, MAC).",
+        annotations(read_only_hint = true)
+    )]
     async fn serial_esp_info(
         &self,
         Parameters(params): Parameters<PortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         self.esp_output(RequestPayload::EspInfo {
             port: params.port_name,
         })
@@ -850,11 +996,18 @@ impl DevSerialServer {
     }
 
     /// Erase the entire flash of an ESP device.
-    #[tool(description = "Erase the entire flash of an ESP device. This destroys all data on it.")]
+    #[tool(
+        description = "Erase the entire flash of an ESP device. This destroys all data on it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
     async fn serial_esp_erase(
         &self,
         Parameters(params): Parameters<PortParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         self.esp_output(RequestPayload::EspErase {
             port: params.port_name,
         })
@@ -863,12 +1016,17 @@ impl DevSerialServer {
 
     /// Write a raw binary to a flash address.
     #[tool(
-        description = "Write a raw binary file to a specific flash address on an ESP device. Use for bootloaders, partition tables or NVS images."
+        description = "Write a raw binary file to a specific flash address on an ESP device. Use for bootloaders, partition tables or NVS images.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn serial_esp_write_bin(
         &self,
         Parameters(params): Parameters<EspWriteBinParams>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> Result<String, ToolExecutionError> {
         self.esp_output(RequestPayload::EspWriteBin {
             port: params.port_name,
             file_path: params.file_path,
@@ -880,9 +1038,9 @@ impl DevSerialServer {
 
 #[cfg(feature = "esp")]
 impl DevSerialServer {
-    async fn esp_output(&self, payload: RequestPayload) -> Result<String, rmcp::ErrorData> {
+    async fn esp_output(&self, payload: RequestPayload) -> Result<String, ToolExecutionError> {
         let ResponsePayload::EspSuccess(output) = self.run(payload).await? else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
         Ok(output)
     }
@@ -924,7 +1082,7 @@ fn render_lines(page: &LinesPage, timestamps: bool) -> String {
 
 #[cfg(feature = "monitor")]
 impl DevSerialServer {
-    async fn monitor_open_impl(&self, port_name: &str) -> Result<String, rmcp::ErrorData> {
+    async fn monitor_open_impl(&self, port_name: &str) -> Result<String, ToolExecutionError> {
         // Fails early when the port is not managed.
         let ResponsePayload::Status { state, .. } = self
             .run(RequestPayload::GetStatus {
@@ -932,13 +1090,14 @@ impl DevSerialServer {
             })
             .await?
         else {
-            return Err(unexpected());
+            return Err(unexpected().into());
         };
 
         if self.monitor_is_open(port_name) {
             return Err(bad_params(format!(
                 "a monitor window is already open for '{port_name}'"
-            )));
+            ))
+            .into());
         }
 
         let db_path = crate::paths::port_db_path(self.engine.data_dir(), port_name);
@@ -963,7 +1122,7 @@ impl DevSerialServer {
     }
 
     #[allow(clippy::unused_async)] // symmetry with the feature-less variant
-    async fn monitor_close_impl(&self, port_name: &str) -> Result<String, rmcp::ErrorData> {
+    async fn monitor_close_impl(&self, port_name: &str) -> Result<String, ToolExecutionError> {
         let monitor = self
             .monitors
             .lock()
@@ -975,9 +1134,7 @@ impl DevSerialServer {
                 state.handle.close();
                 Ok(format!("Monitor closed for {port_name}"))
             }
-            None => Err(bad_params(format!(
-                "no monitor window is open for '{port_name}'"
-            ))),
+            None => Err(bad_params(format!("no monitor window is open for '{port_name}'")).into()),
         }
     }
 
@@ -1028,22 +1185,25 @@ impl DevSerialServer {
             let Ok(mut pipe) = tokio::process::ChildStdin::from_std(stdin) else {
                 return;
             };
-            let Ok(storage) = engine.port_manager().get_storage(&port).await else {
-                return;
-            };
-
             let mut last_id = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                // Change detection uses the primary key only. Asking for full
-                // statistics here meant scanning the whole capture table many
-                // times per second.
-                let current = {
-                    let guard = storage
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.last_id().unwrap_or(last_id)
+                // The MCP engine may be an IPC proxy. Read the latest retained
+                // id through the shared engine instead of the local port manager.
+                let Ok(ResponsePayload::Lines(page)) = engine
+                    .execute(RequestPayload::ReadLines {
+                        port: port.clone(),
+                        window: ReadWindow {
+                            tail: Some(1),
+                            limit: Some(1),
+                            ..ReadWindow::default()
+                        },
+                    })
+                    .await
+                else {
+                    break;
                 };
+                let current = page.next_after_id;
                 if current != last_id {
                     last_id = current;
                     if pipe.write_all(b"\n").await.is_err() {
@@ -1092,25 +1252,6 @@ fn monitor_event_payload(port: &str, event: crate::gui_ipc::MonitorEvent) -> Req
             output_dir: dir,
             protocol,
         },
-    }
-}
-
-#[cfg(not(feature = "monitor"))]
-impl DevSerialServer {
-    async fn monitor_open_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
-        tokio::task::yield_now().await;
-        Err(rmcp::ErrorData::internal_error(
-            "this build has no GUI monitor (rebuild with --features monitor)".to_string(),
-            None,
-        ))
-    }
-
-    async fn monitor_close_impl(&self, _port_name: &str) -> Result<String, rmcp::ErrorData> {
-        tokio::task::yield_now().await;
-        Err(rmcp::ErrorData::internal_error(
-            "this build has no GUI monitor (rebuild with --features monitor)".to_string(),
-            None,
-        ))
     }
 }
 
@@ -1289,6 +1430,95 @@ mod tests {
             server,
             _ctrl: ctrl,
         }
+    }
+
+    #[tokio::test]
+    async fn tool_router_reflects_monitor_feature_and_tool_annotations() {
+        let server = DevSerialServer::with_port_manager(PortManagerHandle::new());
+        let names: Vec<_> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        #[cfg(feature = "monitor")]
+        {
+            assert!(names.iter().any(|name| name == "serial_monitor_open"));
+            assert!(names.iter().any(|name| name == "serial_monitor_close"));
+        }
+        #[cfg(not(feature = "monitor"))]
+        {
+            assert!(!names.iter().any(|name| name == "serial_monitor_open"));
+            assert!(!names.iter().any(|name| name == "serial_monitor_close"));
+        }
+
+        let read = server.tool_router.get("serial_read").unwrap();
+        assert_eq!(
+            read.annotations.as_ref().unwrap().read_only_hint,
+            Some(true)
+        );
+
+        let clear = server.tool_router.get("serial_clear").unwrap();
+        let clear_annotations = clear.annotations.as_ref().unwrap();
+        assert_eq!(clear_annotations.read_only_hint, Some(false));
+        assert_eq!(clear_annotations.destructive_hint, Some(true));
+        assert_eq!(clear_annotations.idempotent_hint, Some(false));
+
+        let open = server.tool_router.get("serial_open").unwrap();
+        assert_eq!(
+            open.annotations.as_ref().unwrap().idempotent_hint,
+            Some(true)
+        );
+
+        #[cfg(feature = "esp")]
+        {
+            assert_eq!(
+                server
+                    .tool_router
+                    .get("serial_esp_info")
+                    .unwrap()
+                    .annotations
+                    .as_ref()
+                    .unwrap()
+                    .read_only_hint,
+                Some(true)
+            );
+            assert_eq!(
+                server
+                    .tool_router
+                    .get("serial_esp_erase")
+                    .unwrap()
+                    .annotations
+                    .as_ref()
+                    .unwrap()
+                    .destructive_hint,
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn execution_failures_become_tool_results() {
+        let error = ToolExecutionError(bad_params("port was not found"));
+        let response = Result::<String, ToolExecutionError>::Err(error)
+            .into_call_tool_result()
+            .unwrap();
+        let rmcp::model::CallToolResponse::Complete(result) = response else {
+            panic!("expected a complete tool result");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(rmcp::model::ContentBlock::as_text)
+                .any(|text| text.text.contains("not found"))
+        );
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["isError"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     fn read_params(port: &str) -> ReadBufferParams {

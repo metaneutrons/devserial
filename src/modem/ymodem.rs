@@ -7,8 +7,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{
-    ACK, CAN, CRC_C, EOT, MAX_RETRIES, NAK, PAD, SOH, STX, TIMEOUT, crc16_ccitt,
-    read_byte_with_timeout,
+    ACK, CAN, CRC_C, EOT, MAX_RECEIVE_BYTES, MAX_RETRIES, NAK, PAD, SOH, STX, TIMEOUT,
+    check_receive_growth, crc16_ccitt, read_byte_with_timeout,
 };
 
 /// Send a file with filename and payload using YMODEM.
@@ -155,6 +155,11 @@ where
                 return Ok((String::new(), Vec::new()));
             }
             filename = name;
+            if size.is_some_and(|declared| declared > MAX_RECEIVE_BYTES) {
+                return Err(format!(
+                    "received file exceeds the {MAX_RECEIVE_BYTES}-byte limit"
+                ));
+            }
             expected_size = size;
             started = true;
             break;
@@ -215,6 +220,12 @@ where
             }
 
             if blk == expected_block {
+                // YMODEM pads the final block to 128 or 1024 bytes. Allow one
+                // block of protocol padding beyond the payload limit.
+                check_receive_growth(received.len(), data.len(), 1024)?;
+                received
+                    .try_reserve(data.len())
+                    .map_err(|e| format!("could not reserve receive buffer: {e}"))?;
                 received.extend_from_slice(data);
                 stream.write_all(&[ACK]).await.ok();
                 stream.flush().await.ok();
