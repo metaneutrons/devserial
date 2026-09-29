@@ -153,6 +153,7 @@ fn the_description_is_short_enough_for_homebrew() {
 
 #[test]
 fn the_cask_requires_macos_12_and_allows_sparkle_updates() {
+    let package_metadata = PACKAGE_METADATA.replace("\r\n", "\n");
     assert!(
         PACKAGE_METADATA
             .lines()
@@ -164,7 +165,7 @@ fn the_cask_requires_macos_12_and_allows_sparkle_updates() {
         "the cask must acknowledge the in-app Sparkle updater"
     );
     assert!(
-        PACKAGE_METADATA.contains(
+        package_metadata.contains(
             "  auto_updates true\n  depends_on macos: :monterey\n\n  app \"devserial.app\""
         ),
         "Homebrew requires auto_updates before depends_on with no blank line between them"
