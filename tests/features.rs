@@ -163,4 +163,10 @@ fn the_cask_requires_macos_12_and_allows_sparkle_updates() {
         PACKAGE_METADATA.contains("auto_updates true"),
         "the cask must acknowledge the in-app Sparkle updater"
     );
+    assert!(
+        PACKAGE_METADATA.contains(
+            "  auto_updates true\n  depends_on macos: :monterey\n\n  app \"devserial.app\""
+        ),
+        "Homebrew requires auto_updates before depends_on with no blank line between them"
+    );
 }
