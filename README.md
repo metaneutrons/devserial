@@ -123,6 +123,12 @@ workflow and signs the repository indices. devserial holds neither a signing key
 nor write access to the archive, so a compromised release workflow could not
 produce a validly signed index.
 
+After a release becomes stable, its workflow asks the archive to import the
+package and checks the public by-hash indexes and delivered `.deb` files for
+both architectures. A failed import is reported as a failed release workflow;
+the GitHub release remains available while the archive continues to serve the
+previous package version.
+
 The packages are built on Debian 12, so they install on Debian 12 and newer and
 on Ubuntu 22.04 and newer, for `amd64` and `arm64`. The GUI libraries are
 listed as `Recommends`: they are pulled in by default and can be left out with
@@ -178,7 +184,7 @@ Each payload additionally carries an SPDX software bill of materials as
 | Linux glibc | `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu` |
 | Linux musl | `aarch64-unknown-linux-musl`, `x86_64-unknown-linux-musl` |
 | Windows | `aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc` |
-| Debian package | `devserial_<version>_amd64.deb`, `devserial_<version>_arm64.deb` |
+| Debian package | `devserial_<version>-1_amd64.deb`, `devserial_<version>-1_arm64.deb` |
 
 These archives are not code-signed or notarized; the notarized application is
 the cask above. On macOS, install through Homebrew or clear the quarantine flag
