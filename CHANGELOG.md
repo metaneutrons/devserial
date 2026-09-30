@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.6](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.5...devserial-v0.2.6) (2026-09-29)
+
+
+### Bug Fixes
+
+* **release:** correct Homebrew cask stanza order ([bb200b4](https://github.com/metaneutrons/devserial/commit/bb200b4b67f919f98297360f2d001f672d252282))
+
 ## [0.2.5](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.4...devserial-v0.2.5) (2026-09-29)
 
 
