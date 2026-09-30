@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.7](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.6...devserial-v0.2.7) (2026-09-30)
+
+
+### Bug Fixes
+
+* identify Sparkle public readback requests ([0d92675](https://github.com/metaneutrons/devserial/commit/0d92675ce7e7dbe796a46650272f9b00d0abcddf))
+
 ## [0.2.6](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.5...devserial-v0.2.6) (2026-09-29)
 
 
