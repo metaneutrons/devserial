@@ -4,6 +4,32 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.7](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.6...devserial-v0.2.7) (2026-09-30)
+
+
+### Bug Fixes
+
+* identify Sparkle public readback requests ([0d92675](https://github.com/metaneutrons/devserial/commit/0d92675ce7e7dbe796a46650272f9b00d0abcddf))
+
+## [0.2.6](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.5...devserial-v0.2.6) (2026-09-29)
+
+
+### Bug Fixes
+
+* **release:** correct Homebrew cask stanza order ([bb200b4](https://github.com/metaneutrons/devserial/commit/bb200b4b67f919f98297360f2d001f672d252282))
+
+## [0.2.5](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.4...devserial-v0.2.5) (2026-09-29)
+
+
+### Features
+
+* **macos:** add signed Sparkle app updates ([20a4568](https://github.com/metaneutrons/devserial/commit/20a4568a597bf7e085a2406a72593b36943f284a))
+
+
+### Bug Fixes
+
+* **release:** dispatch and verify APT archive import ([2f8765e](https://github.com/metaneutrons/devserial/commit/2f8765ee82a0b89de09e3224c07259dcce8fcf4c))
+
 ## [0.2.4](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.3...devserial-v0.2.4) (2026-09-29)
 
 
