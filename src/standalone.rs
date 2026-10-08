@@ -264,6 +264,44 @@ impl std::fmt::Debug for RestRequest {
     }
 }
 
+/// Interpret a REST port field. An empty field means use the daemon config.
+///
+/// Shared by the window and the terminal monitor, so both take the same input.
+///
+/// # Errors
+/// Returns a sentence a person can act on when the text is not a port.
+#[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
+pub fn parse_rest_port(text: &str) -> Result<Option<u16>, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match text.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(Some(port)),
+        _ => Err("Enter a port from 1 to 65535, or leave it blank for the configured port."),
+    }
+}
+
+/// Interpret a REST address field. An empty field means use the daemon config.
+///
+/// An IP address and nothing else, because the daemon refuses a name: a name
+/// is not loopback however much it looks like one, and resolving it would let
+/// `localhost.attacker.example` decide whether a token is needed. Checked in
+/// the surfaces as well so the reason shows before anything is sent.
+///
+/// # Errors
+/// Returns a sentence a person can act on when the text is not an IP address.
+#[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
+pub fn parse_rest_bind(text: &str) -> Result<Option<std::net::IpAddr>, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<std::net::IpAddr>().map(Some).map_err(|_| {
+        "Enter an IP address such as 127.0.0.1 or 0.0.0.0, or leave it blank for the configured one."
+    })
+}
+
 /// Shows and changes the HTTP interface through the daemon.
 #[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
 pub type RestControlFn =

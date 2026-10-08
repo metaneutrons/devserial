@@ -203,6 +203,9 @@ struct AppState {
     /// What the daemon last said about the HTTP interface.
     #[cfg(feature = "rest")]
     rest_state: Option<crate::protocol::RestState>,
+    /// What is being typed on the HTTP screen.
+    #[cfg(feature = "rest")]
+    rest_form: RestForm,
     /// What the reader reports about the hardware.
     ///
     /// Without it the bar could only show what the user had asked for, and an
@@ -212,6 +215,73 @@ struct AppState {
     hex_view: bool,
     /// Semantic colours in the capture buffer, independent of stored payloads.
     color_enabled: bool,
+}
+
+/// Which field of the HTTP screen takes the keys.
+#[cfg(feature = "rest")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RestField {
+    Address,
+    #[default]
+    Port,
+    Token,
+}
+
+#[cfg(feature = "rest")]
+impl RestField {
+    const fn next(self) -> Self {
+        match self {
+            Self::Address => Self::Port,
+            Self::Port => Self::Token,
+            Self::Token => Self::Address,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::Address => Self::Token,
+            Self::Port => Self::Address,
+            Self::Token => Self::Port,
+        }
+    }
+}
+
+/// The three fields of the HTTP screen, the same three the window has.
+///
+/// Its own fields rather than the shared input line, because the screen edits
+/// three values and only one of them may be shown as typed. A blank field
+/// means the configured value. The token is never filled from the daemon and
+/// is cleared once a start succeeds or the screen closes.
+#[cfg(feature = "rest")]
+#[derive(Default)]
+struct RestForm {
+    field: RestField,
+    bind: String,
+    port: String,
+    token: String,
+}
+
+#[cfg(feature = "rest")]
+impl RestForm {
+    const fn active(&mut self) -> &mut String {
+        match self.field {
+            RestField::Address => &mut self.bind,
+            RestField::Port => &mut self.port,
+            RestField::Token => &mut self.token,
+        }
+    }
+
+    /// The request the fields describe, or why they do not describe one.
+    fn request(&self) -> Result<crate::standalone::RestRequest, &'static str> {
+        let bind = crate::standalone::parse_rest_bind(&self.bind)?;
+        let port = crate::standalone::parse_rest_port(&self.port)?;
+        let token = self.token.trim();
+        Ok(crate::standalone::RestRequest::Enable {
+            bind: bind.map(|ip| ip.to_string()),
+            port,
+            token: (!token.is_empty()).then(|| token.to_string()),
+        })
+    }
 }
 
 impl AppState {
@@ -284,6 +354,8 @@ impl AppState {
             rest: None,
             #[cfg(feature = "rest")]
             rest_state: None,
+            #[cfg(feature = "rest")]
+            rest_form: RestForm::default(),
             link: None,
             lines: std::collections::VecDeque::new(),
             last_id: 0,
@@ -621,11 +693,13 @@ fn run_app(
                     // The state is fetched on open rather than kept, because
                     // the command line and the window can change it too.
                     state.refresh_rest();
-                    state.input = state
-                        .rest_state
-                        .as_ref()
-                        .map(|rest| rest.port.to_string())
-                        .unwrap_or_default();
+                    state.rest_form = RestForm::default();
+                    if let Some(rest) = state.rest_state.as_ref() {
+                        state.rest_form.bind.clone_from(&rest.bind);
+                        state.rest_form.port = rest.port.to_string();
+                    }
+                } else {
+                    state.rest_form.token.clear();
                 }
                 continue;
             }
@@ -674,6 +748,8 @@ fn run_app(
                 }
                 state.input_mode = InputMode::Normal;
                 state.input.clear();
+                #[cfg(feature = "rest")]
+                state.rest_form.token.clear();
                 continue;
             }
             _ => {}
@@ -704,6 +780,21 @@ fn run_app(
             } else {
                 state.transfer_proto.next()
             };
+            continue;
+        }
+
+        #[cfg(feature = "rest")]
+        if state.input_mode == InputMode::Rest {
+            match key.code {
+                KeyCode::Tab => state.rest_form.field = state.rest_form.field.next(),
+                KeyCode::BackTab => state.rest_form.field = state.rest_form.field.previous(),
+                KeyCode::Enter => start_rest(&mut state),
+                KeyCode::Char(c) => state.rest_form.active().push(c),
+                KeyCode::Backspace => {
+                    state.rest_form.active().pop();
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -1074,33 +1165,7 @@ fn handle_enter(
             }
         }
         #[cfg(feature = "rest")]
-        InputMode::Rest => {
-            let port = state.input.trim().parse::<u16>().ok();
-            if !state.input.trim().is_empty() && port.is_none() {
-                state.set_status("that is not a port number");
-                return;
-            }
-            let outcome = state.rest.as_ref().map_or_else(
-                || Err("no daemon connection".to_string()),
-                |rest| {
-                    rest(&crate::standalone::RestRequest::Enable {
-                        bind: None,
-                        port,
-                        token: None,
-                    })
-                },
-            );
-            match outcome {
-                Ok(rest) => {
-                    state.set_status(format!("REST listening on {}", rest.url()));
-                    state.rest_state = Some(rest);
-                }
-                Err(e) => {
-                    state.set_status(format!("REST did not start: {e}"));
-                    state.refresh_rest();
-                }
-            }
-        }
+        InputMode::Rest => start_rest(state),
         InputMode::RecvFile => {
             let dir = if state.input.is_empty() {
                 ".".to_string()
@@ -1239,10 +1304,20 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         ),
         InputMode::Export => ("Export to: ", export_title(state)),
         #[cfg(feature = "rest")]
-        InputMode::Rest => ("Port: ", rest_title(state)),
+        InputMode::Rest => ("", rest_title(state)),
         #[cfg(feature = "esp")]
         InputMode::Flash => ("Firmware: ", flash_title(state)),
     };
+
+    #[cfg(feature = "rest")]
+    if state.input_mode == InputMode::Rest {
+        frame.render_widget(
+            Paragraph::new(rest_form_line(&state.rest_form))
+                .block(Block::default().borders(Borders::TOP).title(title)),
+            area,
+        );
+        return;
+    }
 
     frame.render_widget(
         Paragraph::new(format!("{prompt}{}", state.input))
@@ -1319,6 +1394,77 @@ fn export_title(state: &AppState) -> String {
     )
 }
 
+/// Start the HTTP interface with what the screen's fields say.
+#[cfg(feature = "rest")]
+fn start_rest(state: &mut AppState) {
+    let request = match state.rest_form.request() {
+        Ok(request) => request,
+        Err(reason) => {
+            state.set_status(reason);
+            return;
+        }
+    };
+    let outcome = state.rest.as_ref().map_or_else(
+        || Err("no daemon connection".to_string()),
+        |rest| rest(&request),
+    );
+    match outcome {
+        Ok(rest) => {
+            state.set_status(format!("REST listening on {}", rest.url()));
+            state.rest_form.token.clear();
+            state.rest_state = Some(rest);
+        }
+        Err(e) => {
+            state.set_status(format!("REST did not start: {e}"));
+            state.refresh_rest();
+        }
+    }
+}
+
+/// The HTTP screen's input line: three fields, the active one highlighted.
+///
+/// The token shows as one dot per character, so it does not land on screen,
+/// in a screenshot or in a recording of the terminal.
+#[cfg(feature = "rest")]
+fn rest_form_line(form: &RestForm) -> Line<'static> {
+    let field = |label: &str, value: String, active: bool| {
+        let style = if active {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let shown = if value.is_empty() && !active {
+            "(configured)".to_string()
+        } else {
+            value
+        };
+        vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(shown, style),
+            Span::raw("   "),
+        ]
+    };
+    let mut spans = field(
+        "Address",
+        form.bind.clone(),
+        form.field == RestField::Address,
+    );
+    spans.extend(field(
+        "Port",
+        form.port.clone(),
+        form.field == RestField::Port,
+    ));
+    spans.extend(field(
+        "Token",
+        "\u{2022}".repeat(form.token.chars().count()),
+        form.field == RestField::Token,
+    ));
+    Line::from(spans)
+}
+
 /// What the HTTP interface screen says above the input line.
 ///
 /// The state comes from the daemon, so another surface or the command line
@@ -1339,10 +1485,10 @@ fn rest_title(state: &AppState) -> String {
         ""
     };
     rest.reason.as_deref().map_or_else(
-        || format!(" REST {head}{token} | Enter starts, Ctrl+K stops, Esc closes "),
+        || format!(" REST {head}{token} | Tab next field, Enter starts, Ctrl+K stops, Esc closes "),
         |reason| {
             format!(
-                " REST {head}{token} | last attempt: {reason} | Enter starts, Ctrl+K stops, Esc closes "
+                " REST {head}{token} | last attempt: {reason} | Tab next field, Enter starts, Ctrl+K stops, Esc closes "
             )
         },
     )
@@ -2290,5 +2436,99 @@ mod tests {
                 export_format_label(format)
             );
         }
+    }
+
+    /// The HTTP screen sends what its three fields say, blank meaning the
+    /// configured value, and refuses what the window refuses.
+    #[cfg(feature = "rest")]
+    #[test]
+    fn the_rest_form_builds_the_request_its_fields_describe() {
+        use crate::standalone::RestRequest;
+
+        let blank = RestForm::default();
+        assert_eq!(
+            blank.request(),
+            Ok(RestRequest::Enable {
+                bind: None,
+                port: None,
+                token: None,
+            })
+        );
+
+        let network = RestForm {
+            field: RestField::Token,
+            bind: " 0.0.0.0 ".to_string(),
+            port: "9601".to_string(),
+            token: " s3cret ".to_string(),
+        };
+        assert_eq!(
+            network.request(),
+            Ok(RestRequest::Enable {
+                bind: Some("0.0.0.0".to_string()),
+                port: Some(9601),
+                token: Some("s3cret".to_string()),
+            })
+        );
+
+        let named = RestForm {
+            bind: "localhost".to_string(),
+            ..RestForm::default()
+        };
+        assert!(named.request().is_err(), "a name must be refused");
+        let zero = RestForm {
+            port: "0".to_string(),
+            ..RestForm::default()
+        };
+        assert!(zero.request().is_err(), "port 0 must be refused");
+    }
+
+    /// Tab walks the three fields in a ring, Shift+Tab walks it back, and
+    /// typing lands in the field that is active.
+    #[cfg(feature = "rest")]
+    #[test]
+    fn tab_moves_between_the_rest_fields() {
+        let mut form = RestForm::default();
+        assert_eq!(form.field, RestField::Port, "the screen opens on the port");
+        form.active().push('1');
+        form.field = form.field.next();
+        assert_eq!(form.field, RestField::Token);
+        form.active().push('x');
+        form.field = form.field.next();
+        assert_eq!(form.field, RestField::Address);
+        form.field = form.field.previous().previous();
+        assert_eq!(form.field, RestField::Port);
+        assert_eq!((form.port.as_str(), form.token.as_str()), ("1", "x"));
+    }
+
+    /// The token is drawn as dots, so it lands neither on screen nor in a
+    /// recording of the terminal. Read from the rendered buffer, which is what
+    /// the terminal receives.
+    #[cfg(feature = "rest")]
+    #[test]
+    fn the_token_is_not_drawn() {
+        let form = RestForm {
+            field: RestField::Address,
+            bind: "0.0.0.0".to_string(),
+            port: "9600".to_string(),
+            token: "s3cret".to_string(),
+        };
+        let backend = ratatui::backend::TestBackend::new(80, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(rest_form_line(&form)), frame.area()))
+            .expect("draw");
+        let drawn: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!drawn.contains("s3cret"), "{drawn}");
+        assert!(drawn.contains("\u{2022}".repeat(6).as_str()), "{drawn}");
+        assert!(
+            drawn.contains("0.0.0.0") && drawn.contains("9600"),
+            "{drawn}"
+        );
     }
 }

@@ -432,11 +432,12 @@ monitor, and a clickable **REST** status entry in each window's bottom bar. It
 shows `REST off` when stopped and the listening port when active; click it to
 open the separate REST API window.
 
-That window sets address, port and token for the next start, the way `--bind`,
-`--port` and `--token-file` do on the command line. A blank field means the
+That window and the `F7` screen set address, port and token for the next
+start, the way `--bind`, `--port` and `--token-file` do on the command line. On
+the `F7` screen, Tab moves between the three fields and the token shows as dots. A blank field means the
 configured value. The address has to be an IP address, because the daemon
 refuses a name. The token field is masked, never filled from the daemon, and
-cleared after a successful start or when the window closes. To make a network
+cleared after a successful start or when the window or screen closes. To make a network
 bind permanent, set `bind` and `token` under `[rest]` in the configuration.
 
 **Port 9600, on `127.0.0.1`.** The number is the one a serial developer recalls

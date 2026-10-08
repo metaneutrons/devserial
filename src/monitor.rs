@@ -63,36 +63,6 @@ fn rest_indicator_label(state: Option<&crate::protocol::RestState>, unavailable:
     }
 }
 
-/// Interpret the REST port field. An empty field means use the daemon config.
-#[cfg(feature = "rest")]
-fn parse_rest_port(text: &str) -> Result<Option<u16>, &'static str> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    match text.parse::<u16>() {
-        Ok(port) if port != 0 => Ok(Some(port)),
-        _ => Err("Enter a port from 1 to 65535, or leave it blank for the configured port."),
-    }
-}
-
-/// Interpret the REST address field. An empty field means use the daemon config.
-///
-/// An IP address and nothing else, because the daemon refuses a name: a name
-/// is not loopback however much it looks like one, and resolving it would let
-/// `localhost.attacker.example` decide whether a token is needed. Checked here
-/// as well so the reason shows before anything is sent.
-#[cfg(feature = "rest")]
-fn parse_rest_bind(text: &str) -> Result<Option<std::net::IpAddr>, &'static str> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    text.parse::<std::net::IpAddr>().map(Some).map_err(|_| {
-        "Enter an IP address such as 127.0.0.1 or 0.0.0.0, or leave it blank for the configured one."
-    })
-}
-
 /// Everything the firmware dialog needs to keep between frames.
 ///
 /// One struct rather than a dozen fields on the window, so the whole feature
@@ -3115,7 +3085,7 @@ impl PortMonitorState {
                 let token_required = if listening {
                     self.rest_state.as_ref().map(|rest| rest.token_required)
                 } else {
-                    match parse_rest_bind(&self.rest_bind) {
+                    match crate::standalone::parse_rest_bind(&self.rest_bind) {
                         Ok(Some(ip)) => {
                             Some(!ip.is_loopback() || !self.rest_token.trim().is_empty())
                         }
@@ -3155,8 +3125,8 @@ impl PortMonitorState {
                         }
                     } else if state_available && ui.button("▶ Start").clicked() {
                         match (
-                            parse_rest_bind(&self.rest_bind),
-                            parse_rest_port(&self.rest_port),
+                            crate::standalone::parse_rest_bind(&self.rest_bind),
+                            crate::standalone::parse_rest_port(&self.rest_port),
                         ) {
                             (Ok(bind), Ok(port)) => {
                                 self.rest_dialog_error = None;
@@ -4450,10 +4420,9 @@ mod marker_tests {
 
 #[cfg(all(test, feature = "rest"))]
 mod rest_status_tests {
-    use super::{
-        PortMonitorState, RestOperation, parse_rest_bind, parse_rest_port, rest_indicator_label,
-    };
+    use super::{PortMonitorState, RestOperation, rest_indicator_label};
     use crate::protocol::RestState;
+    use crate::standalone::{parse_rest_bind, parse_rest_port};
 
     fn state(listening: bool, port: u16) -> RestState {
         RestState {
