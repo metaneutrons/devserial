@@ -1082,7 +1082,13 @@ fn handle_enter(
             }
             let outcome = state.rest.as_ref().map_or_else(
                 || Err("no daemon connection".to_string()),
-                |rest| rest(&crate::standalone::RestRequest::Enable { bind: None, port }),
+                |rest| {
+                    rest(&crate::standalone::RestRequest::Enable {
+                        bind: None,
+                        port,
+                        token: None,
+                    })
+                },
             );
             match outcome {
                 Ok(rest) => {

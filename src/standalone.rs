@@ -231,7 +231,7 @@ pub type TransferFn = Arc<
 
 /// What a surface asks of the HTTP interface.
 #[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RestRequest {
     /// Report the state without changing it.
     Status,
@@ -239,9 +239,29 @@ pub enum RestRequest {
     Enable {
         bind: Option<String>,
         port: Option<u16>,
+        /// Bearer token for this run. `None` uses the configured one.
+        token: Option<String>,
     },
     /// Stop listening.
     Disable,
+}
+
+/// Written by hand so a token typed into a window cannot reach a log line
+/// through `{:?}`. Only whether one was given is shown.
+#[cfg(all(feature = "rest", any(feature = "monitor", feature = "tui")))]
+impl std::fmt::Debug for RestRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status => f.write_str("Status"),
+            Self::Enable { bind, port, token } => f
+                .debug_struct("Enable")
+                .field("bind", bind)
+                .field("port", port)
+                .field("token", &token.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::Disable => f.write_str("Disable"),
+        }
+    }
 }
 
 /// Shows and changes the HTTP interface through the daemon.
@@ -350,10 +370,10 @@ fn daemon_rest(client: &Arc<IpcClient>, runtime: &tokio::runtime::Handle) -> Res
     Arc::new(move |request: &RestRequest| {
         let payload = match request {
             RestRequest::Status => RequestPayload::RestStatus,
-            RestRequest::Enable { bind, port } => RequestPayload::RestEnable {
+            RestRequest::Enable { bind, port, token } => RequestPayload::RestEnable {
                 bind: bind.clone(),
                 port: *port,
-                token: None,
+                token: token.clone(),
             },
             RestRequest::Disable => RequestPayload::RestDisable,
         };
@@ -913,6 +933,56 @@ mod tests {
                 .contains(&FakeDaemon::PORT.to_string()),
             "ending the session closed the port; the capture would stop with it"
         );
+    }
+
+    /// A token typed into a surface reaches the daemon's listener.
+    ///
+    /// Through the same closure the window and the terminal monitor use, to a
+    /// real daemon on a temporary socket. Loopback rather than `0.0.0.0`, so
+    /// the test opens nothing beyond this machine: loopback needs no token, so
+    /// a listener that demands one can only have got it from this request.
+    #[cfg(all(unix, feature = "testutil", feature = "rest"))]
+    #[test]
+    fn a_token_from_a_surface_reaches_the_listener() {
+        use std::io::{Read as _, Write as _};
+
+        let daemon = FakeDaemon::start();
+        let client = Arc::new(IpcClient::new(daemon.socket.clone()));
+        let rest = daemon_rest(&client, daemon.runtime.handle());
+
+        let state = rest(&RestRequest::Enable {
+            bind: Some("127.0.0.1".to_string()),
+            port: Some(0),
+            token: Some("typed-in-the-window".to_string()),
+        })
+        .expect("starting the listener");
+        assert!(state.listening, "{state:?}");
+        assert!(state.token_required, "the token did not arrive: {state:?}");
+
+        let ask = |token: Option<&str>| {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", state.port)).unwrap();
+            let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
+            write!(
+                stream,
+                "GET /v1/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{auth}Connection: close\r\n\r\n",
+                state.port
+            )
+            .unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut answer = String::new();
+            drop(stream.read_to_string(&mut answer));
+            answer.lines().next().unwrap_or_default().to_string()
+        };
+        assert!(ask(None).contains("401"), "{}", ask(None));
+        assert!(
+            ask(Some("typed-in-the-window")).contains("200"),
+            "{}",
+            ask(Some("typed-in-the-window"))
+        );
+
+        rest(&RestRequest::Disable).expect("stopping the listener");
     }
 
     #[test]

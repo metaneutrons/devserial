@@ -76,6 +76,23 @@ fn parse_rest_port(text: &str) -> Result<Option<u16>, &'static str> {
     }
 }
 
+/// Interpret the REST address field. An empty field means use the daemon config.
+///
+/// An IP address and nothing else, because the daemon refuses a name: a name
+/// is not loopback however much it looks like one, and resolving it would let
+/// `localhost.attacker.example` decide whether a token is needed. Checked here
+/// as well so the reason shows before anything is sent.
+#[cfg(feature = "rest")]
+fn parse_rest_bind(text: &str) -> Result<Option<std::net::IpAddr>, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<std::net::IpAddr>().map(Some).map_err(|_| {
+        "Enter an IP address such as 127.0.0.1 or 0.0.0.0, or leave it blank for the configured one."
+    })
+}
+
 /// Everything the firmware dialog needs to keep between frames.
 ///
 /// One struct rather than a dozen fields on the window, so the whole feature
@@ -1285,12 +1302,21 @@ pub struct PortMonitorState {
     /// Port validation and Start/Stop errors shown inside the REST API dialog.
     #[cfg(feature = "rest")]
     rest_dialog_error: Option<String>,
+    /// The address typed into the window, before it is applied.
+    #[cfg(feature = "rest")]
+    rest_bind: String,
     /// The port typed into the window, before it is applied.
     #[cfg(feature = "rest")]
     rest_port: String,
-    /// Keeps periodic status updates from replacing a port being edited.
+    /// A token typed for the next start. Never filled from the daemon, which
+    /// does not hand its token out, and cleared once a start succeeds or the
+    /// dialog closes, so it is held no longer than it is needed.
     #[cfg(feature = "rest")]
-    rest_port_edited: bool,
+    rest_token: String,
+    /// Keeps periodic status updates from replacing an address or port being
+    /// edited.
+    #[cfg(feature = "rest")]
+    rest_fields_edited: bool,
     pub show_settings_dialog: bool,
     /// Live line settings; the single place this window keeps them.
     pub config: PortConfig,
@@ -1395,9 +1421,13 @@ impl PortMonitorState {
             #[cfg(feature = "rest")]
             rest_dialog_error: None,
             #[cfg(feature = "rest")]
+            rest_bind: String::new(),
+            #[cfg(feature = "rest")]
             rest_port: String::new(),
             #[cfg(feature = "rest")]
-            rest_port_edited: false,
+            rest_token: String::new(),
+            #[cfg(feature = "rest")]
+            rest_fields_edited: false,
             show_settings_dialog: false,
             settings_custom_baud: config.baudrate.to_string(),
             config,
@@ -2793,7 +2823,8 @@ impl PortMonitorState {
                         }
                         RestOperation::Start | RestOperation::Stop => match outcome {
                             Ok(state) => {
-                                self.rest_port_edited = false;
+                                self.rest_fields_edited = false;
+                                self.rest_token.clear();
                                 self.set_rest_state(state);
                                 self.rest_dialog_error = None;
                                 self.rest_next_sync =
@@ -2883,7 +2914,8 @@ impl PortMonitorState {
     /// Apply a state returned by either a background query or a user action.
     #[cfg(feature = "rest")]
     fn set_rest_state(&mut self, state: crate::protocol::RestState) {
-        if !self.rest_port_edited {
+        if !self.rest_fields_edited {
+            self.rest_bind.clone_from(&state.bind);
             self.rest_port = state.port.to_string();
         }
         self.rest_state = Some(state);
@@ -3020,37 +3052,83 @@ impl PortMonitorState {
                 ui.separator();
                 ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Port:").strong());
-                    // Frozen while it listens: changing the port of a running
-                    // listener means restarting it, and the button below says
-                    // so rather than doing it silently.
-                    let response = ui.add_enabled(
-                        !listening && state_available && !pending_action,
-                        egui::TextEdit::singleline(&mut self.rest_port).desired_width(90.0),
+                // Frozen while it listens: moving a running listener means
+                // restarting it, and the note below says so rather than doing
+                // it silently.
+                let editable = !listening && state_available && !pending_action;
+                let mut edited = false;
+                egui::Grid::new("rest_fields")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Address:").strong());
+                        edited |= ui
+                            .add_enabled(
+                                editable,
+                                egui::TextEdit::singleline(&mut self.rest_bind)
+                                    .hint_text("127.0.0.1")
+                                    .desired_width(160.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("Port:").strong());
+                        edited |= ui
+                            .add_enabled(
+                                editable,
+                                egui::TextEdit::singleline(&mut self.rest_port).desired_width(90.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("Token:").strong());
+                        edited |= ui
+                            .add_enabled(
+                                editable,
+                                egui::TextEdit::singleline(&mut self.rest_token)
+                                    .password(true)
+                                    .hint_text("from the configuration")
+                                    .desired_width(160.0),
+                            )
+                            .changed();
+                        ui.end_row();
+                    });
+                if edited {
+                    self.rest_fields_edited = true;
+                    self.rest_dialog_error = None;
+                }
+                if listening {
+                    ui.label(
+                        egui::RichText::new("Stop first to change address, port or token.")
+                            .color(egui::Color32::from_rgb(150, 150, 150))
+                            .size(11.0),
                     );
-                    if response.changed() {
-                        self.rest_port_edited = true;
-                        self.rest_dialog_error = None;
-                    }
-                    if listening {
-                        ui.label(
-                            egui::RichText::new("stop first to change it")
-                                .color(egui::Color32::from_rgb(150, 150, 150))
-                                .size(11.0),
-                        );
-                    }
-                });
+                }
 
                 if let Some(error) = &self.rest_dialog_error {
                     ui.colored_label(egui::Color32::from_rgb(255, 90, 90), error);
                 }
 
-                if let Some(rest) = self.rest_state.as_ref() {
+                // While it listens the state says what the listener requires.
+                // Before it starts, the address being typed decides, because
+                // that is what the next start will ask for.
+                let token_required = if listening {
+                    self.rest_state.as_ref().map(|rest| rest.token_required)
+                } else {
+                    match parse_rest_bind(&self.rest_bind) {
+                        Ok(Some(ip)) => {
+                            Some(!ip.is_loopback() || !self.rest_token.trim().is_empty())
+                        }
+                        Ok(None) => self.rest_state.as_ref().map(|rest| rest.token_required),
+                        Err(_) => None,
+                    }
+                };
+                if let Some(required) = token_required {
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(if rest.token_required {
-                            "A token is required: this bind leaves the machine."
+                        egui::RichText::new(if required {
+                            "A token is required: callers send it as a bearer token. \
+                             Reach the interface by IP address; a host name is refused."
                         } else {
                             "No token on loopback. Any local process can reach it."
                         })
@@ -3076,15 +3154,22 @@ impl PortMonitorState {
                             request = Some(crate::standalone::RestRequest::Disable);
                         }
                     } else if state_available && ui.button("▶ Start").clicked() {
-                        match parse_rest_port(&self.rest_port) {
-                            Ok(port) => {
+                        match (
+                            parse_rest_bind(&self.rest_bind),
+                            parse_rest_port(&self.rest_port),
+                        ) {
+                            (Ok(bind), Ok(port)) => {
                                 self.rest_dialog_error = None;
+                                let token = self.rest_token.trim();
                                 request = Some(crate::standalone::RestRequest::Enable {
-                                    bind: None,
+                                    bind: bind.map(|ip| ip.to_string()),
                                     port,
+                                    token: (!token.is_empty()).then(|| token.to_string()),
                                 });
                             }
-                            Err(error) => self.rest_dialog_error = Some(error.to_string()),
+                            (Err(error), _) | (_, Err(error)) => {
+                                self.rest_dialog_error = Some(error.to_string());
+                            }
                         }
                     }
                     if ui.button("Close").clicked() {
@@ -3098,6 +3183,9 @@ impl PortMonitorState {
         }
 
         self.show_rest_dialog = is_open && !close_requested;
+        if !self.show_rest_dialog {
+            self.rest_token.clear();
+        }
     }
 
     fn render_about_dialog(
@@ -4362,7 +4450,9 @@ mod marker_tests {
 
 #[cfg(all(test, feature = "rest"))]
 mod rest_status_tests {
-    use super::{PortMonitorState, RestOperation, parse_rest_port, rest_indicator_label};
+    use super::{
+        PortMonitorState, RestOperation, parse_rest_bind, parse_rest_port, rest_indicator_label,
+    };
     use crate::protocol::RestState;
 
     fn state(listening: bool, port: u16) -> RestState {
@@ -4419,6 +4509,39 @@ mod rest_status_tests {
         for text in ["nope", "0", "65536", "-1"] {
             assert!(parse_rest_port(text).is_err(), "'{text}' must be rejected");
         }
+    }
+
+    /// An empty address means the configured one, and only an IP literal is
+    /// taken. A name is refused here for the reason the daemon refuses it:
+    /// resolving it would let a lookup decide whether a token is needed.
+    #[test]
+    fn the_address_field_takes_an_ip_and_nothing_else() {
+        assert_eq!(parse_rest_bind("  "), Ok(None));
+        assert_eq!(
+            parse_rest_bind(" 0.0.0.0 "),
+            Ok(Some(std::net::Ipv4Addr::UNSPECIFIED.into()))
+        );
+        assert_eq!(
+            parse_rest_bind("::1"),
+            Ok(Some(std::net::Ipv6Addr::LOCALHOST.into()))
+        );
+        for text in ["localhost", "devbox.local", "192.168.1", "127.0.0.1:9600"] {
+            assert!(parse_rest_bind(text).is_err(), "'{text}' must be rejected");
+        }
+    }
+
+    /// A token typed into the window does not reach a log through `{:?}`.
+    #[test]
+    fn a_rest_request_does_not_print_its_token() {
+        let request = crate::standalone::RestRequest::Enable {
+            bind: Some("0.0.0.0".to_string()),
+            port: Some(9600),
+            token: Some("s3cret-token".to_string()),
+        };
+        let printed = format!("{request:?}");
+        assert!(!printed.contains("s3cret-token"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(printed.contains("0.0.0.0"), "{printed}");
     }
 
     #[test]
