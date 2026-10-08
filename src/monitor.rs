@@ -4199,7 +4199,7 @@ mod flash_tests {
     #[test]
     fn an_erase_needs_no_image() {
         let (path, baud) = check_flash_request("", "", true).expect("erase needs no image");
-        assert!(path.is_empty());
+        assert!(path.is_empty(), "{path:?}");
         assert_eq!(baud, None);
     }
 

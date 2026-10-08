@@ -276,7 +276,7 @@ mod tests {
     fn a_newline_ends_a_line() {
         let (lines, rest) = lines_of(&[b"one\ntwo\n"]);
         assert_eq!(lines, ["one", "two"]);
-        assert!(rest.is_empty());
+        assert!(rest.is_empty(), "{rest:?}");
     }
 
     #[test]

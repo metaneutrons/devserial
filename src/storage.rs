@@ -651,7 +651,7 @@ mod tests {
         s.insert_lines(&[(1000, "only")]).unwrap();
 
         let lines = s.read_lines(100, 50).unwrap();
-        assert!(lines.is_empty());
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     #[test]
@@ -783,7 +783,8 @@ mod tests {
         let page = s.read_lines_since(3, 2000, 10).unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].payload, "second");
-        assert!(s.read_lines_since(4, 2000, 10).unwrap().is_empty());
+        let after_the_end = s.read_lines_since(4, 2000, 10).unwrap();
+        assert!(after_the_end.is_empty(), "{after_the_end:?}");
     }
 
     #[test]
