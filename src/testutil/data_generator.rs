@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn test_boot_sequence_not_empty() {
         let lines = TestDataGenerator::boot_sequence();
-        assert!(!lines.is_empty());
+        assert!(!lines.is_empty(), "the generator produced no lines");
         assert!(lines[0].contains("Bootloader"));
     }
 

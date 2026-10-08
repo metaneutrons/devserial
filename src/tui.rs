@@ -1983,7 +1983,7 @@ mod tests {
     fn a_filter_that_matches_nothing_shows_nothing() {
         let mut state = with_lines(&["boot", "ready"]);
         state.filter = "nowhere".to_string();
-        assert!(state.shown().is_empty());
+        assert!(state.shown().is_empty(), "{:?}", state.shown());
     }
 
     #[test]
@@ -2002,7 +2002,7 @@ mod tests {
         state.lines.clear();
         state.scroll_offset = 0;
         state.auto_follow = true;
-        assert!(state.shown().is_empty());
+        assert!(state.shown().is_empty(), "{:?}", state.shown());
         assert_eq!(state.scroll_offset, 0);
         assert!(state.auto_follow);
     }

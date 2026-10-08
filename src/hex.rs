@@ -105,8 +105,10 @@ mod tests {
 
     #[test]
     fn empty_input_is_empty_output() {
-        assert!(decode("").unwrap().is_empty());
-        assert!(decode("0x").unwrap().is_empty());
+        let bare = decode("").unwrap();
+        assert!(bare.is_empty(), "{bare:?}");
+        let prefix_only = decode("0x").unwrap();
+        assert!(prefix_only.is_empty(), "{prefix_only:?}");
     }
 
     #[test]

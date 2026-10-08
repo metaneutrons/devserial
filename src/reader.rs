@@ -502,7 +502,7 @@ mod tests {
 
         let lines = storage.lock().unwrap().read_lines(1, 10).unwrap();
         assert_eq!(lines.len(), 1);
-        assert!(!lines[0].payload.is_empty());
+        assert!(!lines[0].payload.is_empty(), "{:?}", lines[0]);
     }
 
     #[tokio::test]
