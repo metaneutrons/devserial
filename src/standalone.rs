@@ -29,6 +29,8 @@ use crate::config::PortConfig;
 #[cfg(any(feature = "monitor", feature = "tui"))]
 use crate::ipc::IpcClient;
 #[cfg(any(feature = "monitor", feature = "tui"))]
+use crate::protocol::LeaseKind;
+#[cfg(any(feature = "monitor", feature = "tui"))]
 use crate::protocol::{RequestPayload, ResponsePayload};
 #[cfg(any(feature = "monitor", feature = "tui"))]
 use crate::reader::ConnectionState;
@@ -71,6 +73,9 @@ pub struct SessionKeepalive {
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     link: tokio::sync::watch::Receiver<ConnectionState>,
     poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Keeps the daemon from stopping through idleness while the session
+    /// lives (#114). Released when the session ends.
+    _lease: crate::ipc::LeaseKeeper,
 }
 
 #[cfg(any(feature = "monitor", feature = "tui"))]
@@ -79,11 +84,13 @@ impl SessionKeepalive {
         runtime: tokio::runtime::Runtime,
         link: tokio::sync::watch::Receiver<ConnectionState>,
         poller: tokio::task::JoinHandle<()>,
+        lease: crate::ipc::LeaseKeeper,
     ) -> Arc<Self> {
         Arc::new(Self {
             runtime: Mutex::new(Some(runtime)),
             link,
             poller: Mutex::new(Some(poller)),
+            _lease: lease,
         })
     }
 
@@ -493,6 +500,7 @@ fn attach_session(
     data_dir: &Path,
     socket: Option<std::path::PathBuf>,
     config_path: Option<&Path>,
+    kind: crate::protocol::LeaseKind,
 ) -> Result<SessionParts, String> {
     crate::paths::create_private_dir(data_dir)
         .map_err(|e| format!("failed to create data directory: {e}"))?;
@@ -557,6 +565,7 @@ fn attach_session(
     ));
 
     let (link, poller) = spawn_link_poller(port, &client, &handle, state);
+    let lease = crate::ipc::LeaseKeeper::start((*client).clone(), kind);
 
     Ok(SessionParts {
         #[cfg(feature = "monitor")]
@@ -564,7 +573,7 @@ fn attach_session(
         #[cfg(feature = "tui")]
         shared_storage,
         client,
-        keepalive: SessionKeepalive::new(runtime, link, poller),
+        keepalive: SessionKeepalive::new(runtime, link, poller, lease),
         history,
     })
 }
@@ -578,7 +587,14 @@ pub fn open_standalone_session(
     port: &str,
     config: &PortConfig,
 ) -> Result<crate::monitor::PortMonitorState, String> {
-    let parts = attach_session(port, config, &gui_data_dir(), None, None)?;
+    let parts = attach_session(
+        port,
+        config,
+        &gui_data_dir(),
+        None,
+        None,
+        crate::protocol::LeaseKind::Gui,
+    )?;
     let runtime = parts
         .keepalive
         .handle()
@@ -669,8 +685,8 @@ pub fn run_monitor_standalone(
         Err(e) => tracing::warn!(error = %e, "could not reach the running GUI instance"),
     }
 
-    let parts =
-        attach_session(port, config, &data_dir, socket, config_path).map_err(CliError::msg)?;
+    let parts = attach_session(port, config, &data_dir, socket, config_path, LeaseKind::Gui)
+        .map_err(CliError::msg)?;
     let runtime = parts
         .keepalive
         .handle()
@@ -724,8 +740,8 @@ pub fn run_tui_standalone(
     config_path: Option<&Path>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(config_path);
-    let parts =
-        attach_session(port, config, &data_dir, socket, config_path).map_err(CliError::msg)?;
+    let parts = attach_session(port, config, &data_dir, socket, config_path, LeaseKind::Tui)
+        .map_err(CliError::msg)?;
     let runtime = parts
         .keepalive
         .handle()
@@ -903,6 +919,7 @@ mod tests {
             &daemon.data_dir,
             Some(daemon.socket.clone()),
             None,
+            LeaseKind::Gui,
         )
         .expect("attaching to a port the daemon already holds");
 
@@ -955,6 +972,7 @@ mod tests {
             &daemon.data_dir,
             Some(daemon.socket.clone()),
             None,
+            LeaseKind::Gui,
         )
         .expect("attaching");
         let runtime = parts.keepalive.handle().expect("runtime");
@@ -985,6 +1003,48 @@ mod tests {
                 .contains(&FakeDaemon::PORT.to_string()),
             "Disconnect left the port on the daemon"
         );
+    }
+
+    /// #114: an attached window holds a lease on the daemon for as long as
+    /// its session lives, and gives it up when the session ends.
+    #[cfg(all(unix, feature = "testutil"))]
+    #[test]
+    fn an_attached_session_holds_a_lease_until_it_ends() {
+        let daemon = FakeDaemon::start();
+        let leases = || {
+            let client = IpcClient::new(daemon.socket.clone());
+            match daemon
+                .runtime
+                .block_on(client.send(RequestPayload::GetLifecycle))
+            {
+                Ok(ResponsePayload::Lifecycle(state)) => state.leases,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let before = leases();
+        assert!(before.is_empty(), "{before:?}");
+
+        let parts = attach_session(
+            FakeDaemon::PORT,
+            &PortConfig::default(),
+            &daemon.data_dir,
+            Some(daemon.socket.clone()),
+            None,
+            LeaseKind::Tui,
+        )
+        .expect("attaching");
+        let mut held = Vec::new();
+        for _ in 0..100 {
+            held = leases();
+            if !held.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(held, vec![LeaseKind::Tui]);
+
+        drop(parts);
+        assert!(leases().is_empty(), "the lease outlived the session");
     }
 
     #[test]

@@ -250,6 +250,92 @@ where
     writer.flush().await
 }
 
+/// Holds a lease on the daemon for a long-lived client (#114).
+///
+/// A window, the terminal monitor, an MCP session or `read --follow` keeps the
+/// daemon from stopping through idleness for as long as one of these lives.
+/// Every client opens a fresh connection per request, so there is no standing
+/// connection the daemon could watch; the lease is renewed every
+/// [`LEASE_RENEW_SECS`](crate::protocol::LEASE_RENEW_SECS) instead, from a
+/// thread of its own, and released when this value is dropped. A client that
+/// dies without dropping it loses the lease after three minutes.
+///
+/// A renewal never starts a daemon. It goes to whatever daemon is running, and
+/// to none if none is: otherwise an open window would bring back a daemon that
+/// was stopped on purpose. The next real operation starts one, and the next
+/// renewal registers the lease with it.
+pub struct LeaseKeeper {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LeaseKeeper {
+    /// Hold a lease of this kind on the daemon `client` talks to.
+    #[must_use]
+    pub fn start(client: IpcClient, kind: crate::protocol::LeaseKind) -> Self {
+        Self::start_every(
+            client,
+            kind,
+            Duration::from_secs(crate::protocol::LEASE_RENEW_SECS),
+        )
+    }
+
+    /// The same, renewing at another interval, for tests.
+    #[must_use]
+    pub fn start_every(
+        client: IpcClient,
+        kind: crate::protocol::LeaseKind,
+        every: Duration,
+    ) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let id = format!("{kind:?}-{}-{stamp}", std::process::id()).to_lowercase();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        // A renewal that waits on a daemon in trouble must not hold up a quit.
+        let client = client.with_timeout(Duration::from_secs(5));
+        let thread = std::thread::Builder::new()
+            .name("devserial-lease".to_string())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                loop {
+                    let renewal = runtime.block_on(client.send(RequestPayload::RenewLease {
+                        client: id.clone(),
+                        kind,
+                    }));
+                    if let Err(e) = renewal {
+                        tracing::debug!(error = %e, "lease renewal did not reach a daemon");
+                    }
+                    match stopped.recv_timeout(every) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                let _ = runtime.block_on(client.send(RequestPayload::ReleaseLease { client: id }));
+            })
+            .ok();
+        Self {
+            stop: Some(stop),
+            thread,
+        }
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        // Closing the channel ends the renewal loop, which then releases.
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// IPC client to communicate with a running devserial daemon.
 #[derive(Debug, Clone)]
 pub struct IpcClient {
@@ -572,5 +658,62 @@ mod tests {
             read_frame(&mut reader, 1024).await.unwrap().unwrap(),
             b"tail".to_vec()
         );
+    }
+
+    async fn leases(client: &IpcClient) -> Vec<crate::protocol::LeaseKind> {
+        match client.send(RequestPayload::GetLifecycle).await {
+            Ok(ResponsePayload::Lifecycle(state)) => state.leases,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// #114: a keeper registers its lease, keeps it while alive, and
+    /// releases it when dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_is_held_while_the_keeper_lives() {
+        use crate::protocol::LeaseKind;
+        let h = harness("lease").await;
+        let before = leases(&h.client).await;
+        assert!(before.is_empty(), "{before:?}");
+
+        let keeper =
+            LeaseKeeper::start_every(h.client.clone(), LeaseKind::Mcp, Duration::from_millis(50));
+        let mut held = Vec::new();
+        for _ in 0..50 {
+            held = leases(&h.client).await;
+            if !held.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(held, vec![LeaseKind::Mcp]);
+
+        // Dropping joins the renewal thread, which releases on its way out.
+        tokio::task::spawn_blocking(move || drop(keeper))
+            .await
+            .unwrap();
+        assert!(
+            leases(&h.client).await.is_empty(),
+            "the lease outlived its keeper"
+        );
+        let _ = h.shutdown.send(());
+    }
+
+    /// #114: a renewal never starts a daemon. With nothing listening, a keeper
+    /// renewing many times leaves no endpoint behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewal_never_starts_a_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("absent.sock");
+        let keeper = LeaseKeeper::start_every(
+            IpcClient::new(endpoint.clone()),
+            crate::protocol::LeaseKind::Gui,
+            Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::task::spawn_blocking(move || drop(keeper))
+            .await
+            .unwrap();
+        assert!(!endpoint.exists(), "a renewal started a daemon");
     }
 }
