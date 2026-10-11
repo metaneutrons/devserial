@@ -2609,6 +2609,35 @@ mod tests {
         assert!(none.request_quit());
     }
 
+    /// #114: the daemon screen changes the running daemon, and Ctrl+D also
+    /// saves the period as the default. A period without a unit goes nowhere.
+    #[test]
+    fn the_daemon_screen_applies_and_saves_the_idle_period() {
+        use crate::standalone::DaemonRequest;
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("devserial.toml");
+        let (mut state, asked) = with_daemon(crate::config::OnQuit::Ask, true);
+        state.config_file = Some(file.clone());
+
+        state.input = "30".to_string();
+        state.apply_idle();
+        state.save_idle_default();
+        assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+        assert!(!file.exists(), "a period without a unit was saved");
+
+        state.input = "30m".to_string();
+        state.apply_idle();
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::SetIdle(1800)]);
+        assert!(!file.exists(), "applying alone must not save");
+
+        state.save_idle_default();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![DaemonRequest::SetIdle(1800), DaemonRequest::SetIdle(1800)]
+        );
+        assert_eq!(crate::config::saved_idle(&file).as_deref(), Some("30m"));
+    }
+
     /// "Always" saves the answer, so the next quit does not ask.
     #[test]
     fn remembering_the_answer_saves_the_setting() {

@@ -2183,7 +2183,14 @@ impl MultiMonitorApp {
             self.quit_question = None;
             return;
         }
-        let Some(stop) = answer else {
+        if let Some(stop) = answer {
+            self.answer_quit(stop);
+        }
+    }
+
+    /// Act on the answer to the quit question, and save it when asked to.
+    fn answer_quit(&mut self, stop: bool) {
+        let Some(question) = self.quit_question.take() else {
             return;
         };
         let (window, remember) = (question.window, question.remember);
@@ -4937,6 +4944,68 @@ mod quit_tests {
         app.begin_quit(0);
         assert!(app.quit_resolved, "the saved 'keep' should have answered");
         assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+    }
+
+    /// "Remember my answer" saves it, so the next quit does not ask. Without
+    /// the tick nothing is saved.
+    #[test]
+    fn remembering_the_answer_saves_the_setting() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("devserial.toml");
+
+        let (mut once, _) = app(OnQuit::Ask);
+        once.monitors[0].config_file = Some(file.clone());
+        once.begin_quit(0);
+        once.answer_quit(false);
+        assert!(once.quit_resolved);
+        assert!(!file.exists(), "an answer without the tick was saved");
+
+        let (mut remembered, asked) = app(OnQuit::Ask);
+        remembered.monitors[0].config_file = Some(file.clone());
+        remembered.begin_quit(0);
+        remembered
+            .quit_question
+            .as_mut()
+            .expect("question")
+            .remember = true;
+        remembered.answer_quit(false);
+        assert!(remembered.quit_resolved);
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Status]);
+        assert_eq!(crate::config::saved_on_quit(&file), Some(OnQuit::Keep));
+
+        let (mut next, asked) = app(OnQuit::Ask);
+        next.monitors[0].config_file = Some(file);
+        next.begin_quit(0);
+        assert!(next.quit_resolved, "the remembered answer did not count");
+        assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+    }
+
+    /// #114: the Daemon dialog changes the running daemon, and "Save as
+    /// default" also writes the file. A period without a unit goes nowhere.
+    #[test]
+    fn the_daemon_dialog_applies_and_saves_the_idle_period() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("devserial.toml");
+        let (mut app, asked) = app(OnQuit::Ask);
+        let window = &mut app.monitors[0];
+        window.config_file = Some(file.clone());
+
+        window.daemon_idle = "30".to_string();
+        window.apply_daemon_idle(true);
+        assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+        assert!(!file.exists(), "a period without a unit was saved");
+
+        window.daemon_idle = "30m".to_string();
+        window.apply_daemon_idle(false);
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::SetIdle(1800)]);
+        assert!(!file.exists(), "applying alone must not save");
+
+        window.apply_daemon_idle(true);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![DaemonRequest::SetIdle(1800), DaemonRequest::SetIdle(1800)]
+        );
+        assert_eq!(crate::config::saved_idle(&file).as_deref(), Some("30m"));
     }
 
     /// Cmd+Q asks once, even with several windows open, and the answer
