@@ -4,6 +4,21 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.8](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.7...devserial-v0.2.8) (2026-10-11)
+
+
+### Features
+
+* **daemon:** ask on quit, and set the idle period from the monitors ([#119](https://github.com/metaneutrons/devserial/issues/119)) ([b8df9af](https://github.com/metaneutrons/devserial/commit/b8df9af8983556d55e70dcc1a131957c11566409))
+* **daemon:** long-lived clients hold a lease ([#118](https://github.com/metaneutrons/devserial/issues/118)) ([0457a28](https://github.com/metaneutrons/devserial/commit/0457a283cda180c6daa79553de151272dcabbaf1))
+* **daemon:** stop by itself once idle ([#117](https://github.com/metaneutrons/devserial/issues/117)) ([1ac5f46](https://github.com/metaneutrons/devserial/commit/1ac5f46558eaa0de2007965d7f75f5cf8d6a1722))
+
+
+### Bug Fixes
+
+* **gui:** ask about the daemon on Cmd+Q and Quit from the Dock ([#120](https://github.com/metaneutrons/devserial/issues/120)) ([914ed10](https://github.com/metaneutrons/devserial/commit/914ed101cf93a38835e8067ab1ca69111560345b)), closes [#114](https://github.com/metaneutrons/devserial/issues/114)
+* **gui:** wire the window that `devserial monitor` opens ([#112](https://github.com/metaneutrons/devserial/issues/112)) ([b2bebcc](https://github.com/metaneutrons/devserial/commit/b2bebcc55743099a8afba300c3dd8a689a8f9ad7))
+
 ## [0.2.7](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.6...devserial-v0.2.7) (2026-09-30)
 
 
