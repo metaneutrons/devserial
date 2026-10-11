@@ -73,10 +73,6 @@ pub enum IpcError {
 /// How long a stopping daemon goes on answering the requests it already has.
 const DRAIN: Duration = Duration::from_secs(5);
 
-/// A stopping daemon takes queued connections until none arrives for this
-/// long.
-const QUEUE_QUIET: Duration = Duration::from_millis(50);
-
 /// The IPC server running in the daemon process.
 pub struct IpcServer {
     engine: CommandEngine,
@@ -167,7 +163,7 @@ impl IpcServer {
         }
         let deadline = tokio::time::Instant::now() + DRAIN;
         while let Ok(Ok(stream)) = tokio::time::timeout_at(
-            deadline.min(tokio::time::Instant::now() + QUEUE_QUIET),
+            deadline.min(tokio::time::Instant::now() + transport::QUEUE_QUIET),
             listener.accept(),
         )
         .await

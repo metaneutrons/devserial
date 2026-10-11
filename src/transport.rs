@@ -12,14 +12,18 @@ use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
-pub use unix::{ClientStream, Listener, ServerStream, cleanup, connect, describe, is_listening};
+pub use unix::{
+    ClientStream, Listener, QUEUE_QUIET, ServerStream, cleanup, connect, describe, is_listening,
+};
 
 #[cfg(windows)]
-pub use windows::{ClientStream, Listener, ServerStream, cleanup, connect, describe, is_listening};
+pub use windows::{
+    ClientStream, Listener, QUEUE_QUIET, ServerStream, cleanup, connect, describe, is_listening,
+};
 
 #[cfg(not(any(unix, windows)))]
 pub use unsupported::{
-    ClientStream, Listener, ServerStream, cleanup, connect, describe, is_listening,
+    ClientStream, Listener, QUEUE_QUIET, ServerStream, cleanup, connect, describe, is_listening,
 };
 
 /// Error returned when an endpoint is already served by a live daemon.
@@ -40,6 +44,13 @@ mod unix {
 
     /// Stream handed to the daemon for an accepted connection.
     pub type ServerStream = UnixStream;
+
+    /// How long a stopping daemon waits for queued connections.
+    ///
+    /// The endpoint is removed by then, so nobody new can connect; the wait
+    /// only covers connections already queued that the runtime has not
+    /// reported yet.
+    pub const QUEUE_QUIET: std::time::Duration = std::time::Duration::from_millis(50);
     /// Stream used by a client to talk to the daemon.
     pub type ClientStream = UnixStream;
 
@@ -212,6 +223,13 @@ mod windows {
 
     /// Stream handed to the daemon for an accepted connection.
     pub type ServerStream = NamedPipeServer;
+
+    /// How long a stopping daemon waits for queued connections: not at all.
+    ///
+    /// A named pipe stays open to new clients until the listener is dropped,
+    /// so waiting would let them in; a client already connected is ready on
+    /// the first poll.
+    pub const QUEUE_QUIET: std::time::Duration = std::time::Duration::ZERO;
     /// Stream used by a client to talk to the daemon.
     pub type ClientStream = NamedPipeClient;
 
@@ -349,6 +367,9 @@ mod unsupported {
 
     /// Placeholder stream type.
     pub type ServerStream = tokio::io::Empty;
+
+    /// Nothing is ever queued here.
+    pub const QUEUE_QUIET: std::time::Duration = std::time::Duration::ZERO;
     /// Placeholder stream type.
     pub type ClientStream = tokio::io::Empty;
 
