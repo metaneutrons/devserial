@@ -2544,7 +2544,7 @@ impl eframe::App for MultiMonitorApp {
                         }
                         ui.heading(egui::RichText::new("devserial").strong().size(22.0));
                         ui.label(
-                            egui::RichText::new("Interactive serial hardware monitor & MCP bridge")
+                            egui::RichText::new("Interactive serial hardware monitor")
                                 .color(egui::Color32::from_rgb(170, 170, 180)),
                         );
                         ui.add_space(2.0);
