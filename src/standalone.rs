@@ -583,32 +583,59 @@ pub fn open_standalone_session(
         .keepalive
         .handle()
         .ok_or_else(|| "session runtime is gone".to_string())?;
+    let history = parts.history.clone();
+    Ok(session_monitor(
+        port,
+        config,
+        parts.storage,
+        history,
+        &parts.client,
+        &parts.keepalive,
+        &runtime,
+    ))
+}
 
+/// A window's state for a port the daemon holds, with every route wired.
+///
+/// The one place a window gets its write path, line settings, actions,
+/// connection switch and HTTP switch. Both ways of opening a window go through
+/// it, so a button cannot work in one and be dead in the other.
+#[cfg(feature = "monitor")]
+fn session_monitor(
+    port: &str,
+    config: &PortConfig,
+    storage: SqliteStorage,
+    history: Vec<String>,
+    client: &Arc<IpcClient>,
+    keepalive: &Arc<SessionKeepalive>,
+    runtime: &tokio::runtime::Handle,
+) -> crate::monitor::PortMonitorState {
     let writer = DaemonWriter {
         port: port.to_string(),
-        client: Arc::clone(&parts.client),
+        client: Arc::clone(client),
         runtime: runtime.clone(),
     };
 
+    #[allow(unused_mut)]
     let mut monitor = crate::monitor::PortMonitorState::new_with_reconfigure(
         port.to_string(),
         config.framing_summary(),
-        parts.storage,
-        parts.history.clone(),
+        storage,
+        history,
         Some(Arc::new(Mutex::new(
             Box::new(writer) as Box<dyn std::io::Write + Send>
         ))),
-        Some(daemon_reconfigure(port, &parts.client, runtime.clone())),
-        Some(daemon_action(port, &parts.client, runtime.clone())),
+        Some(daemon_reconfigure(port, client, runtime.clone())),
+        Some(daemon_action(port, client, runtime.clone())),
         Some(config.clone()),
-        Some(daemon_toggle(port, &parts.client, runtime.clone())),
-        Some(Arc::clone(&parts.keepalive)),
+        Some(daemon_toggle(port, client, runtime.clone())),
+        Some(Arc::clone(keepalive)),
     );
     #[cfg(feature = "rest")]
     {
-        monitor.rest = Some(daemon_rest(&parts.client, &runtime));
+        monitor.rest = Some(daemon_rest(client, runtime));
     }
-    Ok(monitor)
+    monitor
 }
 
 /// Open a serial port on the daemon and show it in a window.
@@ -648,23 +675,19 @@ pub fn run_monitor_standalone(
         .keepalive
         .handle()
         .ok_or_else(|| CliError::msg("session runtime is gone"))?;
-    let writer = DaemonWriter {
-        port: port.to_string(),
-        client: Arc::clone(&parts.client),
-        runtime: runtime.clone(),
-    };
-
-    let db_path = crate::paths::port_db_path(&data_dir, port);
-    let info = config.framing_summary();
-    let result = crate::monitor::run_monitor_with_port(
+    // A storage handle of its own rather than the session's, because the
+    // session stays whole for the terminal fallback below.
+    let storage = SqliteStorage::open(&crate::paths::port_db_path(&data_dir, port))
+        .map_err(|e| CliError::msg(format!("failed to open capture database: {e}")))?;
+    let result = crate::monitor::run_monitor_with_state(session_monitor(
         port,
-        &db_path,
-        &info,
-        Box::new(writer),
-        Arc::clone(&parts.keepalive),
-        #[cfg(feature = "rest")]
-        Some(daemon_rest(&parts.client, &runtime)),
-    );
+        config,
+        storage,
+        parts.history.clone(),
+        &parts.client,
+        &parts.keepalive,
+        &runtime,
+    ));
 
     match result {
         Ok(()) => Ok(()),
@@ -912,6 +935,55 @@ mod tests {
                 .managed_ports()
                 .contains(&FakeDaemon::PORT.to_string()),
             "ending the session closed the port; the capture would stop with it"
+        );
+    }
+
+    /// A window opened with `devserial monitor` can let go of its port.
+    ///
+    /// Through `session_monitor`, the function both ways of opening a window
+    /// now share. Before, `devserial monitor` built its own state without the
+    /// connection switch, so Disconnect did nothing and said so only inside
+    /// the settings dialog. The daemon's own list is the evidence: the window
+    /// saying it disconnected would prove nothing.
+    #[cfg(all(unix, feature = "testutil", feature = "monitor"))]
+    #[test]
+    fn a_window_from_the_command_line_can_disconnect() {
+        let daemon = FakeDaemon::start();
+        let parts = attach_session(
+            FakeDaemon::PORT,
+            &PortConfig::default(),
+            &daemon.data_dir,
+            Some(daemon.socket.clone()),
+            None,
+        )
+        .expect("attaching");
+        let runtime = parts.keepalive.handle().expect("runtime");
+        let storage = SqliteStorage::open(&crate::paths::port_db_path(
+            &daemon.data_dir,
+            FakeDaemon::PORT,
+        ))
+        .expect("storage");
+        let mut window = session_monitor(
+            FakeDaemon::PORT,
+            &PortConfig::default(),
+            storage,
+            Vec::new(),
+            &parts.client,
+            &parts.keepalive,
+            &runtime,
+        );
+
+        window.toggle_connection();
+
+        assert_eq!(
+            window.settings_status, None,
+            "the switch reported a failure instead of acting"
+        );
+        assert!(
+            !daemon
+                .managed_ports()
+                .contains(&FakeDaemon::PORT.to_string()),
+            "Disconnect left the port on the daemon"
         );
     }
 
