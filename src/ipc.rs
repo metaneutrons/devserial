@@ -699,6 +699,85 @@ mod tests {
         let _ = h.shutdown.send(());
     }
 
+    /// Serve a fresh engine on `endpoint` until the returned sender fires.
+    fn serve(endpoint: &std::path::Path, dir: &std::path::Path) -> broadcast::Sender<()> {
+        let mut config = Config::default();
+        config.global.data_dir = dir.to_path_buf();
+        config.global.archive_dir = dir.join("archive");
+        let engine = CommandEngine::new(
+            PortManagerHandle::new(),
+            Arc::new(Mutex::new(StateDb::open_memory().unwrap())),
+            Arc::new(config),
+        );
+        let server = IpcServer::new(engine, endpoint.to_path_buf(), dir.join("serve.pid"));
+        let (shutdown, shutdown_rx) = broadcast::channel::<()>(1);
+        tokio::spawn(async move {
+            let _ = server.run(shutdown_rx).await;
+        });
+        shutdown
+    }
+
+    /// Poll until the daemon at `client` reports `want` as its leases.
+    async fn wait_for_leases(client: &IpcClient, want: &[crate::protocol::LeaseKind]) -> bool {
+        for _ in 0..100 {
+            if let Ok(ResponsePayload::Lifecycle(state)) =
+                client.send(RequestPayload::GetLifecycle).await
+                && state.leases == want
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// #114: when a daemon stops and a real operation starts a new one, the
+    /// keeper's next renewal holds the new daemon. Between the two, with no
+    /// daemon, the renewals leave nothing behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_renewal_holds_a_restarted_daemon() {
+        use crate::protocol::LeaseKind;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("restart.sock");
+        let client = IpcClient::new(endpoint.clone()).with_timeout(Duration::from_secs(5));
+
+        let first = serve(&endpoint, dir.path());
+        assert!(wait_for_leases(&client, &[]).await, "no first daemon");
+        let keeper =
+            LeaseKeeper::start_every(client.clone(), LeaseKind::Tui, Duration::from_millis(30));
+        assert!(
+            wait_for_leases(&client, &[LeaseKind::Tui]).await,
+            "the first daemon was not held"
+        );
+
+        let _ = first.send(());
+        for _ in 0..100 {
+            if !client.is_alive().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!client.is_alive().await, "the first daemon did not stop");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!endpoint.exists(), "a renewal started a daemon");
+
+        // What a real operation does through `ensure_daemon`.
+        let second = serve(&endpoint, dir.path());
+        assert!(
+            wait_for_leases(&client, &[LeaseKind::Tui]).await,
+            "the next renewal did not hold the new daemon"
+        );
+
+        tokio::task::spawn_blocking(move || drop(keeper))
+            .await
+            .unwrap();
+        assert!(
+            wait_for_leases(&client, &[]).await,
+            "the lease outlived its keeper"
+        );
+        let _ = second.send(());
+    }
+
     /// #114: a renewal never starts a daemon. With nothing listening, a keeper
     /// renewing many times leaves no endpoint behind.
     #[tokio::test(flavor = "multi_thread")]

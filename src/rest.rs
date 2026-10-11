@@ -2571,6 +2571,49 @@ mod tests {
         (server, addr, engine, dir)
     }
 
+    /// #114: a request over HTTP resets the idle timer. The listener on its
+    /// own does not, and neither do the routes that only describe the build,
+    /// so a health probe cannot keep the daemon alive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_http_request_resets_the_idle_timer_and_listening_does_not() {
+        use crate::lifecycle::{Lifecycle, tests::ManualClock};
+        const MIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let clock = ManualClock::new();
+        let (engine, _dir) = test_engine();
+        let engine = engine.with_lifecycle(Lifecycle::new(
+            15 * MIN,
+            crate::protocol::IdleSource::Default,
+            clock.clone(),
+        ));
+        let config = config("127.0.0.1", 0);
+        let mut server = RestServer::new(&config);
+        let state = server.enable(&config, &engine).expect("binding loopback");
+        let addr: std::net::SocketAddr = format!("{}:{}", state.bind, state.port)
+            .parse()
+            .expect("address");
+
+        clock.advance(14 * MIN);
+        for path in ["/v1/health", "/v1/version", "/v1/openapi.json"] {
+            let answer = get(addr, path, None);
+            assert!(answer.starts_with("HTTP/1.1 200"), "{path}: {answer}");
+        }
+        clock.advance(MIN);
+        assert!(
+            engine.lifecycle().idle_expired(),
+            "listening or describing the build reset the timer"
+        );
+
+        let ports = get(addr, "/v1/ports", None);
+        assert!(ports.starts_with("HTTP/1.1 200"), "{ports}");
+        assert!(
+            !engine.lifecycle().idle_expired(),
+            "an HTTP request did not reset the timer"
+        );
+        clock.advance(14 * MIN);
+        assert!(!engine.lifecycle().idle_expired());
+    }
+
     /// The listener answers both routes, and says what it is.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_listener_answers_health_and_version() {

@@ -535,6 +535,19 @@ fn follow_port(
     json: bool,
     color: bool,
 ) -> Result<(), CliError> {
+    follow_until(session, port, window, (timestamps, json, color), async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+/// Follow until `stop` completes, which for a person is Ctrl+C.
+fn follow_until(
+    session: &Session,
+    port: &str,
+    window: ReadWindow,
+    (timestamps, json, color): (bool, bool, bool),
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), CliError> {
     // Seed from the requested window, then continue by id.
     let initial = ReadWindow {
         tail: window.tail.or(Some(20)),
@@ -553,9 +566,10 @@ fn follow_port(
         crate::ipc::LeaseKeeper::start(session.client.clone(), crate::protocol::LeaseKind::Follow);
 
     session.runtime.block_on(async {
+        tokio::pin!(stop);
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                () = &mut stop => {
                     return Ok(());
                 }
                 () = tokio::time::sleep(FOLLOW_INTERVAL) => {
@@ -742,6 +756,88 @@ mod tests {
         .unwrap();
         let err = write(&session, "/dev/x", Some("41".into()), true, true).unwrap_err();
         assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    /// #114: `read --follow` holds the daemon while it follows and lets go
+    /// when it stops. Against a real endpoint with a mock port.
+    #[cfg(feature = "testutil")]
+    #[test]
+    fn following_a_port_holds_the_daemon_until_it_stops() {
+        use crate::protocol::LeaseKind;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("dir");
+        let socket = dir.path().join("follow.sock");
+        let server_runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _context = server_runtime.enter();
+        let mut settings = crate::config::Config::default();
+        settings.global.data_dir = dir.path().to_path_buf();
+        let engine = crate::engine::CommandEngine::new(
+            crate::port_manager::PortManagerHandle::new(),
+            Arc::new(Mutex::new(
+                crate::state::StateDb::open_memory().expect("state"),
+            )),
+            Arc::new(settings),
+        );
+        let (mock, _feed) = crate::testutil::mock_serial::mock_serial(64);
+        let storage = Arc::new(Mutex::new(
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+        ));
+        let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        server_runtime.block_on(async {
+            engine
+                .port_manager()
+                .open(
+                    "mock_follow".into(),
+                    mock,
+                    crate::config::PortConfig::default(),
+                    storage,
+                )
+                .await
+                .expect("open");
+            let server =
+                crate::ipc::IpcServer::new(engine, socket.clone(), dir.path().join("follow.pid"));
+            tokio::spawn(async move {
+                let _ = server.run(shutdown_rx).await;
+            });
+        });
+
+        let probe = IpcClient::new(socket.clone());
+        let leases = || match server_runtime.block_on(probe.send(RequestPayload::GetLifecycle)) {
+            Ok(ResponsePayload::Lifecycle(state)) => state.leases,
+            other => panic!("unexpected {other:?}"),
+        };
+        for _ in 0..100 {
+            if socket.exists() && server_runtime.block_on(probe.is_alive()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(leases().is_empty(), "a lease before anyone followed");
+
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let follower = std::thread::spawn(move || {
+            let session = Session::new(Some(socket), None).expect("session");
+            follow_until(
+                &session,
+                "mock_follow",
+                ReadWindow::default(),
+                (false, false, false),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+        });
+
+        let held = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            leases() == vec![LeaseKind::Follow]
+        });
+        let _ = stop.send(());
+        follower.join().expect("follower").expect("follow");
+        assert!(held, "following did not hold the daemon");
+        assert!(leases().is_empty(), "the lease outlived the follow");
+        let _ = shutdown.send(());
     }
 
     #[test]

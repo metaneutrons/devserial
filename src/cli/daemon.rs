@@ -288,6 +288,44 @@ mod tests {
             .expect("server task");
     }
 
+    /// A client that is killed renews no more and never releases. Its lease
+    /// holds for three minutes after the last renewal and then lapses. The
+    /// idle period is one minute here, so the lease alone holds the daemon in
+    /// between. Renewals and the stop go through the real endpoint and
+    /// watcher; only the clock is the test's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_killed_client_releases_the_daemon_once_its_lease_lapses() {
+        let daemon = Idle::start().await;
+        daemon
+            .engine
+            .execute(RequestPayload::SetIdleTimeout { seconds: 60 })
+            .await
+            .expect("set");
+        let client = crate::ipc::IpcClient::new(daemon.socket.clone());
+        for _ in 0..5 {
+            client
+                .send(RequestPayload::RenewLease {
+                    client: "killed-tui".to_string(),
+                    kind: LeaseKind::Tui,
+                })
+                .await
+                .expect("renew");
+            daemon.advance(MIN).await;
+        }
+        // Killed one minute ago: no more renewals, and no release.
+        daemon.advance(MIN).await;
+        assert!(
+            daemon.running(),
+            "the lease stopped holding before three minutes"
+        );
+
+        daemon.advance(MIN).await;
+        tokio::time::timeout(Duration::from_secs(2), daemon.server)
+            .await
+            .expect("the daemon did not stop once the lease had lapsed")
+            .expect("server task");
+    }
+
     /// `0` turns the idle stop off.
     #[tokio::test(flavor = "multi_thread")]
     async fn zero_never_stops() {

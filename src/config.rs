@@ -368,6 +368,16 @@ pub fn saved_on_quit(path: &Path) -> Option<OnQuit> {
         .map(|config| config.daemon.on_quit)
 }
 
+/// The idle period as the file says now, as written there, for tests.
+#[cfg(test)]
+#[must_use]
+pub fn saved_idle(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<Config>(&text)
+        .ok()
+        .map(|config| config.daemon.idle_timeout.to_string())
+}
+
 /// Save the daemon settings a surface changed, keeping everything else in the
 /// file as it was: other sections, comments and formatting (#114).
 ///
