@@ -617,6 +617,8 @@ pub fn run_monitor_gui() -> Result<(), String> {
         last_zoom: stored_zoom().unwrap_or(1.0),
         quit_question: None,
         quit_resolved: false,
+        skill_offer: crate::agent_skill::Offer::for_this_user(),
+        skill_result: None,
     };
 
     let options = window_options(
@@ -667,6 +669,8 @@ fn run_monitor_inner(initial: PortMonitorState) -> Result<(), String> {
         last_zoom: stored_zoom().unwrap_or(1.0),
         quit_question: None,
         quit_resolved: false,
+        skill_offer: crate::agent_skill::Offer::for_this_user(),
+        skill_result: None,
     };
 
     let options = window_options(
@@ -2049,6 +2053,10 @@ struct MultiMonitorApp {
     quit_question: Option<QuitQuestion>,
     /// Whether quitting has been decided, so the window may close.
     quit_resolved: bool,
+    /// The agent skill offered at start, until it is answered (#124).
+    skill_offer: Option<crate::agent_skill::Offer>,
+    /// What answering the offer did, until it is dismissed.
+    skill_result: Option<String>,
 }
 
 /// The question on quit: stop the daemon too?
@@ -2062,6 +2070,78 @@ struct QuitQuestion {
 }
 
 impl MultiMonitorApp {
+    /// Answer the agent skill offer: install (`Some(true)`), never offer these
+    /// places again (`Some(false)`), or ask next time (`None`).
+    fn answer_skill_offer(&mut self, answer: Option<bool>) {
+        let Some(offer) = self.skill_offer.take() else {
+            return;
+        };
+        self.skill_result = match answer {
+            Some(true) => Some(offer.accept().join("\n")),
+            Some(false) => Some(offer.decline().map_or_else(
+                |e| format!("Could not save the answer: {e}"),
+                |()| {
+                    "Not offered again. `devserial skill --install` installs it later.".to_string()
+                },
+            )),
+            None => None,
+        };
+    }
+
+    /// The agent skill offer, and then what answering it did (#124).
+    fn render_skill_offer(&mut self, ctx: &egui::Context) {
+        if let Some(result) = &self.skill_result {
+            let mut dismissed = false;
+            egui::Window::new("AI tools")
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .default_width(FORM_WIDTH)
+                .show(ctx, |ui| {
+                    ui.set_max_width(FORM_WIDTH);
+                    ui.label(result);
+                    ui.add_space(8.0);
+                    dismissed = ui.button("OK").clicked();
+                });
+            if dismissed {
+                self.skill_result = None;
+            }
+            return;
+        }
+        let Some(offer) = &self.skill_offer else {
+            return;
+        };
+        let mut answer = None;
+        egui::Window::new("AI tools")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH);
+                ui.label(egui::RichText::new(crate::agent_skill::Offer::QUESTION).strong());
+                ui.add_space(6.0);
+                for line in offer.lines() {
+                    ui.label(line);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Install").clicked() {
+                        answer = Some(Some(true));
+                    }
+                    if ui.button("Not here").clicked() {
+                        answer = Some(Some(false));
+                    }
+                    if ui.button("Later").clicked() {
+                        answer = Some(None);
+                    }
+                });
+            });
+        if let Some(answer) = answer {
+            self.answer_skill_offer(answer);
+        }
+    }
+
     /// The last window is closing: decide what happens to the daemon (#114).
     ///
     /// Leave it, stop it, or ask, as the setting says. Asking keeps the window
@@ -2496,6 +2576,8 @@ impl eframe::App for MultiMonitorApp {
                 egui::TextureOptions::LINEAR,
             ));
         }
+
+        self.render_skill_offer(ui.ctx());
 
         let primary_idx = self.monitors.iter().position(|m| m.is_open);
 
@@ -4908,6 +4990,8 @@ mod quit_tests {
             last_zoom: 1.0,
             quit_question: None,
             quit_resolved: false,
+            skill_offer: None,
+            skill_result: None,
         };
         (app, asked)
     }
@@ -5006,6 +5090,40 @@ mod quit_tests {
             vec![DaemonRequest::SetIdle(1800), DaemonRequest::SetIdle(1800)]
         );
         assert_eq!(crate::config::saved_idle(&file).as_deref(), Some("30m"));
+    }
+
+    /// #124: the agent skill offer installs, remembers a no, or asks again
+    /// next time.
+    #[test]
+    fn the_skill_offer_installs_remembers_or_waits() {
+        use crate::agent_skill::{Offer, sandbox_setup};
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app(OnQuit::Ask);
+
+        app.skill_offer = Offer::for_setup(sandbox_setup(dir.path(), &[".claude"]));
+        app.answer_skill_offer(None);
+        assert!(app.skill_offer.is_none() && app.skill_result.is_none());
+        let again = Offer::for_setup(sandbox_setup(dir.path(), &[]));
+        assert!(again.is_some(), "later did not ask again");
+
+        app.skill_offer = again;
+        app.answer_skill_offer(Some(false));
+        assert!(
+            app.skill_result
+                .as_deref()
+                .is_some_and(|text| text.contains("Not offered again")),
+            "{:?}",
+            app.skill_result
+        );
+        assert!(Offer::for_setup(sandbox_setup(dir.path(), &[])).is_none());
+
+        app.skill_offer = Offer::for_setup(sandbox_setup(dir.path(), &[".codex"]));
+        app.answer_skill_offer(Some(true));
+        assert!(
+            dir.path()
+                .join("home/.agents/skills/devserial/SKILL.md")
+                .exists()
+        );
     }
 
     /// Cmd+Q asks once, even with several windows open, and the answer

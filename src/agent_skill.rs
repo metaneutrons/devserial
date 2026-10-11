@@ -187,6 +187,69 @@ pub fn update_in_background() {
     }
 }
 
+/// The question the GUI and the TUI ask once at start (#124, A2): install the
+/// skill where AI tools were found and nobody has decided yet?
+pub struct Offer {
+    setup: Setup,
+    places: Vec<PathBuf>,
+    lines: Vec<String>,
+}
+
+impl Offer {
+    /// What the question says before its places.
+    pub const QUESTION: &'static str = "AI tools on this computer can learn when and how to use devserial. \
+         Install the devserial skill for them?";
+
+    /// The offer for the user running devserial, when there is one.
+    #[must_use]
+    pub fn for_this_user() -> Option<Self> {
+        Setup::for_this_user().ok().and_then(Self::for_setup)
+    }
+
+    /// The offer for a setup: none when every place is decided.
+    #[must_use]
+    pub fn for_setup(setup: Setup) -> Option<Self> {
+        let assessment = setup.assess().ok()?;
+        let steps: Vec<&Step> = assessment.awaiting_approval().collect();
+        if steps.is_empty() {
+            return None;
+        }
+        let lines = steps
+            .iter()
+            .map(|step| where_for_whom(step, &setup.catalog))
+            .collect();
+        let places = steps.iter().map(|step| step.place.clone()).collect();
+        Some(Self {
+            setup,
+            places,
+            lines,
+        })
+    }
+
+    /// One line per place: where, and which tools read it.
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Install where offered. What happened, one line per place.
+    #[must_use]
+    pub fn accept(&self) -> Vec<String> {
+        match self.setup.install(&self.places) {
+            Ok(outcomes) => outcomes.iter().map(outcome).collect(),
+            Err(e) => vec![format!("not installed: {e}")],
+        }
+    }
+
+    /// Do not offer these places again.
+    ///
+    /// # Errors
+    /// Returns an error when the answer cannot be saved.
+    pub fn decline(&self) -> Result<(), String> {
+        self.setup.decline(&self.places)
+    }
+}
+
 /// The places waiting for the user's answer.
 #[must_use]
 pub fn undecided(assessment: &Assessment) -> Vec<PathBuf> {
@@ -230,24 +293,40 @@ pub fn shown(place: &Path) -> String {
         )
 }
 
+/// Where a place is and which tools read it, with a note when it lies in a
+/// git working tree.
+fn where_for_whom(step: &Step, catalog: &Catalog) -> String {
+    let mut line = shown(&step.place);
+    if !step.tools.is_empty() {
+        let _ = write!(line, " (read by {})", tool_names(step, catalog).join(", "));
+    }
+    if let Some(root) = &step.git_root {
+        let _ = write!(line, ", inside the git working tree {}", shown(root));
+    }
+    line
+}
+
+/// The names people know the step's tools by.
+fn tool_names<'a>(step: &'a Step, catalog: &'a Catalog) -> Vec<&'a str> {
+    step.tools
+        .iter()
+        .map(|id| {
+            catalog
+                .tools()
+                .iter()
+                .find(|tool| &tool.id == id)
+                .map_or(id.as_str(), |tool| tool.name.as_str())
+        })
+        .collect()
+}
+
 /// One place, as a line or two for people: where, for which tools, and what
 /// is there or would happen.
 #[must_use]
 pub fn describe(step: &Step, catalog: &Catalog) -> String {
     let mut line = shown(&step.place);
     if !step.tools.is_empty() {
-        let names: Vec<&str> = step
-            .tools
-            .iter()
-            .map(|id| {
-                catalog
-                    .tools()
-                    .iter()
-                    .find(|tool| &tool.id == id)
-                    .map_or(id.as_str(), |tool| tool.name.as_str())
-            })
-            .collect();
-        let _ = write!(line, " (read by {})", names.join(", "));
+        let _ = write!(line, " (read by {})", tool_names(step, catalog).join(", "));
     }
     let state = match &step.action {
         Action::Install => "not installed, waiting for your consent".to_string(),
@@ -475,9 +554,56 @@ pub fn http_reference() -> String {
     out
 }
 
+/// A setup on a temporary home holding the given AI tool folders, for tests
+/// of the surfaces that offer the skill.
+///
+/// # Panics
+/// Panics when the folders cannot be created, which fails the test.
+#[cfg(test)]
+#[must_use]
+pub fn sandbox_setup(dir: &Path, tools: &[&str]) -> Setup {
+    for tool in tools {
+        std::fs::create_dir_all(dir.join("home").join(tool)).expect("tool");
+    }
+    Setup::new(Environment::new(dir.join("home")), dir.join("consent")).expect("setup")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #124: the offer names the places, installs when accepted, and a
+    /// declined place is not offered again; a tool found later is offered on
+    /// its own.
+    #[test]
+    fn an_offer_installs_or_is_not_made_again() {
+        let dir = tempfile::tempdir().expect("dir");
+        let offer = Offer::for_setup(sandbox_setup(dir.path(), &[".claude"])).expect("an offer");
+        assert_eq!(offer.lines().len(), 1, "{:?}", offer.lines());
+        assert!(
+            offer.lines()[0].contains("Claude Code"),
+            "{:?}",
+            offer.lines()
+        );
+        offer.decline().expect("decline");
+        assert!(
+            Offer::for_setup(sandbox_setup(dir.path(), &[])).is_none(),
+            "a declined place was offered again"
+        );
+
+        let offer =
+            Offer::for_setup(sandbox_setup(dir.path(), &[".codex"])).expect("the new place");
+        assert_eq!(offer.lines().len(), 1, "{:?}", offer.lines());
+        assert!(offer.lines()[0].contains(".agents"), "{:?}", offer.lines());
+        let done = offer.accept();
+        assert!(done[0].ends_with("installed"), "{done:?}");
+        assert!(
+            dir.path()
+                .join("home/.agents/skills/devserial/SKILL.md")
+                .exists()
+        );
+        assert!(Offer::for_setup(sandbox_setup(dir.path(), &[])).is_none());
+    }
 
     /// The skill is valid under the specification as this build makes it.
     #[test]

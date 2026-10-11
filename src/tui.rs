@@ -101,6 +101,8 @@ pub struct TuiContext {
     pub on_quit: crate::config::OnQuit,
     /// Where a setting saved from here is written.
     pub config_file: Option<std::path::PathBuf>,
+    /// The agent skill to offer at start, if any place is undecided (#124).
+    pub skill_offer: Option<crate::agent_skill::Offer>,
 }
 
 /// Run the TUI monitor.
@@ -145,6 +147,8 @@ enum InputMode {
     Daemon,
     /// Asking, on quit, whether the daemon should stop too.
     QuitDaemon,
+    /// Offering the agent skill to AI tools found on this computer (#124).
+    SkillOffer,
 }
 
 // DTR and RTS join the view toggles here. They are separate switches with
@@ -230,9 +234,37 @@ struct AppState {
     config_file: Option<std::path::PathBuf>,
     /// What the daemon last said about itself.
     daemon_view: Option<crate::standalone::DaemonView>,
+    /// The agent skill offered at start, until it is answered.
+    skill_offer: Option<crate::agent_skill::Offer>,
 }
 
 impl AppState {
+    /// Put the agent skill offer up, when there is one (#124).
+    fn offer_skill(&mut self, offer: Option<crate::agent_skill::Offer>) {
+        if offer.is_some() {
+            self.skill_offer = offer;
+            self.input_mode = InputMode::SkillOffer;
+        }
+    }
+
+    /// Answer the agent skill offer: install, or never offer these places
+    /// again.
+    fn answer_skill_offer(&mut self, install: bool) {
+        self.input_mode = InputMode::Normal;
+        let Some(offer) = self.skill_offer.take() else {
+            return;
+        };
+        if install {
+            self.set_status(offer.accept().join("; "));
+        } else {
+            match offer.decline() {
+                Ok(()) => self
+                    .set_status("Not offered again; `devserial skill --install` installs it later"),
+                Err(e) => self.set_status(format!("Could not save the answer: {e}")),
+            }
+        }
+    }
+
     /// Ask the daemon about itself (#114). Never starts one.
     fn refresh_daemon(&mut self) {
         let Some(daemon) = self.daemon.clone() else {
@@ -445,6 +477,7 @@ impl AppState {
             on_quit: crate::config::OnQuit::Ask,
             config_file: None,
             daemon_view: None,
+            skill_offer: None,
         }
     }
 
@@ -615,6 +648,7 @@ fn run_app(
     state.daemon = context.daemon;
     state.on_quit = context.on_quit;
     state.config_file = context.config_file;
+    state.offer_skill(context.skill_offer);
 
     loop {
         // Poll new lines from storage.
@@ -852,6 +886,15 @@ fn run_app(
                 continue;
             }
             _ => {}
+        }
+
+        if state.input_mode == InputMode::SkillOffer {
+            match key.code {
+                KeyCode::Char('y') => state.answer_skill_offer(true),
+                KeyCode::Char('n') => state.answer_skill_offer(false),
+                _ => {}
+            }
+            continue;
         }
 
         if state.input_mode == InputMode::QuitDaemon {
@@ -1440,6 +1483,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Rest => ("Port: ", rest_title(state)),
         InputMode::Daemon => ("Idle period: ", daemon_title(state)),
         InputMode::QuitDaemon => ("", " Quit ".to_string()),
+        InputMode::SkillOffer => ("", " AI tools ".to_string()),
         #[cfg(feature = "esp")]
         InputMode::Flash => ("Firmware: ", flash_title(state)),
     };
@@ -1790,6 +1834,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         #[cfg(feature = "esp")]
         InputMode::Flash => render_flash_popup(frame, state),
         InputMode::QuitDaemon => render_quit_daemon_popup(frame, state),
+        InputMode::SkillOffer => render_skill_offer_popup(frame, state),
         _ => {}
     }
 }
@@ -1818,6 +1863,39 @@ fn render_quit_daemon_popup(frame: &mut Frame, state: &AppState) {
     ]);
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Quit ")),
+        area,
+    );
+}
+
+/// The agent skill offer: where it would go, and the three answers.
+fn render_skill_offer_popup(frame: &mut Frame, state: &AppState) {
+    let Some(offer) = &state.skill_offer else {
+        return;
+    };
+    let area = centered_rect(70, 50, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            crate::agent_skill::Offer::QUESTION,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    lines.extend(
+        offer
+            .lines()
+            .iter()
+            .map(|line| Line::from(format!("  {line}"))),
+    );
+    lines.extend([
+        Line::from(""),
+        Line::from("y  install        n  not here, do not ask again"),
+        Line::from("Esc  ask next time"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" AI tools ")),
         area,
     );
 }
@@ -2636,6 +2714,44 @@ mod tests {
             vec![DaemonRequest::SetIdle(1800), DaemonRequest::SetIdle(1800)]
         );
         assert_eq!(crate::config::saved_idle(&file).as_deref(), Some("30m"));
+    }
+
+    /// #124: the agent skill is offered at start when there is a place to
+    /// offer, and answering installs it or remembers the no.
+    #[test]
+    fn the_skill_offer_installs_or_is_remembered() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut nothing = AppState::new("/dev/x", &PortConfig::default());
+        nothing.offer_skill(None);
+        assert!(nothing.input_mode == InputMode::Normal);
+
+        let mut yes = AppState::new("/dev/x", &PortConfig::default());
+        yes.offer_skill(crate::agent_skill::Offer::for_setup(
+            crate::agent_skill::sandbox_setup(dir.path(), &[".claude"]),
+        ));
+        assert!(yes.input_mode == InputMode::SkillOffer);
+        yes.answer_skill_offer(true);
+        assert!(yes.input_mode == InputMode::Normal);
+        assert!(
+            dir.path()
+                .join("home/.claude/skills/devserial/SKILL.md")
+                .exists()
+        );
+
+        let mut no = AppState::new("/dev/x", &PortConfig::default());
+        no.offer_skill(crate::agent_skill::Offer::for_setup(
+            crate::agent_skill::sandbox_setup(dir.path(), &[".codex"]),
+        ));
+        assert!(no.input_mode == InputMode::SkillOffer);
+        no.answer_skill_offer(false);
+        assert!(
+            crate::agent_skill::Offer::for_setup(crate::agent_skill::sandbox_setup(
+                dir.path(),
+                &[]
+            ))
+            .is_none(),
+            "the no was not remembered"
+        );
     }
 
     /// "Always" saves the answer, so the next quit does not ask.
