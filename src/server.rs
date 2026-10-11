@@ -84,6 +84,12 @@ impl DevSerialServer {
         &self.engine
     }
 
+    /// Every MCP tool this build offers, for the agent skill (#124).
+    #[must_use]
+    pub fn tools() -> Vec<rmcp::model::Tool> {
+        Self::build_router().list_all()
+    }
+
     /// Combine the always-present tools with the optional ones.
     ///
     /// The ESP tools live in their own router so that a build without the `esp`

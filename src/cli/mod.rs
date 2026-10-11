@@ -408,6 +408,30 @@ pub enum Command {
         token_file: Option<std::path::PathBuf>,
     },
 
+    /// Show or change the agent skill that teaches AI tools to use devserial
+    ///
+    /// Without a flag it shows, for every skills folder of an AI tool found on
+    /// this machine, whether the skill is there and what devserial would do.
+    /// Nothing is installed without your consent. A copy devserial installed
+    /// and nobody changed is kept up to date without asking.
+    Skill {
+        /// Install where it is missing, after asking (at once with --yes)
+        #[arg(long, conflicts_with_all = ["remove", "decline"])]
+        install: bool,
+
+        /// Remove the copies devserial installed and nobody changed
+        #[arg(long, conflicts_with = "decline")]
+        remove: bool,
+
+        /// Stop offering it where it is missing
+        #[arg(long)]
+        decline: bool,
+
+        /// Install without asking
+        #[arg(long, requires = "install")]
+        yes: bool,
+    },
+
     /// Display version, author, license and repository info
     About,
 
@@ -490,6 +514,21 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
             let session = handlers::Session::new(cli.socket, config_path)?;
             handlers::rest_control(&session, enable, disable, bind, port, token_file.as_deref())
         }
+
+        Some(Command::Skill {
+            install,
+            remove,
+            decline,
+            yes,
+        }) => handlers::skill_control(if remove {
+            handlers::SkillRequest::Remove
+        } else if decline {
+            handlers::SkillRequest::Decline
+        } else if install {
+            handlers::SkillRequest::Install { ask: !yes }
+        } else {
+            handlers::SkillRequest::Status
+        }),
 
         Some(Command::About) => {
             output::print_about();

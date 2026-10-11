@@ -322,6 +322,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `daemon` | Run, inspect or stop the daemon, or change its idle period |
 | `monitor` / `tui` | Interactive monitors |
 | `mcp` | Run as an MCP server |
+| `skill` | Show, install or remove the agent skill for AI tools |
 | `about` | Version, author, license, repository |
 
 Global options include `--socket` for the IPC endpoint, `--config` for a configuration file, and `--color auto|always|never` (or `--no-color`) for human-readable output. `auto` is the default: colors appear on a terminal, not in a pipe. `NO_COLOR` also disables automatic coloring; explicit `--color always` overrides it. The GUI's Color checkbox and the TUI's `F8` key save a shared display preference. A command-line color override locks the interactive switch for that process.
@@ -668,6 +669,30 @@ The configuration file lives at `~/Library/Application Support/Claude/claude_des
 Each port is also exposed as an MCP resource at `serial://PORT/status`.
 
 The ESP tools release the port for the duration of the operation and reopen it afterwards, so a flash can be followed by reading the boot log without losing the first lines.
+
+### The agent skill
+
+An AI tool works better with devserial when it knows the tool is there and
+how to use it. devserial ships an [Agent Skill](https://agentskills.io/specification) for
+that: when to reach for devserial instead of `screen` or a pyserial script, the
+usual sequence of commands, and what to ask the user before doing (flashing,
+clearing a capture, closing a port). Its references list every command, MCP
+tool and HTTP route, generated from the binary that installs it, so they match
+the build.
+
+```bash
+devserial skill                  # where it is, and what devserial would do
+devserial skill --install        # install where it is missing, after asking
+devserial skill --decline        # stop offering it
+devserial skill --remove         # take out the copies devserial installed
+```
+
+It goes only into the skills folders of AI tools found on the machine, such as
+`~/.claude/skills` for Claude Code and `~/.agents/skills`, which Codex, Gemini
+CLI and GitHub Copilot read. Nothing is installed without your consent, and a
+place you declined is not offered again; `--install` still installs there when
+you ask for it. A copy devserial installed and nobody changed since is replaced
+by the version of the running devserial; one you edited is left alone.
 
 ---
 

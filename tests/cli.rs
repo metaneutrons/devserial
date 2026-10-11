@@ -580,3 +580,141 @@ fn an_mcp_session_holds_the_daemon_until_it_ends() {
     );
     assert!(!held(&sandbox), "the lease outlived the MCP session");
 }
+
+/// A devserial invocation that sees only the AI tools under `home`.
+fn skill_command(sandbox: &Sandbox, home: &std::path::Path) -> Command {
+    let mut cmd = sandbox.command();
+    cmd.env("HOME", home).env("USERPROFILE", home);
+    for var in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "COPILOT_HOME",
+        "XDG_CONFIG_HOME",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+fn skill_status(sandbox: &Sandbox, home: &std::path::Path) -> String {
+    let output = skill_command(sandbox, home)
+        .arg("skill")
+        .output()
+        .expect("status");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// #124: the skill goes only where the user agreed, and comes out again.
+#[test]
+fn the_skill_is_installed_only_with_consent() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("claude");
+    let skill = home.join(".claude/skills/devserial");
+
+    let status = skill_status(&sandbox, &home);
+    assert!(status.contains("Claude Code"), "{status}");
+    assert!(status.contains("waiting for your consent"), "{status}");
+
+    // No terminal to ask on and no --yes: nothing happens.
+    skill_command(&sandbox, &home)
+        .args(["skill", "--install"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--yes"));
+    assert!(!skill.exists(), "installed without consent");
+
+    skill_command(&sandbox, &home)
+        .args(["skill", "--install", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("installed"));
+    let skill_md = std::fs::read_to_string(skill.join("SKILL.md")).expect("SKILL.md");
+    assert!(skill_md.contains("name: \"devserial\""), "{skill_md}");
+    assert!(
+        skill_md.contains("installed-by: \"devserial\""),
+        "{skill_md}"
+    );
+    assert!(skill.join("references/cli.md").exists());
+    assert!(skill.join("references/mcp.md").exists());
+    assert!(skill_status(&sandbox, &home).contains("installed and up to date"));
+
+    skill_command(&sandbox, &home)
+        .args(["skill", "--remove"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("removed"));
+    assert!(!skill.exists(), "the skill outlived --remove");
+}
+
+/// #124: a declined place is not offered again; a tool found later is asked
+/// about on its own; an explicit install still goes everywhere.
+#[test]
+fn a_declined_place_is_not_offered_again() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("claude");
+
+    skill_command(&sandbox, &home)
+        .args(["skill", "--decline"])
+        .assert()
+        .success();
+    let status = skill_status(&sandbox, &home);
+    assert!(status.contains("declined"), "{status}");
+    assert!(!status.contains("waiting for your consent"), "{status}");
+
+    std::fs::create_dir_all(home.join(".codex")).expect("codex");
+    let status = skill_status(&sandbox, &home);
+    assert!(status.contains("declined"), "{status}");
+    assert!(status.contains("waiting for your consent"), "{status}");
+
+    skill_command(&sandbox, &home)
+        .args(["skill", "--install", "--yes"])
+        .assert()
+        .success();
+    assert!(home.join(".claude/skills/devserial/SKILL.md").exists());
+    assert!(home.join(".agents/skills/devserial/SKILL.md").exists());
+}
+
+/// #124: with no AI tool on the machine there is nothing to offer.
+#[test]
+fn without_an_ai_tool_nothing_is_offered() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let status = skill_status(&sandbox, &home);
+    assert!(status.contains("No AI tool"), "{status}");
+}
+
+/// #124: a copy an older devserial installed is brought up to date, even
+/// when no place is new.
+#[test]
+fn an_older_copy_is_updated_by_install() {
+    use agent_skill_installer::{Approval, Catalog, Consent, Environment, Installer, Program};
+
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("claude");
+    let skill = devserial::agent_skill::skill().expect("skill");
+    let older = Program::new("devserial", "0.0.1").expect("program");
+    let (catalog, env) = (Catalog::builtin(), Environment::new(&home));
+    let installer = Installer::new(&catalog, &env, &skill, &older);
+    let consent = Consent::load(sandbox.dir.path().join("older-consent")).expect("consent");
+    let assessment = installer.assess(&consent).expect("assess");
+    let approval = Approval {
+        install: assessment
+            .awaiting_approval()
+            .map(|step| step.place.clone())
+            .collect(),
+        overwrite: Vec::new(),
+    };
+    assert_eq!(installer.apply(&assessment, &approval).len(), 1);
+
+    skill_command(&sandbox, &home)
+        .args(["skill", "--install", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("updated from 0.0.1"));
+    assert!(skill_status(&sandbox, &home).contains("installed and up to date"));
+}
