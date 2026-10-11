@@ -8,6 +8,7 @@
 /// read a Rust constant.
 pub const COPYRIGHT: &str = "\u{a9} 2026 Fabian Schmieder";
 
+pub mod agent_skill;
 pub mod assets;
 pub mod cli;
 pub mod color;

@@ -333,7 +333,7 @@ pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<()
         } => flash(session, &port, &firmware, baud, monitor, color),
 
         // Handled before reaching this router.
-        Command::Mcp | Command::Daemon { .. } | Command::About => {
+        Command::Mcp | Command::Daemon { .. } | Command::About | Command::Skill { .. } => {
             Err(CliError::msg("command is not a remote operation"))
         }
 
@@ -482,6 +482,121 @@ pub fn daemon_control(
 }
 
 /// The idle period, where it came from, and what keeps the daemon running.
+/// What `devserial skill` was asked to do (#124).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillRequest {
+    /// Show where the skill is and what would happen.
+    Status,
+    /// Install where it is missing; `ask` unless `--yes` was given.
+    Install {
+        /// Whether to ask before installing.
+        ask: bool,
+    },
+    /// Stop offering it where it is missing.
+    Decline,
+    /// Remove the copies devserial installed and nobody changed.
+    Remove,
+}
+
+/// `devserial skill`: the agent skill's state, or install, decline or remove
+/// it (#124).
+///
+/// # Errors
+/// Returns an error when the machine cannot be assessed, or an install is
+/// asked for without a terminal to ask on and without `--yes`.
+pub fn skill_control(request: SkillRequest) -> Result<(), CliError> {
+    let setup = crate::agent_skill::Setup::for_this_user().map_err(CliError::msg)?;
+    match request {
+        SkillRequest::Status => skill_status(&setup),
+        SkillRequest::Install { ask } => skill_install(&setup, ask),
+        SkillRequest::Decline => {
+            let assessment = setup.assess().map_err(CliError::msg)?;
+            let places = crate::agent_skill::undecided(&assessment);
+            setup.decline(&places).map_err(CliError::msg)?;
+            println!(
+                "Not offered again for {} place(s). `devserial skill --install` still installs there.",
+                places.len()
+            );
+            Ok(())
+        }
+        SkillRequest::Remove => {
+            let outcomes = setup.remove().map_err(CliError::msg)?;
+            if outcomes.is_empty() {
+                println!("No copy of the skill to remove.");
+            }
+            for done in &outcomes {
+                println!("{}", crate::agent_skill::outcome(done));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn skill_status(setup: &crate::agent_skill::Setup) -> Result<(), CliError> {
+    use crate::agent_skill::{NAME, describe, undecided};
+    let assessment = setup.assess().map_err(CliError::msg)?;
+    println!("Agent skill {NAME} {}", env!("CARGO_PKG_VERSION"));
+    if assessment.steps.is_empty() {
+        println!("No AI tool with a skills folder was found.");
+    }
+    for step in &assessment.steps {
+        println!("{}", describe(step, setup.catalog()));
+    }
+    for unserved in &assessment.plan.unserved {
+        println!(
+            "{} is installed but cannot be reached: {}",
+            unserved.tool, unserved.reason
+        );
+    }
+    if !undecided(&assessment).is_empty() {
+        println!("\n`devserial skill --install` installs it, `--decline` stops offering it.");
+    }
+    Ok(())
+}
+
+fn skill_install(setup: &crate::agent_skill::Setup, ask: bool) -> Result<(), CliError> {
+    use crate::agent_skill::{describe, installable, outcome};
+    use std::io::IsTerminal as _;
+
+    let assessment = setup.assess().map_err(CliError::msg)?;
+    let steps = installable(&assessment);
+    if steps.is_empty() {
+        // Still bring copies devserial installed earlier up to date.
+        let outcomes = setup.install(&[]).map_err(CliError::msg)?;
+        if outcomes.is_empty() {
+            println!("Nothing to install: it is everywhere it can go.");
+        }
+        for done in &outcomes {
+            println!("{}", outcome(done));
+        }
+        return Ok(());
+    }
+    let places: Vec<_> = steps.iter().map(|step| step.place.clone()).collect();
+    println!("The devserial skill would be installed into:");
+    for step in steps {
+        println!("  {}", describe(step, setup.catalog()));
+    }
+    if ask {
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::msg(
+                "not installed: add --yes to install without being asked",
+            ));
+        }
+        print!("Install it there? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Not installed.");
+            return Ok(());
+        }
+    }
+    for done in setup.install(&places).map_err(CliError::msg)? {
+        println!("{}", outcome(&done));
+    }
+    Ok(())
+}
+
 fn print_lifecycle(state: &crate::protocol::LifecycleState) {
     let period = crate::lifecycle::IdleTimeout(std::time::Duration::from_secs(state.idle_seconds));
     if state.idle_seconds == 0 {

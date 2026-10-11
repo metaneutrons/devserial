@@ -944,6 +944,7 @@ fn run_tui_attached(
             .map(|loaded| loaded.daemon.on_quit)
             .unwrap_or_default(),
         config_file: crate::config::writable_config_path(config_path),
+        skill_offer: crate::agent_skill::Offer::for_this_user(),
     };
 
     crate::tui::run_tui(port, config, &parts.shared_storage, runtime, context)

@@ -21,6 +21,9 @@ version = 2
 # cargo-deny vergleicht die genaue SPDX-Kennung, "GPL-3.0" allein genuegt nicht.
 allow = [
     "GPL-3.0-or-later",
+    # agent-skill-installer, die eigene Bibliothek, mit der devserial seinen
+    # Agent Skill installiert (#124).
+    "LGPL-3.0-or-later",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -49,3 +52,7 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# agent-skill-installer steht noch nicht auf crates.io. Bis dahin kommt es,
+# auf einen Commit festgelegt, aus dem eigenen Repository (#124). Der Eintrag
+# entfaellt mit der ersten Version auf crates.io.
+allow-git = ["https://github.com/metaneutrons/agent-skill-installer"]

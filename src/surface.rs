@@ -92,6 +92,8 @@ pub enum Capability {
     DaemonLifecycle,
     /// Ask on quit whether the daemon should stop too, or follow the setting.
     QuitAsksAboutDaemon,
+    /// Offer the agent skill once at start where AI tools were found (#124).
+    AgentSkillOffer,
 }
 
 impl Capability {
@@ -121,6 +123,7 @@ impl Capability {
         Self::RestServer,
         Self::DaemonLifecycle,
         Self::QuitAsksAboutDaemon,
+        Self::AgentSkillOffer,
     ];
 }
 
@@ -158,6 +161,7 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::RestServer, "fn render_rest_dialog"),
     (Capability::DaemonLifecycle, "fn render_daemon_dialog"),
     (Capability::QuitAsksAboutDaemon, "fn render_quit_question"),
+    (Capability::AgentSkillOffer, "fn render_skill_offer"),
 ];
 
 /// What the terminal interface offers, with the same kind of proof.
@@ -187,6 +191,7 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::RestServer, "InputMode::Rest"),
     (Capability::DaemonLifecycle, "InputMode::Daemon"),
     (Capability::QuitAsksAboutDaemon, "InputMode::QuitDaemon"),
+    (Capability::AgentSkillOffer, "InputMode::SkillOffer"),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.
