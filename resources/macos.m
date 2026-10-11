@@ -284,6 +284,7 @@ static void forward_edit_action(id target, unsigned short keyCode, NSString *cha
 - (void)zoomReset:(id)sender;
 - (void)toggleColor:(id)sender;
 - (void)quitApp:(id)sender;
+- (void)handleQuitEvent:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)reply;
 @end
 
 static BOOL g_exportRequested = NO;
@@ -369,6 +370,20 @@ static BOOL g_colorLocked = NO;
 // close buttons do.
 - (void)quitApp:(id)sender {
     (void)sender;
+    g_quitRequested = YES;
+}
+
+// The quit Apple event: Quit in the Dock, `osascript ... quit`, and
+// -[NSRunningApplication terminate]. AppKit's own handler calls terminate:
+// and so skips the question as well. Logout, restart and shutdown carry a
+// reason; they quit as before, because a question nobody answers would stop
+// the logout.
+- (void)handleQuitEvent:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)reply {
+    (void)reply;
+    if ([event attributeDescriptorForKeyword:kAEQuitReason]) {
+        [NSApp terminate:nil];
+        return;
+    }
     g_quitRequested = YES;
 }
 @end
@@ -492,6 +507,15 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
         if (!g_aboutHandler) {
             g_aboutHandler = [[DevSerialAboutHandler alloc] init];
         }
+
+        // Replaces AppKit's handler, which it installs while the application
+        // finishes launching. This runs again once the window exists, so the
+        // last installation is ours.
+        [[NSAppleEventManager sharedAppleEventManager]
+            setEventHandler:g_aboutHandler
+                andSelector:@selector(handleQuitEvent:withReplyEvent:)
+              forEventClass:kCoreEventClass
+                 andEventID:kAEQuitApplication];
 
         // Configure the macOS Main Menu
         NSMenu *mainMenu = [app mainMenu];

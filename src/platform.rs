@@ -311,6 +311,23 @@ mod tests {
         );
     }
 
+    /// Quit from the Dock arrives as an Apple event, not through the menu; it
+    /// has to reach the same request (#114).
+    #[test]
+    fn the_quit_event_asks_like_the_menu() {
+        assert!(MACOS_SOURCE.contains("andEventID:kAEQuitApplication"));
+        let handler = MACOS_SOURCE
+            .split("- (void)handleQuitEvent:")
+            .nth(2)
+            .expect("an implementation of handleQuitEvent");
+        let body = &handler[..handler.find("\n}").expect("end of the handler")];
+        assert!(
+            body.contains("kAEQuitReason"),
+            "logout must not wait on a question"
+        );
+        assert!(body.contains("g_quitRequested = YES;"));
+    }
+
     #[test]
     fn the_native_side_answers_every_request() {
         for request in MenuRequest::ALL {
