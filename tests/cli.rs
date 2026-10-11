@@ -527,3 +527,56 @@ fn an_idle_period_without_a_unit_is_refused() {
         .failure()
         .stderr(predicate::str::contains("needs a unit"));
 }
+
+/// #114: an MCP session holds the daemon for as long as the AI tool keeps it
+/// open, and lets go when the tool disconnects.
+#[test]
+fn an_mcp_session_holds_the_daemon_until_it_ends() {
+    let sandbox = Sandbox::new();
+    let mut mcp = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"))
+        .arg("mcp")
+        .env("DEVSERIAL_DATA_DIR", sandbox.dir.path())
+        .env("DEVSERIAL_SOCKET", sandbox.dir.path().join("test.sock"))
+        .env_remove("DEVSERIAL_CONFIG")
+        .current_dir(sandbox.dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("mcp");
+
+    let held = |sandbox: &Sandbox| {
+        let output = sandbox
+            .command()
+            .args(["daemon", "--status"])
+            .output()
+            .expect("status");
+        String::from_utf8_lossy(&output.stdout).contains("Held by: MCP")
+    };
+    let mut seen = false;
+    for _ in 0..200 {
+        if held(&sandbox) {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Closing stdin is the AI tool disconnecting.
+    drop(mcp.stdin.take());
+    let ended = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        matches!(mcp.try_wait(), Ok(Some(_)))
+    });
+    if !ended {
+        let _ = mcp.kill();
+    }
+    let _ = mcp.wait();
+
+    assert!(seen, "the MCP session did not hold the daemon");
+    assert!(
+        ended,
+        "the MCP server did not end when its client went away"
+    );
+    assert!(!held(&sandbox), "the lease outlived the MCP session");
+}

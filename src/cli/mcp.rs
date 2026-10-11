@@ -29,6 +29,11 @@ pub fn run_mcp(socket: Option<PathBuf>, config_path: Option<&Path>) -> Result<()
         let client = IpcClient::new(socket.unwrap_or_else(paths::default_socket_path))
             .with_config_path(config_path.map(Path::to_path_buf));
         client.ensure_daemon().await?;
+        // Held for the whole MCP session (#114): an AI tool keeps its MCP
+        // server running for as long as its own session lasts, and the daemon
+        // stays with it. Released when the client disconnects.
+        let _lease =
+            crate::ipc::LeaseKeeper::start(client.clone(), crate::protocol::LeaseKind::Mcp);
 
         let port_manager = bootstrap::port_manager(&config);
         let state_db = Arc::new(Mutex::new(

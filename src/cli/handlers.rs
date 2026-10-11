@@ -545,6 +545,11 @@ fn follow_port(
     }
     let mut last_id = page.next_after_id;
 
+    // Someone is watching, which is use of the daemon in its own right (#114),
+    // whatever the polling interval below happens to be.
+    let _lease =
+        crate::ipc::LeaseKeeper::start(session.client.clone(), crate::protocol::LeaseKind::Follow);
+
     session.runtime.block_on(async {
         loop {
             tokio::select! {
