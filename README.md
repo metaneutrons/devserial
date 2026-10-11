@@ -251,7 +251,7 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 | `Cmd+0` | Back to 100 % |
 | `Cmd+Ctrl+F` | Full screen |
 | `Cmd+W` | Close window |
-| `Cmd+Q` | Quit |
+| `Cmd+Q` | Quit, asking about the daemon unless the quit setting says otherwise |
 
 Both keys for opening a port reach the same dialog, which raises the existing window when the port is already shown. The dialog offers a port that can actually be opened rather than the first one in the list.
 
@@ -447,11 +447,12 @@ starts, and `--set-idle-timeout` on the running daemon, which lasts until it
 stops. `--status` says which of these is in force. Durations are written `90s`,
 `15m`, `2h` or `0`.
 
-**Quitting a monitor asks about the daemon.** Quitting the terminal monitor or
-closing the last window asks whether the daemon should stop too, and names what
-that would end: the open ports with their line counts, other attached clients,
-and a listening HTTP interface. The answer can be remembered. `[daemon] on_quit`
-holds it, as `ask`, `stop` or `keep`; with `stop` or `keep` nobody is asked.
+**Quitting a monitor asks about the daemon.** Quitting the terminal monitor,
+closing the last window or quitting the application (`Cmd+Q` on macOS) asks
+whether the daemon should stop too, and names what that would end: the open
+ports with their line counts, other attached clients, and a listening HTTP
+interface. The answer can be remembered. `[daemon] on_quit` holds it, as `ask`,
+`stop` or `keep`; with `stop` or `keep` nobody is asked.
 
 Both are set in the monitors as well: `F9` in the terminal monitor, the
 **Daemon** entry in the window's status bar. A change applies to the running

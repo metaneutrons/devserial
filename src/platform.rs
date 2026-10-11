@@ -48,6 +48,8 @@ pub enum MenuRequest {
     ZoomReset,
     /// Toggle semantic colours in the monitor display.
     ToggleColor,
+    /// Quit the application, as closing every window would (#114).
+    Quit,
 }
 
 impl MenuRequest {
@@ -61,6 +63,7 @@ impl MenuRequest {
         Self::ZoomOut,
         Self::ZoomReset,
         Self::ToggleColor,
+        Self::Quit,
     ];
 }
 
@@ -88,6 +91,7 @@ mod macos {
         fn devserial_check_zoom_out_requested() -> bool;
         fn devserial_check_zoom_reset_requested() -> bool;
         fn devserial_check_toggle_color_requested() -> bool;
+        fn devserial_check_quit_requested() -> bool;
         fn devserial_update_color_state(color_enabled: bool, locked: bool);
         fn devserial_update_edit_state(
             is_text_focused: bool,
@@ -141,6 +145,7 @@ mod macos {
                 MenuRequest::ZoomOut => devserial_check_zoom_out_requested(),
                 MenuRequest::ZoomReset => devserial_check_zoom_reset_requested(),
                 MenuRequest::ToggleColor => devserial_check_toggle_color_requested(),
+                MenuRequest::Quit => devserial_check_quit_requested(),
             }
         }
     }
@@ -279,6 +284,7 @@ mod tests {
             MenuRequest::ZoomOut => ("devserial_check_zoom_out_requested", "zoomOut:"),
             MenuRequest::ZoomReset => ("devserial_check_zoom_reset_requested", "zoomReset:"),
             MenuRequest::ToggleColor => ("devserial_check_toggle_color_requested", "toggleColor:"),
+            MenuRequest::Quit => ("devserial_check_quit_requested", "quitApp:"),
         }
     }
 
@@ -303,6 +309,23 @@ mod tests {
             "{declared} native readers but {} requests listed",
             MenuRequest::ALL.len()
         );
+    }
+
+    /// Quit from the Dock arrives as an Apple event, not through the menu; it
+    /// has to reach the same request (#114).
+    #[test]
+    fn the_quit_event_asks_like_the_menu() {
+        assert!(MACOS_SOURCE.contains("andEventID:kAEQuitApplication"));
+        let handler = MACOS_SOURCE
+            .split("- (void)handleQuitEvent:")
+            .nth(2)
+            .expect("an implementation of handleQuitEvent");
+        let body = &handler[..handler.find("\n}").expect("end of the handler")];
+        assert!(
+            body.contains("kAEQuitReason"),
+            "logout must not wait on a question"
+        );
+        assert!(body.contains("g_quitRequested = YES;"));
     }
 
     #[test]
