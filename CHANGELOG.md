@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.9](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.8...devserial-v0.2.9) (2026-10-11)
+
+
+### Bug Fixes
+
+* **daemon:** lose no request when the daemon stops ([#122](https://github.com/metaneutrons/devserial/issues/122)) ([b57f6e3](https://github.com/metaneutrons/devserial/commit/b57f6e364d69582d3ff416b63596875a58a68809)), closes [#114](https://github.com/metaneutrons/devserial/issues/114)
+
 ## [0.2.8](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.7...devserial-v0.2.8) (2026-10-11)
 
 
