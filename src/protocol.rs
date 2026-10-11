@@ -183,6 +183,79 @@ pub struct SearchOutcome {
     pub truncated: bool,
 }
 
+/// How long a lease lasts without renewal (#114).
+///
+/// Three renewals' worth: a window frozen for a moment keeps its hold, and a
+/// client that crashed releases the daemon within three minutes.
+pub const LEASE_TTL_SECS: u64 = 180;
+
+/// How often a long-lived client renews its lease.
+pub const LEASE_RENEW_SECS: u64 = 60;
+
+/// The kind of long-lived client holding a lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeaseKind {
+    /// A window of the desktop monitor.
+    Gui,
+    /// The terminal monitor.
+    Tui,
+    /// An MCP server session.
+    Mcp,
+    /// `devserial read --follow`.
+    Follow,
+}
+
+impl fmt::Display for LeaseKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Gui => "GUI",
+            Self::Tui => "TUI",
+            Self::Mcp => "MCP",
+            Self::Follow => "read --follow",
+        })
+    }
+}
+
+/// Where the idle period in force came from, highest precedence last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdleSource {
+    /// The built-in default.
+    Default,
+    /// `[daemon] idle_timeout` in the configuration file.
+    Config,
+    /// `devserial daemon --idle-timeout` when the daemon was started.
+    StartFlag,
+    /// Changed on the running daemon.
+    Runtime,
+}
+
+impl fmt::Display for IdleSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "built-in default",
+            Self::Config => "configuration",
+            Self::StartFlag => "start flag",
+            Self::Runtime => "changed at runtime",
+        })
+    }
+}
+
+/// When the daemon would stop by itself, and what holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleState {
+    /// The idle period in seconds; `0` means never.
+    pub idle_seconds: u64,
+    /// Where that period came from.
+    pub source: IdleSource,
+    /// Seconds until an idle stop, when one is due at all: `None` while a
+    /// lease holds the daemon or the period is `0`.
+    pub stops_in_seconds: Option<u64>,
+    /// The kinds of long-lived client attached, one entry per lease.
+    pub leases: Vec<LeaseKind>,
+}
+
 /// Request payloads supported by the devserial engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", content = "params")]
@@ -298,6 +371,19 @@ pub enum RequestPayload {
     /// Stop the HTTP interface.
     #[cfg(feature = "rest")]
     RestDisable,
+    /// Keep the daemon from stopping while this long-lived client is attached.
+    ///
+    /// Sent once a minute. A lease that is not renewed lapses after
+    /// [`LEASE_TTL_SECS`]; a renewal creates the lease if the daemon does not
+    /// know it, so a client re-registers with a daemon that restarted.
+    RenewLease { client: String, kind: LeaseKind },
+    /// End a lease before it lapses, when the client quits normally.
+    ReleaseLease { client: String },
+    /// Change the running daemon's idle period. `0` means never stop by
+    /// itself. Lasts until this daemon stops.
+    SetIdleTimeout { seconds: u64 },
+    /// The daemon's idle period, its source, and what holds it.
+    GetLifecycle,
     /// Request graceful daemon shutdown.
     Shutdown,
 }
@@ -329,7 +415,14 @@ impl RequestPayload {
             | Self::EspWriteBin { port, .. } => Some(port),
             #[cfg(feature = "rest")]
             Self::RestStatus | Self::RestEnable { .. } | Self::RestDisable => None,
-            Self::Ping | Self::ListPorts | Self::ListHardware | Self::Shutdown => None,
+            Self::Ping
+            | Self::ListPorts
+            | Self::ListHardware
+            | Self::RenewLease { .. }
+            | Self::ReleaseLease { .. }
+            | Self::SetIdleTimeout { .. }
+            | Self::GetLifecycle
+            | Self::Shutdown => None,
         }
     }
 }
@@ -400,6 +493,8 @@ pub enum ResponsePayload {
     /// State of the HTTP interface.
     #[cfg(feature = "rest")]
     RestState(RestState),
+    /// The daemon's lifecycle state.
+    Lifecycle(LifecycleState),
     /// Daemon shutdown initiated.
     ShutdownAck,
 }

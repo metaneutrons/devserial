@@ -140,6 +140,8 @@ pub struct CommandEngine {
     /// question differently depending on which port a caller reached.
     #[cfg(feature = "rest")]
     rest: Arc<Mutex<crate::rest::RestServer>>,
+    /// The idle timer and the leases, shared with every clone (#114).
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
 }
 
 impl CommandEngine {
@@ -160,6 +162,15 @@ impl CommandEngine {
     ) -> Self {
         #[cfg(feature = "rest")]
         let rest = Arc::new(Mutex::new(crate::rest::RestServer::new(&config.rest)));
+        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new(
+            config.daemon.idle_timeout.0,
+            if config.daemon.idle_timeout == crate::lifecycle::IdleTimeout::default() {
+                crate::protocol::IdleSource::Default
+            } else {
+                crate::protocol::IdleSource::Config
+            },
+            Arc::new(crate::lifecycle::SystemClock),
+        ));
         Self {
             port_manager,
             state_db,
@@ -167,7 +178,22 @@ impl CommandEngine {
             remote: None,
             #[cfg(feature = "rest")]
             rest,
+            lifecycle,
         }
+    }
+
+    /// The idle timer and leases of this daemon.
+    #[must_use]
+    pub const fn lifecycle(&self) -> &Arc<crate::lifecycle::Lifecycle> {
+        &self.lifecycle
+    }
+
+    /// Replace the idle timer, for a test that drives its own clock.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: crate::lifecycle::Lifecycle) -> Self {
+        self.lifecycle = Arc::new(lifecycle);
+        self
     }
 
     /// Route operations to the daemon instead of opening hardware in this
@@ -218,6 +244,9 @@ impl CommandEngine {
                 .await
                 .map_err(Into::into);
         }
+        // Every request is something happening, whichever transport carried
+        // it: IPC from the CLI, a monitor or MCP, and HTTP alike (#114).
+        self.lifecycle.touch();
         match payload {
             RequestPayload::Ping => Ok(ResponsePayload::Pong),
             RequestPayload::ListPorts => self.list_ports().await,
@@ -284,8 +313,38 @@ impl CommandEngine {
             payload @ (RequestPayload::RestStatus
             | RequestPayload::RestEnable { .. }
             | RequestPayload::RestDisable) => self.execute_rest(payload),
+            RequestPayload::RenewLease { client, kind } => {
+                self.lifecycle.renew(&client, kind);
+                Ok(ResponsePayload::Lifecycle(self.lifecycle.state()))
+            }
+            RequestPayload::ReleaseLease { client } => {
+                self.lifecycle.release(&client);
+                Ok(ResponsePayload::Lifecycle(self.lifecycle.state()))
+            }
+            RequestPayload::SetIdleTimeout { seconds } => {
+                self.lifecycle.set_period(
+                    std::time::Duration::from_secs(seconds),
+                    crate::protocol::IdleSource::Runtime,
+                );
+                Ok(ResponsePayload::Lifecycle(self.lifecycle.state()))
+            }
+            RequestPayload::GetLifecycle => Ok(ResponsePayload::Lifecycle(self.lifecycle.state())),
             RequestPayload::Shutdown => Ok(ResponsePayload::ShutdownAck),
         }
+    }
+
+    /// Feed the idle timer with the line counts and say whether the daemon
+    /// should stop. Called by the daemon's watcher.
+    pub async fn idle_expired(&self) -> bool {
+        let total: u64 = self
+            .port_manager
+            .list()
+            .await
+            .iter()
+            .map(|port| port.total_lines)
+            .sum();
+        self.lifecycle.observe_lines(total);
+        self.lifecycle.idle_expired()
     }
 
     // ------------------------------------------------------------ ports
