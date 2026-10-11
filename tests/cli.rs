@@ -687,18 +687,14 @@ fn without_an_ai_tool_nothing_is_offered() {
     assert!(status.contains("No AI tool"), "{status}");
 }
 
-/// #124: a copy an older devserial installed is brought up to date, even
-/// when no place is new.
-#[test]
-fn an_older_copy_is_updated_by_install() {
+/// Install the skill under `home` as devserial 0.0.1 would have.
+fn install_older_copy(sandbox: &Sandbox, home: &std::path::Path) -> std::path::PathBuf {
     use agent_skill_installer::{Approval, Catalog, Consent, Environment, Installer, Program};
 
-    let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
     std::fs::create_dir_all(home.join(".claude")).expect("claude");
     let skill = devserial::agent_skill::skill().expect("skill");
     let older = Program::new("devserial", "0.0.1").expect("program");
-    let (catalog, env) = (Catalog::builtin(), Environment::new(&home));
+    let (catalog, env) = (Catalog::builtin(), Environment::new(home));
     let installer = Installer::new(&catalog, &env, &skill, &older);
     let consent = Consent::load(sandbox.dir.path().join("older-consent")).expect("consent");
     let assessment = installer.assess(&consent).expect("assess");
@@ -710,6 +706,38 @@ fn an_older_copy_is_updated_by_install() {
         overwrite: Vec::new(),
     };
     assert_eq!(installer.apply(&assessment, &approval).len(), 1);
+    let skill_md = home.join(".claude/skills/devserial/SKILL.md");
+    assert_eq!(installed_version(&skill_md).as_deref(), Some("0.0.1"));
+    skill_md
+}
+
+/// The version in a skill's installation record.
+fn installed_version(skill_md: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(skill_md).ok()?;
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("installed-version:"))?;
+    Some(line.split('"').nth(1)?.to_string())
+}
+
+/// Wait until the skill carries this build's version.
+fn updated(skill_md: &std::path::Path) -> bool {
+    (0..100).any(|_| {
+        if installed_version(skill_md).as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        false
+    })
+}
+
+/// #124: a copy an older devserial installed is brought up to date, even
+/// when no place is new.
+#[test]
+fn an_older_copy_is_updated_by_install() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    install_older_copy(&sandbox, &home);
 
     skill_command(&sandbox, &home)
         .args(["skill", "--install", "--yes"])
@@ -717,4 +745,72 @@ fn an_older_copy_is_updated_by_install() {
         .success()
         .stdout(predicates::str::contains("updated from 0.0.1"));
     assert!(skill_status(&sandbox, &home).contains("installed and up to date"));
+}
+
+/// #124: the daemon brings an older copy up to date when it starts, without
+/// being asked. Which commands do is pinned down by
+/// `long_running_commands_update_the_skill`; a one-shot command ends too soon
+/// for a test here to tell.
+#[test]
+fn the_daemon_updates_the_skill_when_it_starts() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    let skill_md = install_older_copy(&sandbox, &home);
+
+    skill_command(&sandbox, &home)
+        .args(["stats", "/dev/definitely-not-a-port"])
+        .assert()
+        .failure();
+    assert!(sandbox.wait_for_daemon(true), "the daemon did not start");
+    let done = updated(&skill_md);
+    skill_command(&sandbox, &home)
+        .args(["daemon", "--stop"])
+        .assert()
+        .success();
+    assert!(done, "the daemon did not update the skill");
+}
+
+/// #124: in MCP mode the update happens without a byte on stdout, which
+/// belongs to the protocol.
+#[test]
+fn the_mcp_server_updates_the_skill_without_writing_to_stdout() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.dir.path().join("home");
+    let skill_md = install_older_copy(&sandbox, &home);
+
+    let mut mcp = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"));
+    mcp.arg("mcp")
+        .env("DEVSERIAL_DATA_DIR", sandbox.dir.path())
+        .env("DEVSERIAL_SOCKET", sandbox.dir.path().join("test.sock"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("DEVSERIAL_CONFIG")
+        .current_dir(sandbox.dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    for var in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "COPILOT_HOME",
+        "XDG_CONFIG_HOME",
+    ] {
+        mcp.env_remove(var);
+    }
+    let mut mcp = mcp.spawn().expect("mcp");
+    let done = updated(&skill_md);
+
+    // Closing stdin is the AI tool disconnecting.
+    drop(mcp.stdin.take());
+    let output = mcp.wait_with_output().expect("mcp output");
+    skill_command(&sandbox, &home)
+        .args(["daemon", "--stop"])
+        .assert()
+        .success();
+    assert!(done, "the MCP server did not update the skill");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

@@ -691,8 +691,9 @@ It goes only into the skills folders of AI tools found on the machine, such as
 `~/.claude/skills` for Claude Code and `~/.agents/skills`, which Codex, Gemini
 CLI and GitHub Copilot read. Nothing is installed without your consent, and a
 place you declined is not offered again; `--install` still installs there when
-you ask for it. A copy devserial installed and nobody changed since is replaced
-by the version of the running devserial; one you edited is left alone.
+you ask for it. A copy devserial installed and nobody changed since is brought
+up to the running version without asking, whenever the GUI, the terminal
+monitor, the daemon or the MCP server starts; one you edited is left alone.
 
 ---
 

@@ -462,8 +462,31 @@ pub fn run() -> Result<(), CliError> {
     dispatch(cli)
 }
 
+/// Whether the command starts something that runs for a while: a window, the
+/// terminal monitor, the daemon or the MCP server. Those keep the agent skill
+/// up to date (#124); a one-shot command does not.
+const fn runs_for_a_while(command: Option<&Command>) -> bool {
+    match command {
+        None | Some(Command::Mcp) => true,
+        Some(Command::Daemon {
+            status,
+            stop,
+            set_idle_timeout,
+            ..
+        }) => !*status && !*stop && set_idle_timeout.is_none(),
+        #[cfg(feature = "monitor")]
+        Some(Command::Gui | Command::Monitor { .. }) => true,
+        #[cfg(feature = "tui")]
+        Some(Command::Tui { .. }) => true,
+        _ => false,
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<(), CliError> {
     let config_path = cli.config.clone();
+    if runs_for_a_while(cli.command.as_ref()) {
+        crate::agent_skill::update_in_background();
+    }
 
     // An explicitly named configuration file is validated here, so a typo is
     // reported by the command the user ran rather than by a background daemon.
@@ -622,6 +645,33 @@ fn interactive_default() -> Result<(), CliError> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// #124: the agent skill is kept current by what runs for a while, and
+    /// not by a one-shot command.
+    #[test]
+    fn long_running_commands_update_the_skill() {
+        let runs = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            runs_for_a_while(cli.command.as_ref())
+        };
+        assert!(runs(&["devserial"]));
+        assert!(runs(&["devserial", "mcp"]));
+        assert!(runs(&["devserial", "daemon"]));
+        assert!(runs(&["devserial", "daemon", "--idle-timeout", "2h"]));
+        assert!(!runs(&["devserial", "daemon", "--status"]));
+        assert!(!runs(&["devserial", "daemon", "--stop"]));
+        assert!(!runs(&["devserial", "daemon", "--set-idle-timeout", "2h"]));
+        assert!(!runs(&["devserial", "list"]));
+        assert!(!runs(&["devserial", "skill"]));
+        assert!(!runs(&["devserial", "read", "/dev/x"]));
+        #[cfg(feature = "monitor")]
+        {
+            assert!(runs(&["devserial", "gui"]));
+            assert!(runs(&["devserial", "monitor", "/dev/x"]));
+        }
+        #[cfg(feature = "tui")]
+        assert!(runs(&["devserial", "tui", "/dev/x"]));
+    }
 
     #[test]
     fn cli_definition_is_valid() {

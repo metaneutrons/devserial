@@ -148,12 +148,42 @@ impl Setup {
         consent.save().map_err(|e| e.to_string())
     }
 
+    /// Bring every copy devserial installed and nobody changed up to this
+    /// version. Installs nothing new and asks nothing.
+    ///
+    /// # Errors
+    /// Returns an error when no plan can be made.
+    pub fn update(&self) -> Result<Vec<Outcome>, String> {
+        self.installer().update().map_err(|e| e.to_string())
+    }
+
     /// Remove every copy devserial installed that nobody changed.
     ///
     /// # Errors
     /// Returns an error when no plan can be made.
     pub fn remove(&self) -> Result<Vec<Outcome>, String> {
         self.installer().remove().map_err(|e| e.to_string())
+    }
+}
+
+/// Run [`Setup::update`] for this user in the background (#124, A3).
+///
+/// For the long-running surfaces: the GUI, the TUI, the daemon and the MCP
+/// server. Nothing goes to stdout or stderr, which belong to the MCP protocol
+/// and to the terminal monitor; what happened goes to the log.
+pub fn update_in_background() {
+    let spawned = std::thread::Builder::new()
+        .name("devserial-skill".to_string())
+        .spawn(|| match Setup::for_this_user().and_then(|setup| setup.update()) {
+            Ok(outcomes) => {
+                for done in outcomes {
+                    tracing::info!(place = %done.place.display(), done = %done.done, "agent skill");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "agent skill not updated"),
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "agent skill update not started");
     }
 }
 
