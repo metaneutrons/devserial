@@ -70,6 +70,9 @@ pub enum IpcError {
     Unsupported(String),
 }
 
+/// How long a stopping daemon goes on answering the requests it already has.
+const DRAIN: Duration = Duration::from_secs(5);
+
 /// The IPC server running in the daemon process.
 pub struct IpcServer {
     engine: CommandEngine,
@@ -119,6 +122,7 @@ impl IpcServer {
         // here; without it a `Shutdown` request was acknowledged and then
         // silently ignored, leaving the daemon running.
         let (shutdown_tx, mut requested_rx) = broadcast::channel::<()>(1);
+        let mut connections = tokio::task::JoinSet::new();
 
         loop {
             tokio::select! {
@@ -135,18 +139,53 @@ impl IpcServer {
                         Ok(stream) => {
                             let engine = self.engine.clone();
                             let notifier = shutdown_tx.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 serve_connection(stream, engine, notifier).await;
                             });
                         }
                         Err(e) => tracing::warn!(error = %e, "IPC accept failed"),
                     }
                 }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
 
+        // Stopping (#114): nobody new gets in, and everyone already in gets
+        // an answer. Removing the endpoint first makes a late client's connect
+        // fail, which tells it the request never arrived; it starts a new
+        // daemon and sends again. Connections already queued are taken and
+        // served, and the daemon ends once they are done.
         transport::cleanup(&self.endpoint);
-        let _ = std::fs::remove_file(&self.pid_path);
+        // A daemon started meanwhile writes its own PID file; leave that one.
+        if std::fs::read_to_string(&self.pid_path).is_ok_and(|held| held.trim() == pid.to_string())
+        {
+            let _ = std::fs::remove_file(&self.pid_path);
+        }
+        let deadline = tokio::time::Instant::now() + DRAIN;
+        while let Ok(Ok(stream)) = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + transport::QUEUE_QUIET),
+            listener.accept(),
+        )
+        .await
+        {
+            let engine = self.engine.clone();
+            let notifier = shutdown_tx.clone();
+            connections.spawn(async move {
+                serve_connection(stream, engine, notifier).await;
+            });
+        }
+        drop(listener);
+        let drained = tokio::time::timeout_at(deadline, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                left = connections.len(),
+                "requests still running at shutdown were cut off"
+            );
+            connections.abort_all();
+        }
         Ok(())
     }
 }
@@ -419,6 +458,46 @@ impl IpcClient {
             .map_err(|e| IpcError::Protocol(format!("{e} (raw: {text:?})")))?;
 
         response.result.map_err(IpcError::Remote)
+    }
+
+    /// Send a request, starting the daemon first if none answers.
+    ///
+    /// A daemon can stop between that check and the request, through its
+    /// idle stop (#114). It then refuses the connection, so the request never
+    /// left this process, and starting a new daemon and sending once more is
+    /// safe whatever the request does. A failure after the request went out
+    /// is returned as it is: the daemon may have acted on it.
+    ///
+    /// # Errors
+    /// Returns an error if no daemon can be started or reached, or the
+    /// daemon reports a failure.
+    pub async fn send_starting(
+        &self,
+        payload: RequestPayload,
+    ) -> Result<ResponsePayload, IpcError> {
+        self.send_after(payload, || self.ensure_daemon()).await
+    }
+
+    /// [`send_starting`](Self::send_starting) with the start step given, so
+    /// a test can stand in for spawning the binary.
+    async fn send_after<F, Fut>(
+        &self,
+        payload: RequestPayload,
+        start: F,
+    ) -> Result<ResponsePayload, IpcError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<(), IpcError>>,
+    {
+        start().await?;
+        match self.send(payload.clone()).await {
+            Err(IpcError::Connect { .. }) => {
+                tracing::debug!("the daemon went away before the request; starting a new one");
+                start().await?;
+                self.send(payload).await
+            }
+            other => other,
+        }
     }
 
     /// Ensure the daemon is running, spawning it in the background if needed.
@@ -701,6 +780,14 @@ mod tests {
 
     /// Serve a fresh engine on `endpoint` until the returned sender fires.
     fn serve(endpoint: &std::path::Path, dir: &std::path::Path) -> broadcast::Sender<()> {
+        serve_watched(endpoint, dir).0
+    }
+
+    /// The same, with the server task to watch.
+    fn serve_watched(
+        endpoint: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> (broadcast::Sender<()>, tokio::task::JoinHandle<()>) {
         let mut config = Config::default();
         config.global.data_dir = dir.to_path_buf();
         config.global.archive_dir = dir.join("archive");
@@ -711,10 +798,150 @@ mod tests {
         );
         let server = IpcServer::new(engine, endpoint.to_path_buf(), dir.join("serve.pid"));
         let (shutdown, shutdown_rx) = broadcast::channel::<()>(1);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = server.run(shutdown_rx).await;
         });
-        shutdown
+        (shutdown, task)
+    }
+
+    /// #114: a daemon that stops answers the requests on the connections it
+    /// already has before it ends, and a late client is refused at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopping_daemon_answers_the_requests_it_already_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("drain.sock");
+        let client = IpcClient::new(endpoint.clone()).with_timeout(Duration::from_secs(5));
+        let (shutdown, server) = serve_watched(&endpoint, dir.path());
+        for _ in 0..100 {
+            if client.is_alive().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let stream = transport::connect(&endpoint).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown.send(());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !server.is_finished(),
+            "the daemon ended with a connection still to answer"
+        );
+        assert!(
+            matches!(
+                client.send(RequestPayload::Ping).await,
+                Err(IpcError::Connect { .. })
+            ),
+            "a late client was not refused"
+        );
+
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+        write_frame(
+            &mut writer,
+            &RpcRequest {
+                id: 7,
+                payload: RequestPayload::Ping,
+            },
+        )
+        .await
+        .expect("write");
+        let frame = read_frame(&mut reader, MAX_FRAME_BYTES)
+            .await
+            .expect("read")
+            .expect("an answer");
+        let answer: RpcResponse = serde_json::from_slice(&frame).expect("json");
+        assert_eq!(answer.result, Ok(ResponsePayload::Pong));
+
+        drop((reader, writer));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the daemon did not end once it had answered")
+            .expect("server task");
+    }
+
+    /// #114: a request whose connection was refused never arrived, so it goes
+    /// to a new daemon.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_that_never_arrived_goes_to_a_new_daemon() {
+        use std::sync::atomic::AtomicUsize;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("late.sock");
+        let client = IpcClient::new(endpoint.clone()).with_timeout(Duration::from_secs(5));
+        let starts = AtomicUsize::new(0);
+        let started = Mutex::new(None);
+
+        // The first start finds the old daemon, which is gone by the time the
+        // request goes out; the second start brings a new one.
+        let answer = client
+            .send_after(RequestPayload::ListPorts, || {
+                let round = starts.fetch_add(1, Ordering::SeqCst) + 1;
+                let (endpoint, dir, started, client) = (&endpoint, dir.path(), &started, &client);
+                async move {
+                    if round == 2 {
+                        *started.lock().unwrap() = Some(serve(endpoint, dir));
+                        for _ in 0..100 {
+                            if client.is_alive().await {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        assert_eq!(
+            answer.expect("an answer"),
+            ResponsePayload::PortList(vec![])
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        let second = started.lock().unwrap().take();
+        if let Some(shutdown) = second {
+            let _ = shutdown.send(());
+        }
+    }
+
+    /// #114: a request that went out is never sent again, because the daemon
+    /// may have acted on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_that_went_out_is_not_sent_again() {
+        use std::sync::atomic::AtomicUsize;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("mute.sock");
+        let mut listener = transport::Listener::bind(&endpoint).await.expect("bind");
+        let received = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&received);
+        tokio::spawn(async move {
+            while let Ok(stream) = listener.accept().await {
+                let (reader, _writer) = tokio::io::split(stream);
+                let mut reader = BufReader::new(reader);
+                if let Ok(Some(_)) = read_frame(&mut reader, MAX_FRAME_BYTES).await {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                // Hangs up without an answer.
+            }
+        });
+
+        let client = IpcClient::new(endpoint).with_timeout(Duration::from_secs(5));
+        let starts = AtomicUsize::new(0);
+        let answer = client
+            .send_after(RequestPayload::ListPorts, || {
+                starts.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            })
+            .await;
+        assert!(matches!(answer, Err(IpcError::Protocol(_))), "{answer:?}");
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "started again after sending"
+        );
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            1,
+            "the request went out twice"
+        );
     }
 
     /// Poll until the daemon at `client` reports `want` as its leases.

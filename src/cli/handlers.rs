@@ -58,10 +58,8 @@ impl Session {
     /// # Errors
     /// Returns an error if the daemon cannot be reached or reports a failure.
     pub fn request(&self, payload: RequestPayload) -> Result<ResponsePayload, CliError> {
-        self.runtime.block_on(async {
-            self.client.ensure_daemon().await?;
-            Ok(self.client.send(payload).await?)
-        })
+        self.runtime
+            .block_on(async { Ok(self.client.send_starting(payload).await?) })
     }
 
     /// Send a request without starting a daemon.

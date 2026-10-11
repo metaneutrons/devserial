@@ -420,7 +420,8 @@ other, because the operating system hands a serial port to one holder.
 daemon starts it. It stops by itself after **15 minutes** idle, which means all
 of this at once:
 
-- no request arrived, over the IPC socket or over HTTP;
+- no request arrived, over the IPC socket or over HTTP, and none is still
+  being served: a file transfer or a flash holds the daemon until it ends;
 - no data came in on any open port;
 - no window, terminal monitor, MCP session or `read --follow` is attached.
 
@@ -430,6 +431,10 @@ terminal monitor, MCP session or `read --follow` does, for as long as it is
 there, whatever else happens; each holds a lease that it renews every minute
 and that lapses three minutes after a crash. Because an AI tool keeps its MCP
 server running for its whole session, the daemon stays with it.
+
+A request that arrives just as the daemon stops is not lost. The daemon answers
+what it has already received before it ends, and a command that finds it gone
+starts a new one and sends again.
 
 The stop is the same as `devserial daemon --stop`: the ports stay recorded, and
 the next start reopens them and continues the same capture databases. What a
