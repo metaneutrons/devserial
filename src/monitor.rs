@@ -2100,10 +2100,45 @@ impl MultiMonitorApp {
         }
     }
 
+    /// Quit from the application menu (Cmd+Q on macOS).
+    ///
+    /// Asks once, over a window that talks to the daemon, as closing the last
+    /// window does. Returns whether the application may close right away; when
+    /// it asks, the answer closes it later.
+    fn quit_from_menu(&mut self) -> bool {
+        if self.quit_question.is_some() {
+            return false;
+        }
+        let asking = self
+            .monitors
+            .iter()
+            .position(|m| m.is_open && m.daemon.is_some())
+            .or_else(|| self.monitors.iter().position(|m| m.is_open));
+        match asking {
+            Some(window) if !self.quit_resolved => {
+                self.begin_quit(window);
+                self.quit_resolved
+            }
+            _ => {
+                self.quit_resolved = true;
+                for mon in &mut self.monitors {
+                    mon.is_open = false;
+                }
+                true
+            }
+        }
+    }
+
+    /// Quitting is decided: every window closes, which ends the application.
     fn resolve_quit(&mut self, window: usize) {
         self.quit_question = None;
         self.quit_resolved = true;
         self.monitors[window].is_open = false;
+        // A quit from the menu leaves other windows open until now; they go
+        // with the application.
+        for mon in &mut self.monitors {
+            mon.is_open = false;
+        }
     }
 
     /// The question on quit, over the window that asked.
@@ -2337,6 +2372,12 @@ impl eframe::App for MultiMonitorApp {
 
         if platform::take_menu_request(MenuRequest::OpenPort) {
             self.open_connect_dialog();
+        }
+
+        // Cmd+Q: the whole application, asked about the daemon like closing
+        // the last window is (#114).
+        if platform::take_menu_request(MenuRequest::Quit) && self.quit_from_menu() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         if platform::take_menu_request(MenuRequest::PortSettings)
@@ -4896,5 +4937,38 @@ mod quit_tests {
         app.begin_quit(0);
         assert!(app.quit_resolved, "the saved 'keep' should have answered");
         assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+    }
+
+    /// Cmd+Q asks once, even with several windows open, and the answer
+    /// closes all of them.
+    #[test]
+    fn quitting_from_the_menu_asks_once_and_closes_every_window() {
+        let (mut app, asked) = app(OnQuit::Ask);
+        let mut second = PortMonitorState::new(
+            "/dev/ttyOTHER".to_string(),
+            "115200 8N1".to_string(),
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+            Vec::new(),
+            None,
+        );
+        second.daemon = app.monitors[0].daemon.clone();
+        app.monitors.push(second);
+
+        assert!(!app.quit_from_menu(), "asking must not close yet");
+        assert!(!app.quit_from_menu(), "a second Cmd+Q must not ask again");
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Status]);
+        assert!(app.monitors.iter().all(|m| m.is_open));
+
+        app.resolve_quit(app.quit_question.as_ref().expect("question").window);
+        assert!(app.monitors.iter().all(|m| !m.is_open));
+    }
+
+    /// With the setting decided, Cmd+Q closes at once.
+    #[test]
+    fn quitting_from_the_menu_without_asking_closes_at_once() {
+        let (mut app, asked) = app(OnQuit::Stop);
+        assert!(app.quit_from_menu());
+        assert!(!app.monitors[0].is_open);
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Stop]);
     }
 }

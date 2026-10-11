@@ -283,6 +283,7 @@ static void forward_edit_action(id target, unsigned short keyCode, NSString *cha
 - (void)zoomOut:(id)sender;
 - (void)zoomReset:(id)sender;
 - (void)toggleColor:(id)sender;
+- (void)quitApp:(id)sender;
 @end
 
 static BOOL g_exportRequested = NO;
@@ -293,6 +294,7 @@ static BOOL g_zoomInRequested = NO;
 static BOOL g_zoomOutRequested = NO;
 static BOOL g_zoomResetRequested = NO;
 static BOOL g_toggleColorRequested = NO;
+static BOOL g_quitRequested = NO;
 static NSMenuItem *g_colorMenuItem = nil;
 static BOOL g_colorLocked = NO;
 
@@ -360,6 +362,15 @@ static BOOL g_colorLocked = NO;
     (void)sender;
     g_toggleColorRequested = YES;
 }
+
+// Quit goes through the application rather than `terminate:`, which would end
+// the process without the window ever hearing of it and so skip the question
+// about the daemon (#114). The application closes its windows the way their
+// close buttons do.
+- (void)quitApp:(id)sender {
+    (void)sender;
+    g_quitRequested = YES;
+}
 @end
 
 static DevSerialAboutHandler *g_aboutHandler = nil;
@@ -415,6 +426,14 @@ BOOL devserial_check_zoom_out_requested(void) {
 BOOL devserial_check_zoom_reset_requested(void) {
     if (g_zoomResetRequested) {
         g_zoomResetRequested = NO;
+        return YES;
+    }
+    return NO;
+}
+
+BOOL devserial_check_quit_requested(void) {
+    if (g_quitRequested) {
+        g_quitRequested = NO;
         return YES;
     }
     return NO;
@@ -556,8 +575,9 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
 
         // 1.6 Quit devserial (Cmd+Q)
         NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit devserial"
-                                                          action:@selector(terminate:)
+                                                          action:@selector(quitApp:)
                                                    keyEquivalent:@"q"];
+        [quitItem setTarget:g_aboutHandler];
         [appMenu addItem:quitItem];
 
         // Remove old extra menus so we re-create clean state
