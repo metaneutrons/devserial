@@ -335,6 +335,89 @@ impl Default for PortConfig {
     }
 }
 
+/// The configuration file `load_config` reads, if there is one.
+#[must_use]
+pub fn config_source(explicit_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit_path {
+        return Some(path.to_path_buf());
+    }
+    if let Some(path) = paths::config_override() {
+        return Some(path);
+    }
+    let mut candidates = vec![PathBuf::from("./devserial.toml")];
+    if let Some(dir) = paths::config_dir() {
+        candidates.push(dir.join("config.toml"));
+    }
+    candidates.into_iter().find(|path| path.exists())
+}
+
+/// Where a setting saved from a surface goes: the file that is read today,
+/// or the user's configuration file when there is none yet.
+#[must_use]
+pub fn writable_config_path(explicit_path: Option<&Path>) -> Option<PathBuf> {
+    config_source(explicit_path).or_else(|| paths::config_dir().map(|dir| dir.join("config.toml")))
+}
+
+/// The quit setting as the file says now, for a surface that should honour a
+/// choice another window saved after it opened.
+#[must_use]
+pub fn saved_on_quit(path: &Path) -> Option<OnQuit> {
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<Config>(&text)
+        .ok()
+        .map(|config| config.daemon.on_quit)
+}
+
+/// Save the daemon settings a surface changed, keeping everything else in the
+/// file as it was: other sections, comments and formatting (#114).
+///
+/// # Errors
+/// Returns an error when the file cannot be read, is not valid TOML, or cannot
+/// be written.
+pub fn save_daemon_settings(
+    path: &Path,
+    idle_timeout: Option<crate::lifecycle::IdleTimeout>,
+    on_quit: Option<OnQuit>,
+) -> Result<(), ConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(ConfigError::Io(path.to_path_buf(), e)),
+    };
+    let mut document: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ConfigError::Edit(path.to_path_buf(), e.to_string()))?;
+    let daemon = document
+        .entry("daemon")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::Edit(path.to_path_buf(), "[daemon] is not a table".into()))?;
+    if let Some(timeout) = idle_timeout {
+        daemon["idle_timeout"] = toml_edit::value(timeout.to_string());
+    }
+    if let Some(on_quit) = on_quit {
+        let word = match on_quit {
+            OnQuit::Ask => "ask",
+            OnQuit::Stop => "stop",
+            OnQuit::Keep => "keep",
+        };
+        daemon["on_quit"] = toml_edit::value(word);
+    }
+    let rendered = document.to_string();
+    // What is written has to load again; a file the next start rejects would
+    // be worse than the setting not being saved.
+    toml::from_str::<Config>(&rendered)
+        .map_err(|e| ConfigError::Edit(path.to_path_buf(), e.to_string()))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+    }
+    let staging = path.with_extension("toml.saving");
+    std::fs::write(&staging, rendered).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+    std::fs::rename(&staging, path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))
+}
+
 /// Load configuration from an explicit path, the environment, or discovery.
 ///
 /// Discovery order:
@@ -395,6 +478,8 @@ pub enum ConfigError {
     // clippy's result_large_err threshold on macOS and over it on Windows, so
     // the lint fired only there. Boxing leaves margin on every platform.
     Parse(PathBuf, Box<toml::de::Error>),
+    #[error("could not save to config file {}: {}", .0.display(), .1)]
+    Edit(PathBuf, String),
 }
 
 #[cfg(test)]
@@ -594,5 +679,52 @@ steps = [
         assert_eq!(global.log_directive(), "debug");
         global.log_level = "loud".into();
         assert_eq!(global.log_directive(), "info");
+    }
+
+    /// #114: saving a daemon setting keeps the rest of the file as it was,
+    /// comments included, and the result loads again.
+    #[test]
+    fn saving_daemon_settings_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devserial.toml");
+        let original =
+            "# my settings\n[global]\nlog_level = \"debug\"   # loud\n\n[rest]\nport = 9700\n";
+        std::fs::write(&path, original).unwrap();
+
+        save_daemon_settings(&path, Some("30m".parse().unwrap()), Some(OnQuit::Keep)).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with(original), "{saved}");
+        assert!(saved.contains("idle_timeout = \"30m\""), "{saved}");
+        assert!(saved.contains("on_quit = \"keep\""), "{saved}");
+
+        let loaded = load_required(&path).unwrap();
+        assert_eq!(loaded.daemon.idle_timeout.to_string(), "30m");
+        assert_eq!(loaded.daemon.on_quit, OnQuit::Keep);
+        assert_eq!(loaded.rest.port, 9700);
+
+        // Changing one setting leaves the other alone.
+        save_daemon_settings(&path, Some("0".parse().unwrap()), None).unwrap();
+        let loaded = load_required(&path).unwrap();
+        assert_eq!(loaded.daemon.idle_timeout.to_string(), "0");
+        assert_eq!(loaded.daemon.on_quit, OnQuit::Keep);
+    }
+
+    /// A file that does not exist yet is created with just the setting.
+    #[test]
+    fn saving_creates_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/config.toml");
+        save_daemon_settings(&path, None, Some(OnQuit::Stop)).unwrap();
+        assert_eq!(load_required(&path).unwrap().daemon.on_quit, OnQuit::Stop);
+    }
+
+    /// A file that is not valid TOML is refused rather than overwritten.
+    #[test]
+    fn saving_into_a_broken_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devserial.toml");
+        std::fs::write(&path, "[global\n").unwrap();
+        assert!(save_daemon_settings(&path, None, Some(OnQuit::Stop)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[global\n");
     }
 }
