@@ -17,9 +17,38 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        Self {
-            dir: tempfile::tempdir().expect("temp dir"),
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("home")).expect("home");
+        Self { dir }
+    }
+
+    /// The home every invocation sees. AI tools and their skills folders are
+    /// looked up under it, so nothing a test starts reaches the real ones
+    /// (#124).
+    fn home(&self) -> std::path::PathBuf {
+        self.dir.path().join("home")
+    }
+
+    /// A devserial process that cannot touch production state.
+    fn std_command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"));
+        cmd.env("DEVSERIAL_DATA_DIR", self.dir.path())
+            .env("DEVSERIAL_SOCKET", self.dir.path().join("test.sock"))
+            .env("HOME", self.home())
+            .env("USERPROFILE", self.home())
+            .env_remove("DEVSERIAL_CONFIG")
+            // A stray configuration file in the working directory must not
+            // influence the tests.
+            .current_dir(self.dir.path());
+        for var in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "COPILOT_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            cmd.env_remove(var);
         }
+        cmd
     }
 
     /// A devserial invocation that cannot touch production state.
@@ -36,14 +65,8 @@ impl Sandbox {
     /// it took 6m22s where the same job on the same code had taken 1m55s, and
     /// `a_missing_config_file_is_reported` failed with empty output.
     fn command(&self) -> Command {
-        let mut cmd = Command::cargo_bin("devserial").expect("binary");
-        cmd.timeout(std::time::Duration::from_secs(90))
-            .env("DEVSERIAL_DATA_DIR", self.dir.path())
-            .env("DEVSERIAL_SOCKET", self.dir.path().join("test.sock"))
-            .env_remove("DEVSERIAL_CONFIG")
-            // A stray configuration file in the working directory must not
-            // influence the tests.
-            .current_dir(self.dir.path());
+        let mut cmd = Command::from_std(self.std_command());
+        cmd.timeout(std::time::Duration::from_secs(90));
         cmd
     }
 
@@ -68,14 +91,10 @@ impl Sandbox {
 impl Drop for Sandbox {
     /// Stop a daemon a test may have started, so no process outlives the run.
     fn drop(&mut self) {
-        if let Ok(mut cmd) = Command::cargo_bin("devserial") {
-            let _ = cmd
-                .env("DEVSERIAL_DATA_DIR", self.dir.path())
-                .env("DEVSERIAL_SOCKET", self.dir.path().join("test.sock"))
-                .args(["daemon", "--stop"])
-                .timeout(std::time::Duration::from_secs(10))
-                .output();
-        }
+        let _ = Command::from_std(self.std_command())
+            .args(["daemon", "--stop"])
+            .timeout(std::time::Duration::from_secs(10))
+            .output();
     }
 }
 
@@ -499,12 +518,9 @@ fn the_start_flag_overrides_the_configuration() {
         "[daemon]\nidle_timeout = \"30m\"\n",
     )
     .expect("config");
-    let mut daemon = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"))
+    let mut daemon = sandbox
+        .std_command()
         .args(["daemon", "--idle-timeout", "1h"])
-        .env("DEVSERIAL_DATA_DIR", sandbox.dir.path())
-        .env("DEVSERIAL_SOCKET", sandbox.dir.path().join("test.sock"))
-        .env_remove("DEVSERIAL_CONFIG")
-        .current_dir(sandbox.dir.path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -533,12 +549,9 @@ fn an_idle_period_without_a_unit_is_refused() {
 #[test]
 fn an_mcp_session_holds_the_daemon_until_it_ends() {
     let sandbox = Sandbox::new();
-    let mut mcp = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"))
+    let mut mcp = sandbox
+        .std_command()
         .arg("mcp")
-        .env("DEVSERIAL_DATA_DIR", sandbox.dir.path())
-        .env("DEVSERIAL_SOCKET", sandbox.dir.path().join("test.sock"))
-        .env_remove("DEVSERIAL_CONFIG")
-        .current_dir(sandbox.dir.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -581,19 +594,11 @@ fn an_mcp_session_holds_the_daemon_until_it_ends() {
     assert!(!held(&sandbox), "the lease outlived the MCP session");
 }
 
-/// A devserial invocation that sees only the AI tools under `home`.
+/// A devserial invocation that sees only the AI tools under `home`, which
+/// is the sandbox's home.
 fn skill_command(sandbox: &Sandbox, home: &std::path::Path) -> Command {
-    let mut cmd = sandbox.command();
-    cmd.env("HOME", home).env("USERPROFILE", home);
-    for var in [
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "COPILOT_HOME",
-        "XDG_CONFIG_HOME",
-    ] {
-        cmd.env_remove(var);
-    }
-    cmd
+    assert_eq!(home, sandbox.home(), "the sandbox decides the home");
+    sandbox.command()
 }
 
 fn skill_status(sandbox: &Sandbox, home: &std::path::Path) -> String {
@@ -609,7 +614,7 @@ fn skill_status(sandbox: &Sandbox, home: &std::path::Path) -> String {
 #[test]
 fn the_skill_is_installed_only_with_consent() {
     let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
+    let home = sandbox.home();
     std::fs::create_dir_all(home.join(".claude")).expect("claude");
     let skill = home.join(".claude/skills/devserial");
 
@@ -653,7 +658,7 @@ fn the_skill_is_installed_only_with_consent() {
 #[test]
 fn a_declined_place_is_not_offered_again() {
     let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
+    let home = sandbox.home();
     std::fs::create_dir_all(home.join(".claude")).expect("claude");
 
     skill_command(&sandbox, &home)
@@ -681,7 +686,7 @@ fn a_declined_place_is_not_offered_again() {
 #[test]
 fn without_an_ai_tool_nothing_is_offered() {
     let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
+    let home = sandbox.home();
     std::fs::create_dir_all(&home).expect("home");
     let status = skill_status(&sandbox, &home);
     assert!(status.contains("No AI tool"), "{status}");
@@ -736,7 +741,7 @@ fn updated(skill_md: &std::path::Path) -> bool {
 #[test]
 fn an_older_copy_is_updated_by_install() {
     let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
+    let home = sandbox.home();
     install_older_copy(&sandbox, &home);
 
     skill_command(&sandbox, &home)
@@ -754,7 +759,7 @@ fn an_older_copy_is_updated_by_install() {
 #[test]
 fn the_daemon_updates_the_skill_when_it_starts() {
     let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
+    let home = sandbox.home();
     let skill_md = install_older_copy(&sandbox, &home);
 
     skill_command(&sandbox, &home)
@@ -775,29 +780,17 @@ fn the_daemon_updates_the_skill_when_it_starts() {
 #[test]
 fn the_mcp_server_updates_the_skill_without_writing_to_stdout() {
     let sandbox = Sandbox::new();
-    let home = sandbox.dir.path().join("home");
+    let home = sandbox.home();
     let skill_md = install_older_copy(&sandbox, &home);
 
-    let mut mcp = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"));
-    mcp.arg("mcp")
-        .env("DEVSERIAL_DATA_DIR", sandbox.dir.path())
-        .env("DEVSERIAL_SOCKET", sandbox.dir.path().join("test.sock"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env_remove("DEVSERIAL_CONFIG")
-        .current_dir(sandbox.dir.path())
+    let mut mcp = sandbox
+        .std_command()
+        .arg("mcp")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    for var in [
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "COPILOT_HOME",
-        "XDG_CONFIG_HOME",
-    ] {
-        mcp.env_remove(var);
-    }
-    let mut mcp = mcp.spawn().expect("mcp");
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("mcp");
     let done = updated(&skill_md);
 
     // Closing stdin is the AI tool disconnecting.
