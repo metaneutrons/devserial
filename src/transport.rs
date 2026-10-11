@@ -248,22 +248,22 @@ mod windows {
 
         /// Wait for the next client connection.
         ///
+        /// Cancel safe: the waiting instance stays in place until a client has
+        /// connected, so a `select!` that drops this future loses nothing. The
+        /// server loop drops it whenever another branch fires, and taking the
+        /// instance out first closed the listener for good.
+        ///
         /// # Errors
         /// Returns an error if the pipe cannot be served.
         pub async fn accept(&mut self) -> io::Result<ServerStream> {
-            let server = self
-                .pending
-                .take()
-                .ok_or_else(|| io::Error::other("named pipe listener is closed"))?;
-            server.connect().await?;
+            let closed = || io::Error::other("named pipe listener is closed");
+            self.pending.as_ref().ok_or_else(closed)?.connect().await?;
             // Every instance serves exactly one client, so the next one has to
             // exist before this connection is handed off.
-            self.pending = Some(
-                ServerOptions::new()
-                    .reject_remote_clients(true)
-                    .create(&self.name)?,
-            );
-            Ok(server)
+            let next = ServerOptions::new()
+                .reject_remote_clients(true)
+                .create(&self.name)?;
+            self.pending.replace(next).ok_or_else(closed)
         }
     }
 
