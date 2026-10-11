@@ -493,8 +493,10 @@ fn print_lifecycle(state: &crate::protocol::LifecycleState) {
     }
     if state.leases.is_empty() {
         if let Some(seconds) = state.stops_in_seconds {
-            let left = crate::lifecycle::IdleTimeout(std::time::Duration::from_secs(seconds));
-            println!("Stops by itself in: {left} unless something happens");
+            println!(
+                "Stops by itself in: {} unless something happens",
+                crate::lifecycle::format_remaining(seconds)
+            );
         }
     } else {
         let held: Vec<String> = state.leases.iter().map(ToString::to_string).collect();

@@ -1844,10 +1844,7 @@ fn daemon_title(state: &AppState) -> String {
     };
     let holds = if life.leases.is_empty() {
         life.stops_in_seconds.map_or_else(String::new, |seconds| {
-            format!(
-                ", stops in {}",
-                crate::lifecycle::IdleTimeout(Duration::from_secs(seconds))
-            )
+            format!(", stops in {}", crate::lifecycle::format_remaining(seconds))
         })
     } else {
         let names: Vec<String> = life.leases.iter().map(ToString::to_string).collect();

@@ -81,7 +81,7 @@ fn daemon_state_labels(ui: &mut egui::Ui, view: &crate::standalone::DaemonView) 
         life.stops_in_seconds.map_or_else(String::new, |seconds| {
             format!(
                 "Nothing holds it; it stops in {} unless something happens.",
-                IdleTimeout(std::time::Duration::from_secs(seconds))
+                crate::lifecycle::format_remaining(seconds)
             )
         })
     } else {
