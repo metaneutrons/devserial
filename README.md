@@ -276,6 +276,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `F5` | Run a configured macro |
 | `F6` | Flash firmware to an ESP device |
 | `F8` | Toggle semantic colors in the capture display |
+| `F9` | Daemon: idle period, what holds it, and what quitting does; `Enter` applies, `Ctrl+D` saves as default, `Tab` changes the quit setting |
 | `Ctrl+K` | Release the port, or take it back |
 | `Ctrl+F` | Filter the view, `Esc` clears the filter |
 | `Ctrl+L` | Clear the view; the capture on disk is untouched |
@@ -287,7 +288,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `↑` `↓` `PgUp` `PgDn` `End` | Scroll, `End` returns to auto-follow |
 | `Enter` | Send the typed line with the selected line ending |
 | `Esc` | Leave the current mode |
-| `Ctrl+C`, or `q` on an empty input line | Exit |
+| `Ctrl+C`, or `q` on an empty input line | Exit, asking about the daemon unless the quit setting says otherwise |
 
 The status bar shows the active view and the keys. Timestamps and the hex dump work the same way as in the GUI and produce the same output for the same bytes.
 
@@ -318,7 +319,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `stats` | Connection state and buffer statistics |
 | `flash` | Flash an ESP device through `espflash` |
 | `rest` | Show or change the HTTP interface of the daemon |
-| `daemon` | Run, inspect or stop the daemon |
+| `daemon` | Run, inspect or stop the daemon, or change its idle period |
 | `monitor` / `tui` | Interactive monitors |
 | `mcp` | Run as an MCP server |
 | `about` | Version, author, license, repository |
@@ -400,12 +401,66 @@ Export writes one format, whichever front end asks for it. CSV carries the heade
 ### The daemon
 
 ```bash
-devserial daemon --status   # is it running, and on which endpoint
-devserial daemon            # run it in the foreground
-devserial daemon --stop     # stop it
+devserial daemon --status                  # running? idle period, what holds it
+devserial daemon                           # run it in the foreground
+devserial daemon --idle-timeout 2h         # ... with another idle period
+devserial daemon --set-idle-timeout 30m    # change it on the running daemon
+devserial daemon --stop                    # stop it
 ```
 
-The daemon owns the open ports, the SQLite writers and the IPC endpoint. It restores the ports that were open when it last stopped.
+**One daemon for all ports.** There is one daemon per user, not one per port.
+It holds every open port, writes each one into its own capture database, and
+answers every client over a single endpoint: the CLI, the MCP server, the
+terminal monitor and every window. A second daemon exists only when you ask for
+one with `--socket` or `DEVSERIAL_SOCKET`, and then it is a separate world that
+knows nothing of the first; a port either of them holds cannot be opened by the
+other, because the operating system hands a serial port to one holder.
+
+**It starts itself, and stops itself once idle.** Any command that needs the
+daemon starts it. It stops by itself after **15 minutes** idle, which means all
+of this at once:
+
+- no request arrived, over the IPC socket or over HTTP;
+- no data came in on any open port;
+- no window, terminal monitor, MCP session or `read --follow` is attached.
+
+Listening is idle: an open port that stays silent does not keep the daemon
+alive, and neither does a listening HTTP interface. An attached window,
+terminal monitor, MCP session or `read --follow` does, for as long as it is
+there, whatever else happens; each holds a lease that it renews every minute
+and that lapses three minutes after a crash. Because an AI tool keeps its MCP
+server running for its whole session, the daemon stays with it.
+
+The stop is the same as `devserial daemon --stop`: the ports stay recorded, and
+the next start reopens them and continues the same capture databases. What a
+device sends while no daemon runs is lost. A board that stays silent for longer
+than the idle period and then wakes up therefore talks into a closed port until
+something starts the daemon again. If that matters, raise the period or set it
+to `0`, which means never. The idle stop always concerns the one daemon with
+all its ports: a silent port next to an active one stays open, because the
+active port's data resets the timer, and no port is ever closed on its own for
+being silent.
+
+The period comes from, in rising precedence: the built-in 15 minutes,
+`[daemon] idle_timeout` in the configuration, `--idle-timeout` when the daemon
+starts, and `--set-idle-timeout` on the running daemon, which lasts until it
+stops. `--status` says which of these is in force. Durations are written `90s`,
+`15m`, `2h` or `0`.
+
+**Quitting a monitor asks about the daemon.** Quitting the terminal monitor or
+closing the last window asks whether the daemon should stop too, and names what
+that would end: the open ports with their line counts, other attached clients,
+and a listening HTTP interface. The answer can be remembered. `[daemon] on_quit`
+holds it, as `ask`, `stop` or `keep`; with `stop` or `keep` nobody is asked.
+
+Both are set in the monitors as well: `F9` in the terminal monitor, the
+**Daemon** entry in the window's status bar. A change applies to the running
+daemon at once; *save as default* writes it to the configuration file the
+monitor read, or to your user file when there is none, keeping the rest of the
+file as it was.
+
+`devserial close PORT` releases one port and keeps the daemon running for the
+others.
 
 ---
 
@@ -640,6 +695,13 @@ flush_batch_size = 1000
 
 # trace, debug, info, warn, error, off. RUST_LOG overrides it.
 log_level = "info"
+
+[daemon]
+# Stop after this long idle: no request, no data on any port, no window,
+# terminal monitor, MCP session or `read --follow` attached. 0 means never.
+idle_timeout = "15m"
+# What quitting a monitor does to the daemon: ask, stop or keep.
+on_quit = "ask"
 
 [ports."/dev/ttyUSB0"]
 baudrate = 115200
