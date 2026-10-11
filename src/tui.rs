@@ -95,6 +95,12 @@ pub struct TuiContext {
     /// Shows and changes the HTTP interface.
     #[cfg(feature = "rest")]
     pub rest: Option<crate::standalone::RestControlFn>,
+    /// Shows and changes when the daemon stops by itself, and stops it (#114).
+    pub daemon: Option<crate::standalone::DaemonControlFn>,
+    /// What quitting does to the daemon.
+    pub on_quit: crate::config::OnQuit,
+    /// Where a setting saved from here is written.
+    pub config_file: Option<std::path::PathBuf>,
 }
 
 /// Run the TUI monitor.
@@ -135,6 +141,10 @@ enum InputMode {
     /// Naming a firmware image and watching espflash run.
     #[cfg(feature = "esp")]
     Flash,
+    /// Showing and changing when the daemon stops by itself.
+    Daemon,
+    /// Asking, on quit, whether the daemon should stop too.
+    QuitDaemon,
 }
 
 // DTR and RTS join the view toggles here. They are separate switches with
@@ -212,9 +222,142 @@ struct AppState {
     hex_view: bool,
     /// Semantic colours in the capture buffer, independent of stored payloads.
     color_enabled: bool,
+    /// Shows and changes the daemon's lifecycle, and stops it.
+    daemon: Option<crate::standalone::DaemonControlFn>,
+    /// What quitting does to the daemon.
+    on_quit: crate::config::OnQuit,
+    /// Where a setting saved from here is written.
+    config_file: Option<std::path::PathBuf>,
+    /// What the daemon last said about itself.
+    daemon_view: Option<crate::standalone::DaemonView>,
 }
 
 impl AppState {
+    /// Ask the daemon about itself (#114). Never starts one.
+    fn refresh_daemon(&mut self) {
+        let Some(daemon) = self.daemon.clone() else {
+            self.daemon_view = None;
+            return;
+        };
+        match daemon(crate::standalone::DaemonRequest::Status) {
+            Ok(view) => self.daemon_view = Some(view),
+            Err(e) => {
+                self.daemon_view = None;
+                self.set_status(format!("daemon not reachable: {e}"));
+            }
+        }
+    }
+
+    /// The idle period typed on the daemon screen, or why it is not one.
+    fn typed_idle(&self) -> Result<crate::lifecycle::IdleTimeout, String> {
+        self.input.trim().parse::<crate::lifecycle::IdleTimeout>()
+    }
+
+    /// Apply the typed idle period to the running daemon.
+    fn apply_idle(&mut self) {
+        let Some(daemon) = self.daemon.clone() else {
+            self.set_status("no daemon connection");
+            return;
+        };
+        match self.typed_idle() {
+            Ok(timeout) => match daemon(crate::standalone::DaemonRequest::SetIdle(
+                timeout.0.as_secs(),
+            )) {
+                Ok(view) => {
+                    self.daemon_view = Some(view);
+                    self.set_status(format!("idle period {timeout} for the running daemon"));
+                }
+                Err(e) => self.set_status(format!("could not change the idle period: {e}")),
+            },
+            Err(e) => self.set_status(e),
+        }
+    }
+
+    /// Apply the typed idle period and save it as the default.
+    fn save_idle_default(&mut self) {
+        let Ok(timeout) = self.typed_idle().map_err(|e| self.set_status(e)) else {
+            return;
+        };
+        self.apply_idle();
+        let Some(path) = self.config_file.clone() else {
+            self.set_status("no configuration file to save to");
+            return;
+        };
+        match crate::config::save_daemon_settings(&path, Some(timeout), None) {
+            Ok(()) => self.set_status(format!("idle period {timeout} saved to {}", path.display())),
+            Err(e) => self.set_status(e.to_string()),
+        }
+    }
+
+    /// Step through ask, stop and keep, and save the choice.
+    fn cycle_on_quit(&mut self) {
+        use crate::config::OnQuit;
+        self.on_quit = match self.on_quit {
+            OnQuit::Ask => OnQuit::Stop,
+            OnQuit::Stop => OnQuit::Keep,
+            OnQuit::Keep => OnQuit::Ask,
+        };
+        self.save_on_quit();
+    }
+
+    fn save_on_quit(&mut self) {
+        let Some(path) = self.config_file.clone() else {
+            return;
+        };
+        if let Err(e) = crate::config::save_daemon_settings(&path, None, Some(self.on_quit)) {
+            self.set_status(e.to_string());
+        }
+    }
+
+    /// The user asked to quit. Returns whether to leave now, or `false` when
+    /// the question about the daemon is shown first (#114).
+    fn request_quit(&mut self) -> bool {
+        use crate::config::OnQuit;
+        if self.daemon.is_none() {
+            return true;
+        }
+        match self.on_quit {
+            OnQuit::Keep => true,
+            OnQuit::Stop => {
+                self.stop_daemon();
+                true
+            }
+            OnQuit::Ask => {
+                self.refresh_daemon();
+                if self.daemon_view.is_none() {
+                    // Nothing answering, nothing to stop.
+                    return true;
+                }
+                self.input_mode = InputMode::QuitDaemon;
+                false
+            }
+        }
+    }
+
+    /// The answer to the question on quit. Always leaves.
+    fn answer_quit(&mut self, stop: bool, remember: bool) -> bool {
+        if remember {
+            self.on_quit = if stop {
+                crate::config::OnQuit::Stop
+            } else {
+                crate::config::OnQuit::Keep
+            };
+            self.save_on_quit();
+        }
+        if stop {
+            self.stop_daemon();
+        }
+        true
+    }
+
+    fn stop_daemon(&self) {
+        if let Some(daemon) = &self.daemon
+            && let Err(e) = daemon(crate::standalone::DaemonRequest::Stop)
+        {
+            tracing::warn!(error = %e, "could not stop the daemon on quit");
+        }
+    }
+
     /// Ask the daemon what it says about the HTTP interface.
     ///
     /// A failure leaves the last answer in place rather than claiming the
@@ -298,6 +441,10 @@ impl AppState {
             show_timestamps: true,
             hex_view: false,
             color_enabled: color::ui_enabled(),
+            daemon: None,
+            on_quit: crate::config::OnQuit::Ask,
+            config_file: None,
+            daemon_view: None,
         }
     }
 
@@ -465,6 +612,9 @@ fn run_app(
     {
         state.rest = context.rest;
     }
+    state.daemon = context.daemon;
+    state.on_quit = context.on_quit;
+    state.config_file = context.config_file;
 
     loop {
         // Poll new lines from storage.
@@ -500,7 +650,18 @@ fn run_app(
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') => break,
+                KeyCode::Char('c') => {
+                    // A second Ctrl+C while the question is up leaves the
+                    // daemon alone: quitting must never stop it by accident.
+                    if state.input_mode == InputMode::QuitDaemon || state.request_quit() {
+                        break;
+                    }
+                    continue;
+                }
+                KeyCode::Char('d') if state.input_mode == InputMode::Daemon => {
+                    state.save_idle_default();
+                    continue;
+                }
                 KeyCode::Char('b') => {
                     match send_break(&state) {
                         Ok(()) => state.note(
@@ -614,6 +775,20 @@ fn run_app(
                 }
                 continue;
             }
+            KeyCode::F(9) => {
+                state.input_mode = toggle(&state.input_mode, InputMode::Daemon);
+                state.input.clear();
+                if state.input_mode == InputMode::Daemon {
+                    state.refresh_daemon();
+                    if let Some(view) = &state.daemon_view {
+                        state.input = crate::lifecycle::IdleTimeout(Duration::from_secs(
+                            view.lifecycle.idle_seconds,
+                        ))
+                        .to_string();
+                    }
+                }
+                continue;
+            }
             #[cfg(feature = "rest")]
             KeyCode::F(7) => {
                 state.input_mode = toggle(&state.input_mode, InputMode::Rest);
@@ -677,6 +852,33 @@ fn run_app(
                 continue;
             }
             _ => {}
+        }
+
+        if state.input_mode == InputMode::QuitDaemon {
+            let quit = match key.code {
+                KeyCode::Char('y') => state.answer_quit(true, false),
+                KeyCode::Char('n') => state.answer_quit(false, false),
+                KeyCode::Char('Y') => state.answer_quit(true, true),
+                KeyCode::Char('N') => state.answer_quit(false, true),
+                _ => false,
+            };
+            if quit {
+                break;
+            }
+            continue;
+        }
+
+        if state.input_mode == InputMode::Daemon {
+            match key.code {
+                KeyCode::Enter => state.apply_idle(),
+                KeyCode::Tab => state.cycle_on_quit(),
+                KeyCode::Char(c) => state.input.push(c),
+                KeyCode::Backspace => {
+                    state.input.pop();
+                }
+                _ => {}
+            }
+            continue;
         }
 
         if state.input_mode == InputMode::Configure {
@@ -775,7 +977,9 @@ fn run_app(
             KeyCode::Char('q')
                 if state.input_mode == InputMode::Normal && state.input.is_empty() =>
             {
-                break;
+                if state.request_quit() {
+                    break;
+                }
             }
             KeyCode::Char(c) => state.input.push(c),
             KeyCode::Backspace => {
@@ -1208,7 +1412,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Normal => (
             "> ",
             format!(
-                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | F8 color | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F1 about | Ctrl+C quit ",
+                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | F8 color | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F9 daemon | F1 about | Ctrl+C quit ",
                 crate::export::DISPLAY_ZONE_NOTE
             ),
         ),
@@ -1234,6 +1438,8 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Export => ("Export to: ", export_title(state)),
         #[cfg(feature = "rest")]
         InputMode::Rest => ("Port: ", rest_title(state)),
+        InputMode::Daemon => ("Idle period: ", daemon_title(state)),
+        InputMode::QuitDaemon => ("", " Quit ".to_string()),
         #[cfg(feature = "esp")]
         InputMode::Flash => ("Firmware: ", flash_title(state)),
     };
@@ -1583,8 +1789,73 @@ fn render(frame: &mut Frame, state: &AppState) {
         InputMode::Macros => render_macros_popup(frame, state),
         #[cfg(feature = "esp")]
         InputMode::Flash => render_flash_popup(frame, state),
+        InputMode::QuitDaemon => render_quit_daemon_popup(frame, state),
         _ => {}
     }
+}
+
+/// The question on quit: stop the daemon too, and what that would end.
+fn render_quit_daemon_popup(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(60, 45, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Stop the daemon too?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if let Some(view) = &state.daemon_view {
+        for line in view.what_stopping_ends(crate::protocol::LeaseKind::Tui) {
+            lines.push(Line::from(line));
+        }
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from("y  stop it        n  leave it running"),
+        Line::from("Y  always stop    N  always leave it running"),
+        Line::from("Esc  do not quit"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Quit ")),
+        area,
+    );
+}
+
+/// What the daemon screen says above its input line.
+fn daemon_title(state: &AppState) -> String {
+    let on_quit = match state.on_quit {
+        crate::config::OnQuit::Ask => "ask",
+        crate::config::OnQuit::Stop => "stop",
+        crate::config::OnQuit::Keep => "keep",
+    };
+    let Some(view) = &state.daemon_view else {
+        return format!(" Daemon not reachable | on quit: {on_quit} (Tab) | Esc closes ");
+    };
+    let life = &view.lifecycle;
+    let period = if life.idle_seconds == 0 {
+        "never stops by itself".to_string()
+    } else {
+        format!(
+            "idle {} ({})",
+            crate::lifecycle::IdleTimeout(Duration::from_secs(life.idle_seconds)),
+            life.source
+        )
+    };
+    let holds = if life.leases.is_empty() {
+        life.stops_in_seconds.map_or_else(String::new, |seconds| {
+            format!(", stops in {}", crate::lifecycle::format_remaining(seconds))
+        })
+    } else {
+        let names: Vec<String> = life.leases.iter().map(ToString::to_string).collect();
+        format!(", held by {}", names.join(", "))
+    };
+    let save = state.config_file.as_ref().map_or_else(String::new, |path| {
+        format!(" | Ctrl+D save as default to {}", path.display())
+    });
+    format!(
+        " Daemon: {period}{holds} | on quit: {on_quit} (Tab) | Enter apply now{save} | Esc closes "
+    )
 }
 
 /// Render a payload for the active view.
@@ -2284,5 +2555,72 @@ mod tests {
                 export_format_label(format)
             );
         }
+    }
+
+    fn with_daemon(
+        on_quit: crate::config::OnQuit,
+        reachable: bool,
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<crate::standalone::DaemonRequest>>>,
+    ) {
+        let (control, asked) = crate::standalone::fake_daemon_control(reachable);
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.daemon = Some(control);
+        state.on_quit = on_quit;
+        (state, asked)
+    }
+
+    /// #114: what quitting does follows the setting.
+    #[test]
+    fn quitting_follows_the_setting() {
+        use crate::config::OnQuit;
+        use crate::standalone::DaemonRequest;
+
+        let (mut keep, asked) = with_daemon(OnQuit::Keep, true);
+        assert!(keep.request_quit());
+        assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+
+        let (mut stop, asked) = with_daemon(OnQuit::Stop, true);
+        assert!(stop.request_quit());
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Stop]);
+
+        let (mut ask, asked) = with_daemon(OnQuit::Ask, true);
+        assert!(!ask.request_quit(), "asking must keep the TUI open");
+        assert!(ask.input_mode == InputMode::QuitDaemon);
+        assert!(ask.answer_quit(false, false));
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Status]);
+
+        let (mut ask, asked) = with_daemon(OnQuit::Ask, true);
+        assert!(!ask.request_quit());
+        assert!(ask.answer_quit(true, false));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![DaemonRequest::Status, DaemonRequest::Stop]
+        );
+    }
+
+    /// Nothing answering means nothing to ask about.
+    #[test]
+    fn an_unreachable_daemon_is_not_asked_about() {
+        let (mut state, _) = with_daemon(crate::config::OnQuit::Ask, false);
+        assert!(state.request_quit());
+        let mut none = AppState::new("/dev/x", &PortConfig::default());
+        assert!(none.request_quit());
+    }
+
+    /// "Always" saves the answer, so the next quit does not ask.
+    #[test]
+    fn remembering_the_answer_saves_the_setting() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("devserial.toml");
+        let (mut state, _) = with_daemon(crate::config::OnQuit::Ask, true);
+        state.config_file = Some(file.clone());
+        assert!(!state.request_quit());
+        assert!(state.answer_quit(false, true));
+        assert_eq!(
+            crate::config::saved_on_quit(&file),
+            Some(crate::config::OnQuit::Keep)
+        );
     }
 }

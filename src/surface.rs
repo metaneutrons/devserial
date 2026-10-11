@@ -88,6 +88,10 @@ pub enum Capability {
     /// it, so leaving it out would describe them wrongly.
     #[cfg(feature = "rest")]
     RestServer,
+    /// Show and change when the daemon stops by itself, and save it (#114).
+    DaemonLifecycle,
+    /// Ask on quit whether the daemon should stop too, or follow the setting.
+    QuitAsksAboutDaemon,
 }
 
 impl Capability {
@@ -115,6 +119,8 @@ impl Capability {
         Self::About,
         #[cfg(feature = "rest")]
         Self::RestServer,
+        Self::DaemonLifecycle,
+        Self::QuitAsksAboutDaemon,
     ];
 }
 
@@ -150,6 +156,8 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::About, "show_about_dialog"),
     #[cfg(feature = "rest")]
     (Capability::RestServer, "fn render_rest_dialog"),
+    (Capability::DaemonLifecycle, "fn render_daemon_dialog"),
+    (Capability::QuitAsksAboutDaemon, "fn render_quit_question"),
 ];
 
 /// What the terminal interface offers, with the same kind of proof.
@@ -177,6 +185,8 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::FlashFirmware, "fn start_flash"),
     #[cfg(feature = "rest")]
     (Capability::RestServer, "InputMode::Rest"),
+    (Capability::DaemonLifecycle, "InputMode::Daemon"),
+    (Capability::QuitAsksAboutDaemon, "InputMode::QuitDaemon"),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.

@@ -256,6 +256,155 @@ pub enum RestRequest {
 pub type RestControlFn =
     Arc<dyn Fn(&RestRequest) -> Result<crate::protocol::RestState, String> + Send + Sync>;
 
+/// What a surface asks of the daemon itself (#114).
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonRequest {
+    /// Report the lifecycle and what stopping would end.
+    Status,
+    /// Change the idle period of the running daemon, in seconds.
+    SetIdle(u64),
+    /// Stop the daemon.
+    Stop,
+}
+
+/// What a surface shows about the daemon, and what stopping it would end.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonView {
+    /// The idle period, its source, and what holds the daemon.
+    pub lifecycle: crate::protocol::LifecycleState,
+    /// The ports it holds, with their line counts.
+    pub ports: Vec<crate::protocol::PortInfoResponse>,
+    /// Where the HTTP interface listens, if it does.
+    pub rest: Option<String>,
+}
+
+#[cfg(any(feature = "monitor", feature = "tui"))]
+impl DaemonView {
+    /// What stopping the daemon would end, as lines a question can show.
+    ///
+    /// `own` is the kind of lease the asking surface holds itself; one lease
+    /// of that kind is the surface and not "another client".
+    #[must_use]
+    pub fn what_stopping_ends(&self, own: LeaseKind) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.ports.is_empty() {
+            lines.push("No port is open.".to_string());
+        }
+        for port in &self.ports {
+            lines.push(format!(
+                "Port {} stops recording ({} lines captured).",
+                port.name, port.total_lines
+            ));
+        }
+        let mut others = self.lifecycle.leases.clone();
+        if let Some(index) = others.iter().position(|kind| *kind == own) {
+            others.remove(index);
+        }
+        if !others.is_empty() {
+            let names: Vec<String> = others.iter().map(ToString::to_string).collect();
+            lines.push(format!("Also attached: {}.", names.join(", ")));
+        }
+        if let Some(url) = &self.rest {
+            lines.push(format!("The HTTP interface at {url} goes away."));
+        }
+        lines
+    }
+}
+
+/// Shows the daemon's lifecycle and changes or stops it.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+pub type DaemonControlFn = Arc<dyn Fn(DaemonRequest) -> Result<DaemonView, String> + Send + Sync>;
+
+/// A daemon control that answers from a fixed view and records what it was
+/// asked, for tests of the surfaces.
+///
+/// # Panics
+/// Only if a test poisoned the log's lock.
+#[cfg(all(test, any(feature = "monitor", feature = "tui")))]
+#[must_use]
+pub fn fake_daemon_control(reachable: bool) -> (DaemonControlFn, Arc<Mutex<Vec<DaemonRequest>>>) {
+    use crate::protocol::{IdleSource, LifecycleState, PortInfoResponse};
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let control: DaemonControlFn = Arc::new(move |request| {
+        log.lock().unwrap().push(request);
+        if !reachable {
+            return Err("cannot reach the devserial daemon".to_string());
+        }
+        Ok(DaemonView {
+            lifecycle: LifecycleState {
+                idle_seconds: 900,
+                source: IdleSource::Default,
+                stops_in_seconds: None,
+                leases: vec![LeaseKind::Gui, LeaseKind::Tui, LeaseKind::Mcp],
+            },
+            ports: vec![PortInfoResponse {
+                name: "/dev/ttyTEST".to_string(),
+                state: ConnectionState::Connected,
+                total_lines: 42,
+            }],
+            rest: Some("http://127.0.0.1:9600/v1".to_string()),
+        })
+    });
+    (control, asked)
+}
+
+/// Ask the daemon about itself, change its idle period, or stop it.
+///
+/// Nothing here starts a daemon: a status asked of a stopped one is an error,
+/// not a reason to bring it back.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[must_use]
+pub fn daemon_control(
+    client: &Arc<IpcClient>,
+    runtime: &tokio::runtime::Handle,
+) -> DaemonControlFn {
+    let client = Arc::clone(client);
+    let runtime = runtime.clone();
+    Arc::new(move |request: DaemonRequest| {
+        let view = runtime.block_on(async {
+            let lifecycle = match request {
+                DaemonRequest::SetIdle(seconds) => {
+                    client
+                        .send(RequestPayload::SetIdleTimeout { seconds })
+                        .await
+                }
+                DaemonRequest::Status | DaemonRequest::Stop => {
+                    client.send(RequestPayload::GetLifecycle).await
+                }
+            };
+            let ResponsePayload::Lifecycle(lifecycle) = lifecycle.map_err(|e| e.to_string())?
+            else {
+                return Err("unexpected answer from the daemon".to_string());
+            };
+            let ports = match client.send(RequestPayload::ListPorts).await {
+                Ok(ResponsePayload::PortList(ports)) => ports,
+                _ => Vec::new(),
+            };
+            #[cfg(feature = "rest")]
+            let rest = match client.send(RequestPayload::RestStatus).await {
+                Ok(ResponsePayload::RestState(state)) if state.listening => Some(state.url()),
+                _ => None,
+            };
+            #[cfg(not(feature = "rest"))]
+            let rest = None;
+            Ok(DaemonView {
+                lifecycle,
+                ports,
+                rest,
+            })
+        })?;
+        if request == DaemonRequest::Stop {
+            runtime
+                .block_on(client.send(RequestPayload::Shutdown))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(view)
+    })
+}
+
 /// Something a surface asks the hardware to do.
 ///
 /// Its own vocabulary rather than the window's wire type: `gui_ipc` exists to
@@ -608,6 +757,7 @@ pub fn open_standalone_session(
         &parts.client,
         &parts.keepalive,
         &runtime,
+        None,
     ))
 }
 
@@ -617,6 +767,9 @@ pub fn open_standalone_session(
 /// connection switch and HTTP switch. Both ways of opening a window go through
 /// it, so a button cannot work in one and be dead in the other.
 #[cfg(feature = "monitor")]
+// Each argument is a separate route the window gets; bundling them into a
+// struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 fn session_monitor(
     port: &str,
     config: &PortConfig,
@@ -625,6 +778,7 @@ fn session_monitor(
     client: &Arc<IpcClient>,
     keepalive: &Arc<SessionKeepalive>,
     runtime: &tokio::runtime::Handle,
+    config_path: Option<&Path>,
 ) -> crate::monitor::PortMonitorState {
     let writer = DaemonWriter {
         port: port.to_string(),
@@ -651,6 +805,11 @@ fn session_monitor(
     {
         monitor.rest = Some(daemon_rest(client, runtime));
     }
+    monitor.daemon = Some(daemon_control(client, runtime));
+    monitor.on_quit = crate::config::load_config(config_path)
+        .map(|loaded| loaded.daemon.on_quit)
+        .unwrap_or_default();
+    monitor.config_file = crate::config::writable_config_path(config_path);
     monitor
 }
 
@@ -703,6 +862,7 @@ pub fn run_monitor_standalone(
         &parts.client,
         &parts.keepalive,
         &runtime,
+        config_path,
     ));
 
     match result {
@@ -779,6 +939,11 @@ fn run_tui_attached(
         transfer: Some(daemon_transfer(port, &parts.client, runtime.clone())),
         #[cfg(feature = "rest")]
         rest: Some(daemon_rest(&parts.client, runtime)),
+        daemon: Some(daemon_control(&parts.client, runtime)),
+        on_quit: crate::config::load_config(config_path)
+            .map(|loaded| loaded.daemon.on_quit)
+            .unwrap_or_default(),
+        config_file: crate::config::writable_config_path(config_path),
     };
 
     crate::tui::run_tui(port, config, &parts.shared_storage, runtime, context)
@@ -989,6 +1154,7 @@ mod tests {
             &parts.client,
             &parts.keepalive,
             &runtime,
+            None,
         );
 
         window.toggle_connection();
@@ -1045,6 +1211,57 @@ mod tests {
 
         drop(parts);
         assert!(leases().is_empty(), "the lease outlived the session");
+    }
+
+    /// #114: the question on quit names what stopping would end, and does not
+    /// count the asking surface as another client.
+    #[test]
+    fn the_question_names_what_stopping_ends() {
+        let (control, _) = fake_daemon_control(true);
+        let view = control(DaemonRequest::Status).expect("view");
+        let lines = view.what_stopping_ends(LeaseKind::Tui);
+        assert_eq!(
+            lines,
+            vec![
+                "Port /dev/ttyTEST stops recording (42 lines captured).".to_string(),
+                "Also attached: GUI, MCP.".to_string(),
+                "The HTTP interface at http://127.0.0.1:9600/v1 goes away.".to_string(),
+            ]
+        );
+    }
+
+    /// #114: the surfaces' control reports the daemon, changes its idle
+    /// period, and stops it, against a real daemon.
+    #[cfg(all(unix, feature = "testutil"))]
+    #[test]
+    fn the_daemon_control_reports_changes_and_stops() {
+        let daemon = FakeDaemon::start();
+        let client = Arc::new(IpcClient::new(daemon.socket.clone()));
+        let control = daemon_control(&client, daemon.runtime.handle());
+
+        let view = control(DaemonRequest::Status).expect("status");
+        assert_eq!(view.lifecycle.idle_seconds, 900);
+        assert!(
+            view.ports.iter().any(|port| port.name == FakeDaemon::PORT),
+            "{view:?}"
+        );
+
+        let view = control(DaemonRequest::SetIdle(60)).expect("set");
+        assert_eq!(view.lifecycle.idle_seconds, 60);
+        assert_eq!(view.lifecycle.source, crate::protocol::IdleSource::Runtime);
+
+        control(DaemonRequest::Stop).expect("stop");
+        for _ in 0..100 {
+            if !daemon.socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!daemon.socket.exists(), "the daemon did not stop");
+        assert!(
+            control(DaemonRequest::Status).is_err(),
+            "a status started a daemon"
+        );
     }
 
     #[test]

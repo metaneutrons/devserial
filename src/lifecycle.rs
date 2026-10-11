@@ -86,6 +86,22 @@ impl<'de> Deserialize<'de> for IdleTimeout {
     }
 }
 
+/// A remaining time as people read it: `14m 59s`, `2h 5m`, `40s`.
+///
+/// Unlike [`IdleTimeout`]'s form this is never parsed back, so it may combine
+/// units and drop the smallest one once hours are involved.
+#[must_use]
+pub fn format_remaining(seconds: u64) -> String {
+    let (hours, minutes, secs) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    match (hours, minutes, secs) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, 0, _) => format!("{h}h"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
 /// Where the current time comes from, so tests need not wait.
 pub trait Clock: Send + Sync {
     /// The current instant.
@@ -273,6 +289,19 @@ pub(crate) mod tests {
                 bad.parse::<IdleTimeout>().is_err(),
                 "{bad:?} must be refused"
             );
+        }
+    }
+
+    #[test]
+    fn a_remaining_time_reads_as_people_say_it() {
+        for (seconds, text) in [
+            (40, "40s"),
+            (900, "15m"),
+            (899, "14m 59s"),
+            (7200, "2h"),
+            (7500, "2h 5m"),
+        ] {
+            assert_eq!(format_remaining(seconds), text);
         }
     }
 

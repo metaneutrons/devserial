@@ -20,6 +20,7 @@ use crate::color::{self, Tone};
 use crate::config::PortConfig;
 use crate::export::{self, ExportFormat};
 use crate::gui_ipc::{GuiCommand, MonitorEvent, OpenPortRequest};
+use crate::lifecycle::IdleTimeout;
 use crate::platform::{self, EditState, MenuRequest};
 use crate::serial_params::{
     BAUD_PRESETS, DEFAULT_BAUD, DataBits, FlowControl, LineEnding, Parity, StopBits,
@@ -61,6 +62,37 @@ fn rest_indicator_label(state: Option<&crate::protocol::RestState>, unavailable:
         Some(_) => "REST off".to_string(),
         None => "REST checking…".to_string(),
     }
+}
+
+/// What the daemon says about its idle period and what holds it.
+fn daemon_state_labels(ui: &mut egui::Ui, view: &crate::standalone::DaemonView) {
+    let life = &view.lifecycle;
+    let period = if life.idle_seconds == 0 {
+        "Never stops by itself".to_string()
+    } else {
+        format!(
+            "Stops after {} idle ({})",
+            IdleTimeout(std::time::Duration::from_secs(life.idle_seconds)),
+            life.source
+        )
+    };
+    ui.label(period);
+    let holds = if life.leases.is_empty() {
+        life.stops_in_seconds.map_or_else(String::new, |seconds| {
+            format!(
+                "Nothing holds it; it stops in {} unless something happens.",
+                crate::lifecycle::format_remaining(seconds)
+            )
+        })
+    } else {
+        let names: Vec<String> = life.leases.iter().map(ToString::to_string).collect();
+        format!("Held by: {}", names.join(", "))
+    };
+    ui.label(
+        egui::RichText::new(holds)
+            .size(11.0)
+            .color(egui::Color32::from_rgb(150, 150, 150)),
+    );
 }
 
 /// Interpret the REST port field. An empty field means use the daemon config.
@@ -583,6 +615,8 @@ pub fn run_monitor_gui() -> Result<(), String> {
         connect_view_height: 0.0,
         grown_for_monitor: false,
         last_zoom: stored_zoom().unwrap_or(1.0),
+        quit_question: None,
+        quit_resolved: false,
     };
 
     let options = window_options(
@@ -631,6 +665,8 @@ fn run_monitor_inner(initial: PortMonitorState) -> Result<(), String> {
         connect_view_height: 0.0,
         grown_for_monitor: false,
         last_zoom: stored_zoom().unwrap_or(1.0),
+        quit_question: None,
+        quit_resolved: false,
     };
 
     let options = window_options(
@@ -1252,6 +1288,16 @@ pub struct PortMonitorState {
     #[cfg(feature = "rest")]
     rest_port_edited: bool,
     pub show_settings_dialog: bool,
+    /// Shows and changes the daemon's lifecycle, and stops it (#114).
+    pub daemon: Option<crate::standalone::DaemonControlFn>,
+    /// What quitting does to the daemon, as configured when the window opened.
+    pub on_quit: crate::config::OnQuit,
+    /// Where a setting saved from this window is written.
+    pub config_file: Option<std::path::PathBuf>,
+    show_daemon_dialog: bool,
+    daemon_view: Option<crate::standalone::DaemonView>,
+    daemon_idle: String,
+    daemon_status: Option<(String, bool)>,
     /// Live line settings; the single place this window keeps them.
     pub config: PortConfig,
     pub settings_custom_baud: String,
@@ -1359,6 +1405,13 @@ impl PortMonitorState {
             #[cfg(feature = "rest")]
             rest_port_edited: false,
             show_settings_dialog: false,
+            daemon: None,
+            on_quit: crate::config::OnQuit::Ask,
+            config_file: None,
+            show_daemon_dialog: false,
+            daemon_view: None,
+            daemon_idle: String::new(),
+            daemon_status: None,
             settings_custom_baud: config.baudrate.to_string(),
             config,
             settings_status: None,
@@ -1914,6 +1967,10 @@ impl PortMonitorState {
             self.render_rest_dialog(ui.ctx());
         }
 
+        if self.show_daemon_dialog {
+            self.render_daemon_dialog(ui.ctx());
+        }
+
         // Compute context-aware edit state for macOS menu bar (Cut / Copy / Paste / Select All)
         let focused_id = ui.ctx().memory(egui::Memory::focused);
         let (is_text_focused, has_text_selection, text_field_not_empty) = if let Some(fid) =
@@ -1988,9 +2045,135 @@ struct MultiMonitorApp {
     /// egui owns the live value; this is only what is on disk, so a scale the
     /// user did not change costs no write.
     last_zoom: f32,
+    /// The question on quit while it is shown (#114).
+    quit_question: Option<QuitQuestion>,
+    /// Whether quitting has been decided, so the window may close.
+    quit_resolved: bool,
+}
+
+/// The question on quit: stop the daemon too?
+struct QuitQuestion {
+    /// The window that asked; it closes once the question is answered.
+    window: usize,
+    /// What stopping the daemon would end.
+    view: crate::standalone::DaemonView,
+    /// Whether to save the answer as the setting.
+    remember: bool,
 }
 
 impl MultiMonitorApp {
+    /// The last window is closing: decide what happens to the daemon (#114).
+    ///
+    /// Leave it, stop it, or ask, as the setting says. Asking keeps the window
+    /// open until the question is answered.
+    fn begin_quit(&mut self, window: usize) {
+        let mon = &self.monitors[window];
+        let Some(daemon) = mon.daemon.clone() else {
+            self.resolve_quit(window);
+            return;
+        };
+        // Read back from the file, so a choice made in another window counts.
+        let on_quit = mon
+            .config_file
+            .as_deref()
+            .and_then(crate::config::saved_on_quit)
+            .unwrap_or(mon.on_quit);
+        match on_quit {
+            crate::config::OnQuit::Keep => self.resolve_quit(window),
+            crate::config::OnQuit::Stop => {
+                if let Err(e) = daemon(crate::standalone::DaemonRequest::Stop) {
+                    tracing::warn!(error = %e, "could not stop the daemon on quit");
+                }
+                self.resolve_quit(window);
+            }
+            crate::config::OnQuit::Ask => match daemon(crate::standalone::DaemonRequest::Status) {
+                Ok(view) => {
+                    self.quit_question = Some(QuitQuestion {
+                        window,
+                        view,
+                        remember: false,
+                    });
+                }
+                // Nothing answering: nothing to stop.
+                Err(_) => self.resolve_quit(window),
+            },
+        }
+    }
+
+    fn resolve_quit(&mut self, window: usize) {
+        self.quit_question = None;
+        self.quit_resolved = true;
+        self.monitors[window].is_open = false;
+    }
+
+    /// The question on quit, over the window that asked.
+    fn render_quit_question(&mut self, ctx: &egui::Context) {
+        let Some(question) = self.quit_question.as_mut() else {
+            return;
+        };
+        let mut answer: Option<bool> = None;
+        let mut cancel = false;
+        egui::Window::new("Quit devserial")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH);
+                ui.label(egui::RichText::new("Stop the daemon too?").strong());
+                ui.add_space(6.0);
+                for line in question
+                    .view
+                    .what_stopping_ends(crate::protocol::LeaseKind::Gui)
+                {
+                    ui.label(line);
+                }
+                ui.add_space(8.0);
+                ui.checkbox(&mut question.remember, "Remember my answer");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Stop the daemon").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Leave it running").clicked() {
+                        answer = Some(false);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            self.quit_question = None;
+            return;
+        }
+        let Some(stop) = answer else {
+            return;
+        };
+        let (window, remember) = (question.window, question.remember);
+        let mon = &mut self.monitors[window];
+        if remember {
+            mon.on_quit = if stop {
+                crate::config::OnQuit::Stop
+            } else {
+                crate::config::OnQuit::Keep
+            };
+            if let Some(path) = mon.config_file.clone()
+                && let Err(e) = crate::config::save_daemon_settings(&path, None, Some(mon.on_quit))
+            {
+                tracing::warn!(error = %e, "could not save the answer");
+            }
+        }
+        if stop
+            && let Some(daemon) = mon.daemon.clone()
+            && let Err(e) = daemon(crate::standalone::DaemonRequest::Stop)
+        {
+            tracing::warn!(error = %e, "could not stop the daemon on quit");
+        }
+        self.resolve_quit(window);
+    }
+
     /// Act on one command from another invocation.
     fn handle_command(&mut self, command: GuiCommand) {
         match command {
@@ -2229,6 +2412,17 @@ impl eframe::App for MultiMonitorApp {
             && self.monitors.iter().all(|m| !m.is_open)
             && !self.config_dialog.is_open
         {
+            // A last window closed some other way than its close button still
+            // gets the question, shown on that window again (#114).
+            if !self.quit_resolved
+                && let Some(window) = self.monitors.iter().rposition(|m| m.daemon.is_some())
+            {
+                self.monitors[window].is_open = true;
+                self.begin_quit(window);
+                if !self.quit_resolved {
+                    return;
+                }
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -2399,12 +2593,22 @@ impl eframe::App for MultiMonitorApp {
             if open_count > 1 {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.monitors[p_idx].is_open = false;
+            } else if self.quit_resolved {
+                self.monitors[p_idx].is_open = false;
+            } else {
+                // The last window: the daemon question comes first (#114).
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.quit_question.is_none() {
+                    self.begin_quit(p_idx);
+                }
             }
-            self.monitors[p_idx].is_open = false;
         }
 
         let icon_tex = self.icon_texture.clone();
         self.monitors[p_idx].render_ui(ui, icon_tex.as_ref());
+        self.render_quit_question(ui.ctx());
 
         // Show modal Connect Port dialog if triggered
         if self.config_dialog.is_open {
@@ -3975,8 +4179,183 @@ impl PortMonitorState {
                         self.refresh_rest(ui.ctx(), true);
                     }
                 }
+
+                if self.daemon.is_some() {
+                    ui.separator();
+                    if ui
+                        .add(egui::Button::new("Daemon").small())
+                        .on_hover_text("When the daemon stops by itself, and what quitting does")
+                        .clicked()
+                    {
+                        self.open_daemon_dialog();
+                    }
+                }
             });
         });
+    }
+
+    /// Ask the daemon about itself and show the dialog (#114).
+    fn open_daemon_dialog(&mut self) {
+        self.show_daemon_dialog = true;
+        self.daemon_status = None;
+        self.refresh_daemon();
+        if let Some(view) = &self.daemon_view {
+            self.daemon_idle =
+                IdleTimeout(std::time::Duration::from_secs(view.lifecycle.idle_seconds))
+                    .to_string();
+        }
+    }
+
+    fn refresh_daemon(&mut self) {
+        let Some(daemon) = self.daemon.clone() else {
+            return;
+        };
+        match daemon(crate::standalone::DaemonRequest::Status) {
+            Ok(view) => self.daemon_view = Some(view),
+            Err(e) => {
+                self.daemon_view = None;
+                self.daemon_status = Some((format!("Daemon not reachable: {e}"), true));
+            }
+        }
+    }
+
+    /// Apply the typed period to the running daemon, and save it if asked.
+    fn apply_daemon_idle(&mut self, save: bool) {
+        let timeout = match self.daemon_idle.trim().parse::<IdleTimeout>() {
+            Ok(timeout) => timeout,
+            Err(e) => {
+                self.daemon_status = Some((e, true));
+                return;
+            }
+        };
+        let Some(daemon) = self.daemon.clone() else {
+            return;
+        };
+        match daemon(crate::standalone::DaemonRequest::SetIdle(
+            timeout.0.as_secs(),
+        )) {
+            Ok(view) => self.daemon_view = Some(view),
+            Err(e) => {
+                self.daemon_status = Some((format!("Could not change it: {e}"), true));
+                return;
+            }
+        }
+        if !save {
+            self.daemon_status = Some((format!("{timeout} for the running daemon"), false));
+            return;
+        }
+        let Some(path) = self.config_file.clone() else {
+            self.daemon_status = Some(("No configuration file to save to".to_string(), true));
+            return;
+        };
+        self.daemon_status = Some(
+            match crate::config::save_daemon_settings(&path, Some(timeout), None) {
+                Ok(()) => (format!("{timeout} saved to {}", path.display()), false),
+                Err(e) => (e.to_string(), true),
+            },
+        );
+    }
+
+    fn save_on_quit(&mut self) {
+        let Some(path) = self.config_file.clone() else {
+            return;
+        };
+        if let Err(e) = crate::config::save_daemon_settings(&path, None, Some(self.on_quit)) {
+            self.daemon_status = Some((e.to_string(), true));
+        }
+    }
+
+    /// The idle period, what holds the daemon, and what quitting does.
+    fn render_daemon_dialog(&mut self, ctx: &egui::Context) {
+        let mut is_open = self.show_daemon_dialog;
+        let mut close_requested = false;
+        let (mut apply, mut save) = (false, false);
+        let before = self.on_quit;
+
+        egui::Window::new("Daemon")
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH);
+                if let Some(view) = &self.daemon_view {
+                    daemon_state_labels(ui, view);
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Idle period:").strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.daemon_idle)
+                            .hint_text("15m")
+                            .desired_width(80.0),
+                    );
+                    ui.label(
+                        egui::RichText::new("90s, 15m, 2h; 0 = never")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(150, 150, 150)),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    apply = ui.button("Apply now").clicked();
+                    save = ui
+                        .add_enabled(
+                            self.config_file.is_some(),
+                            egui::Button::new("Save as default"),
+                        )
+                        .clicked();
+                });
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("When this window quits:").strong());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.on_quit, crate::config::OnQuit::Ask, "Ask");
+                    ui.radio_value(
+                        &mut self.on_quit,
+                        crate::config::OnQuit::Stop,
+                        "Stop the daemon",
+                    );
+                    ui.radio_value(
+                        &mut self.on_quit,
+                        crate::config::OnQuit::Keep,
+                        "Leave it running",
+                    );
+                });
+                if let Some(path) = &self.config_file {
+                    ui.label(
+                        egui::RichText::new(format!("Saved to {}", path.display()))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(150, 150, 150)),
+                    );
+                }
+
+                if let Some((message, is_err)) = &self.daemon_status {
+                    let colour = if *is_err {
+                        egui::Color32::from_rgb(255, 90, 90)
+                    } else {
+                        egui::Color32::from_rgb(80, 220, 120)
+                    };
+                    ui.colored_label(colour, message);
+                }
+
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close_requested = true;
+                }
+            });
+
+        if apply || save {
+            self.apply_daemon_idle(save);
+        }
+        if self.on_quit != before {
+            self.save_on_quit();
+        }
+        self.show_daemon_dialog = is_open && !close_requested;
     }
 
     /// Ask the owning process to run a macro.
@@ -4449,5 +4828,73 @@ mod rest_status_tests {
             .unwrap();
         monitor.refresh_rest(&ctx, false);
         assert!(!monitor.rest_state.as_ref().unwrap().listening);
+    }
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+    use crate::config::OnQuit;
+    use crate::standalone::DaemonRequest;
+
+    fn app(on_quit: OnQuit) -> (MultiMonitorApp, Arc<std::sync::Mutex<Vec<DaemonRequest>>>) {
+        let (control, asked) = crate::standalone::fake_daemon_control(true);
+        let mut window = PortMonitorState::new(
+            "/dev/ttyTEST".to_string(),
+            "115200 8N1".to_string(),
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+            Vec::new(),
+            None,
+        );
+        window.daemon = Some(control);
+        window.on_quit = on_quit;
+        let app = MultiMonitorApp {
+            monitors: vec![window],
+            commands: std::sync::mpsc::channel().1,
+            open_ports: Arc::new(std::sync::Mutex::new(Vec::new())),
+            _socket_server: None,
+            icon_texture: None,
+            config_dialog: PortConfigDialogState::new(),
+            connect_view_height: 0.0,
+            grown_for_monitor: false,
+            last_zoom: 1.0,
+            quit_question: None,
+            quit_resolved: false,
+        };
+        (app, asked)
+    }
+
+    /// #114: closing the last window leaves, stops or asks, as set.
+    #[test]
+    fn closing_the_last_window_follows_the_setting() {
+        let (mut keep, asked) = app(OnQuit::Keep);
+        keep.begin_quit(0);
+        assert!(keep.quit_resolved && !keep.monitors[0].is_open);
+        assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
+
+        let (mut stop, asked) = app(OnQuit::Stop);
+        stop.begin_quit(0);
+        assert!(stop.quit_resolved);
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Stop]);
+
+        let (mut ask, asked) = app(OnQuit::Ask);
+        ask.begin_quit(0);
+        assert!(!ask.quit_resolved, "asking must keep the window open");
+        assert!(ask.monitors[0].is_open);
+        assert!(ask.quit_question.is_some());
+        assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Status]);
+    }
+
+    /// A choice saved by another window counts at quit time.
+    #[test]
+    fn a_choice_saved_elsewhere_wins_over_the_windows_copy() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("devserial.toml");
+        crate::config::save_daemon_settings(&file, None, Some(OnQuit::Keep)).expect("save");
+        let (mut app, asked) = app(OnQuit::Ask);
+        app.monitors[0].config_file = Some(file);
+        app.begin_quit(0);
+        assert!(app.quit_resolved, "the saved 'keep' should have answered");
+        assert_eq!(*asked.lock().unwrap(), Vec::<DaemonRequest>::new());
     }
 }
