@@ -295,18 +295,18 @@ pub fn run_monitor(port_name: &str, db_path: &Path, port_info: &str) -> Result<(
         return Ok(());
     }
 
-    run_monitor_inner(
-        port_name,
-        db_path,
-        port_info,
+    // The subprocess the MCP server spawns has no session: it reports user
+    // actions over stdout, and has no route to the daemon's switch either.
+    let storage = crate::storage::SqliteStorage::open(db_path)
+        .map_err(|e| format!("failed to open capture database: {e}"))?;
+    let history = storage.load_send_history(500).unwrap_or_default();
+    run_monitor_inner(PortMonitorState::new(
+        port_name.to_string(),
+        port_info.to_string(),
+        storage,
+        history,
         None,
-        None,
-        None,
-        // The subprocess the MCP server spawns has no session, so it has no
-        // route to the daemon's switch either.
-        #[cfg(feature = "rest")]
-        None,
-    )
+    ))
 }
 
 /// Block until the parent process closes our stdin.
@@ -322,28 +322,17 @@ fn wait_for_parent() {
     }
 }
 
-/// Run the monitor for a port this process owns.
+/// Run the monitor for a session attached to the daemon.
+///
+/// The state arrives fully wired, built by the same function as a window that
+/// `devserial gui` opens, so the two cannot differ in what their buttons do.
+/// They did: this entry point used to build its own state and left out the
+/// connection switch, the action path and the line settings.
 ///
 /// # Errors
-/// Returns an error if the database cannot be opened or the window fails.
-pub fn run_monitor_with_port(
-    port_name: &str,
-    db_path: &Path,
-    port_info: &str,
-    write_port: Box<dyn std::io::Write + Send>,
-    keepalive: Arc<crate::standalone::SessionKeepalive>,
-    #[cfg(feature = "rest")] rest: Option<crate::standalone::RestControlFn>,
-) -> Result<(), String> {
-    run_monitor_inner(
-        port_name,
-        db_path,
-        port_info,
-        Some(Arc::new(std::sync::Mutex::new(write_port))),
-        None,
-        Some(keepalive),
-        #[cfg(feature = "rest")]
-        rest,
-    )
+/// Returns an error if the window fails.
+pub fn run_monitor_with_state(state: PortMonitorState) -> Result<(), String> {
+    run_monitor_inner(state)
 }
 
 /// Publish the current edit state to the native menu.
@@ -617,46 +606,17 @@ pub fn run_monitor_gui() -> Result<(), String> {
     .map_err(|e| format!("eframe error: {e}"))
 }
 
-fn run_monitor_inner(
-    port_name: &str,
-    db_path: &Path,
-    port_info: &str,
-    writer: Option<Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
-    reconfigure: Option<ReconfigureFn>,
-    keepalive: Option<Arc<crate::standalone::SessionKeepalive>>,
-    #[cfg(feature = "rest")] rest: Option<crate::standalone::RestControlFn>,
-) -> Result<(), String> {
+fn run_monitor_inner(initial: PortMonitorState) -> Result<(), String> {
     init_platform_app();
+
+    let port_name = initial.port_name.clone();
+    let port_info = initial.port_info.clone();
+    let has_session = initial.writer.is_some();
 
     let ctx_holder: Arc<std::sync::Mutex<Option<egui::Context>>> =
         Arc::new(std::sync::Mutex::new(None));
     let open_ports: crate::gui_ipc::OpenPortsView =
-        Arc::new(std::sync::Mutex::new(vec![port_name.to_string()]));
-
-    let storage = crate::storage::SqliteStorage::open(db_path)
-        .map_err(|e| format!("failed to open capture database: {e}"))?;
-    let history = storage.load_send_history(500).unwrap_or_default();
-    let has_session = writer.is_some();
-
-    #[allow(unused_mut)]
-    let mut initial = PortMonitorState::new_with_reconfigure(
-        port_name.to_string(),
-        port_info.to_string(),
-        storage,
-        history,
-        writer,
-        reconfigure,
-        // This entry point is the monitor subprocess, which forwards its
-        // actions to the MCP server that spawned it.
-        None,
-        None,
-        None,
-        keepalive,
-    );
-    #[cfg(feature = "rest")]
-    {
-        initial.rest = rest;
-    }
+        Arc::new(std::sync::Mutex::new(vec![port_name.clone()]));
 
     let (tx, rx) = std::sync::mpsc::channel();
     let socket_server = start_socket_server(tx, &ctx_holder, &open_ports);
@@ -3946,6 +3906,39 @@ impl PortMonitorState {
                     egui::Color32::from_rgb(255, 200, 100),
                     format!("Filtered: {} matches", self.filtered_indices.len()),
                 );
+            }
+
+            // Every action writes its failure to `settings_status`, not only
+            // the settings dialog, which used to be the one place it showed.
+            // A refused Disconnect or Break then changed nothing on screen and
+            // looked like a dead button. Shown here while that dialog is
+            // closed; a click dismisses it.
+            let failure = self
+                .settings_status
+                .as_ref()
+                .filter(|(_, is_err)| *is_err && !self.show_settings_dialog)
+                .map(|(message, _)| message.clone());
+            if let Some(message) = failure {
+                ui.separator();
+                let label = egui::Label::new(
+                    egui::RichText::new(format!("⚠ {message}"))
+                        .color(egui::Color32::from_rgb(255, 90, 90)),
+                )
+                .truncate()
+                .sense(egui::Sense::click());
+                // Bounded, so a long message is cut short rather than pushing
+                // the REST, zoom and follow controls off the bar.
+                let dismissed = ui
+                    .scope(|ui| {
+                        ui.set_max_width(360.0);
+                        ui.add(label)
+                            .on_hover_text(format!("{message}\n\nClick to dismiss"))
+                            .clicked()
+                    })
+                    .inner;
+                if dismissed {
+                    self.settings_status = None;
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
