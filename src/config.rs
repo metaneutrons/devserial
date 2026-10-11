@@ -27,6 +27,8 @@ pub struct Config {
     pub global: GlobalConfig,
     /// HTTP interface settings.
     pub rest: RestConfig,
+    /// When the daemon stops by itself, and what quitting a monitor does.
+    pub daemon: DaemonConfig,
     /// Per-port configurations keyed by port path.
     pub ports: HashMap<String, PortConfig>,
     /// User-defined macros keyed by name.
@@ -117,6 +119,30 @@ impl Default for GlobalConfig {
             log_level: "info".into(),
         }
     }
+}
+
+/// What quitting the terminal monitor or the window does to the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnQuit {
+    /// Ask every time.
+    #[default]
+    Ask,
+    /// Stop the daemon without asking.
+    Stop,
+    /// Leave it running without asking.
+    Keep,
+}
+
+/// Settings of the daemon's lifecycle (#114).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// How long the daemon waits, idle, before it stops by itself. `0` means
+    /// never. Written as `90s`, `15m` or `2h`.
+    pub idle_timeout: crate::lifecycle::IdleTimeout,
+    /// What quitting a monitor does to the daemon.
+    pub on_quit: OnQuit,
 }
 
 /// Settings of the HTTP interface.

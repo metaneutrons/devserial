@@ -2242,6 +2242,15 @@ mod tests {
             R::Shutdown => Err(
                 "stopping the daemon over HTTP would let a caller remove the thing answering it",
             ),
+            // #114. A lease belongs to a client on this machine's socket; over
+            // HTTP every request already resets the idle timer, which is all a
+            // caller there needs.
+            R::RenewLease { .. } | R::ReleaseLease { .. } => Err(
+                "a lease is held by a local client over the daemon's socket; HTTP requests reset the idle timer themselves",
+            ),
+            R::SetIdleTimeout { .. } | R::GetLifecycle => {
+                Err("the daemon's lifecycle is reached through the daemon, as the HTTP switch is")
+            }
             R::WriteData { .. } => Ok(&["POST /v1/ports/{port}/write"]),
             R::SendBreak { .. } => Ok(&["POST /v1/ports/{port}/break"]),
             R::SetSignal { .. } => Ok(&["POST /v1/ports/{port}/signals"]),
@@ -2345,6 +2354,13 @@ mod tests {
                 token: None,
             },
             R::RestDisable,
+            R::RenewLease {
+                client: "c".into(),
+                kind: crate::protocol::LeaseKind::Gui,
+            },
+            R::ReleaseLease { client: "c".into() },
+            R::SetIdleTimeout { seconds: 900 },
+            R::GetLifecycle,
             R::Shutdown,
         ];
         #[cfg(feature = "esp")]

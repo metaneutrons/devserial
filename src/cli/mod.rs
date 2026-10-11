@@ -132,14 +132,28 @@ pub enum Command {
     Mcp,
 
     /// Start or manage the background daemon service
+    ///
+    /// The daemon stops by itself once it has been idle for its idle period,
+    /// 15 minutes unless configured otherwise: no request, no data on any port,
+    /// and no window, terminal monitor, MCP session or `read --follow`
+    /// attached.
     Daemon {
-        /// Check if the daemon is currently running
-        #[arg(long)]
+        /// Check if the daemon is running, its idle period and what holds it
+        #[arg(long, conflicts_with_all = ["stop", "set_idle_timeout"])]
         status: bool,
 
         /// Stop a running daemon
-        #[arg(long)]
+        #[arg(long, conflicts_with = "set_idle_timeout")]
         stop: bool,
+
+        /// Run with this idle period instead of the configured one (90s, 15m,
+        /// 2h; 0 = never stop by itself)
+        #[arg(long, value_name = "DURATION", conflicts_with_all = ["status", "stop", "set_idle_timeout"])]
+        idle_timeout: Option<crate::lifecycle::IdleTimeout>,
+
+        /// Change the idle period of the running daemon until it stops
+        #[arg(long, value_name = "DURATION")]
+        set_idle_timeout: Option<crate::lifecycle::IdleTimeout>,
     },
 
     /// List managed ports and detected serial hardware
@@ -447,12 +461,21 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
             mcp::run_mcp(cli.socket, config_path.as_deref())
         }
 
-        Some(Command::Daemon { status, stop }) => {
-            if status || stop {
+        Some(Command::Daemon {
+            status,
+            stop,
+            idle_timeout,
+            set_idle_timeout,
+        }) => {
+            if status || stop || set_idle_timeout.is_some() {
                 let session = handlers::Session::new(cli.socket, config_path)?;
-                handlers::daemon_control(&session, status, stop)
+                handlers::daemon_control(&session, status, stop, set_idle_timeout)
             } else {
-                daemon::run_daemon(cli.socket, config_path.as_deref())
+                daemon::run_daemon(
+                    cli.socket,
+                    config_path.as_deref(),
+                    idle_timeout.map(|timeout| timeout.0),
+                )
             }
         }
 

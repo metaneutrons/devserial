@@ -425,3 +425,105 @@ fn a_timeout_kill_passes_failure_and_carries_no_message() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The daemon's idle period as `daemon --status` reports it.
+fn idle_line(sandbox: &Sandbox) -> String {
+    let output = sandbox
+        .command()
+        .args(["daemon", "--status"])
+        .output()
+        .expect("status");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.starts_with("Idle"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Start a daemon through an operation, as every client does.
+fn start_daemon(sandbox: &Sandbox) {
+    sandbox
+        .command()
+        .args(["stats", "/dev/definitely-not-a-port"])
+        .assert()
+        .failure();
+    assert!(sandbox.wait_for_daemon(true), "the daemon did not start");
+}
+
+/// #114: the status names the idle period and where it came from, and a
+/// runtime change wins over everything else until the daemon stops.
+#[test]
+fn the_idle_period_is_reported_and_changed_at_runtime() {
+    let sandbox = Sandbox::new();
+    start_daemon(&sandbox);
+    assert_eq!(idle_line(&sandbox), "Idle period: 15m (built-in default)");
+
+    sandbox
+        .command()
+        .args(["daemon", "--set-idle-timeout", "2h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Idle period: 2h (changed at runtime)",
+        ));
+    assert_eq!(idle_line(&sandbox), "Idle period: 2h (changed at runtime)");
+
+    sandbox
+        .command()
+        .args(["daemon", "--set-idle-timeout", "0"])
+        .assert()
+        .success();
+    assert_eq!(idle_line(&sandbox), "Idle stop: never (changed at runtime)");
+}
+
+/// #114: the configuration file sets the period an auto-started daemon uses.
+#[test]
+fn the_configured_idle_period_applies_without_a_flag() {
+    let sandbox = Sandbox::new();
+    std::fs::write(
+        sandbox.dir.path().join("devserial.toml"),
+        "[daemon]\nidle_timeout = \"30m\"\n",
+    )
+    .expect("config");
+    start_daemon(&sandbox);
+    assert_eq!(idle_line(&sandbox), "Idle period: 30m (configuration)");
+}
+
+/// #114: `--idle-timeout` overrides the configuration for the daemon it
+/// starts.
+#[test]
+fn the_start_flag_overrides_the_configuration() {
+    let sandbox = Sandbox::new();
+    std::fs::write(
+        sandbox.dir.path().join("devserial.toml"),
+        "[daemon]\nidle_timeout = \"30m\"\n",
+    )
+    .expect("config");
+    let mut daemon = std::process::Command::new(assert_cmd::cargo::cargo_bin("devserial"))
+        .args(["daemon", "--idle-timeout", "1h"])
+        .env("DEVSERIAL_DATA_DIR", sandbox.dir.path())
+        .env("DEVSERIAL_SOCKET", sandbox.dir.path().join("test.sock"))
+        .env_remove("DEVSERIAL_CONFIG")
+        .current_dir(sandbox.dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("daemon");
+    let started = sandbox.wait_for_daemon(true);
+    let line = idle_line(&sandbox);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert!(started, "the foreground daemon did not come up");
+    assert_eq!(line, "Idle period: 1h (start flag)");
+}
+
+/// #114: a duration without a unit is refused before anything starts.
+#[test]
+fn an_idle_period_without_a_unit_is_refused() {
+    Sandbox::new()
+        .command()
+        .args(["daemon", "--set-idle-timeout", "15"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs a unit"));
+}

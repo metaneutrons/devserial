@@ -72,10 +72,6 @@ impl Session {
         self.runtime
             .block_on(async { Ok(self.client.send(payload).await?) })
     }
-
-    fn is_alive(&self) -> bool {
-        self.runtime.block_on(self.client.is_alive())
-    }
 }
 
 /// Response of an unexpected shape, which would be an engine bug.
@@ -432,17 +428,46 @@ pub fn rest_control(
 ///
 /// # Errors
 /// Returns an error if the daemon cannot be reached while stopping it.
-pub fn daemon_control(session: &Session, status: bool, stop: bool) -> Result<(), CliError> {
+pub fn daemon_control(
+    session: &Session,
+    status: bool,
+    stop: bool,
+    set_idle_timeout: Option<crate::lifecycle::IdleTimeout>,
+) -> Result<(), CliError> {
     if status {
-        let state = if session.is_alive() {
-            "RUNNING"
-        } else {
-            "STOPPED"
-        };
-        println!(
-            "Daemon is {state} (endpoint: {})",
-            session.endpoint().display()
-        );
+        // Asked of a running daemon only: a status check that started one
+        // would report on a daemon nobody had.
+        match session.request_existing(RequestPayload::GetLifecycle) {
+            Ok(ResponsePayload::Lifecycle(state)) => {
+                println!(
+                    "Daemon is RUNNING (endpoint: {})",
+                    session.endpoint().display()
+                );
+                print_lifecycle(&state);
+            }
+            Ok(other) => return Err(unexpected(&other)),
+            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => println!(
+                "Daemon is STOPPED (endpoint: {})",
+                session.endpoint().display()
+            ),
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+
+    if let Some(timeout) = set_idle_timeout {
+        match session.request_existing(RequestPayload::SetIdleTimeout {
+            seconds: timeout.0.as_secs(),
+        }) {
+            Ok(ResponsePayload::Lifecycle(state)) => print_lifecycle(&state),
+            Ok(other) => return Err(unexpected(&other)),
+            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
+                return Err(CliError::msg(
+                    "the daemon is not running; start it with `devserial daemon --idle-timeout`",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
         return Ok(());
     }
 
@@ -456,6 +481,25 @@ pub fn daemon_control(session: &Session, status: bool, stop: bool) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// The idle period, where it came from, and what keeps the daemon running.
+fn print_lifecycle(state: &crate::protocol::LifecycleState) {
+    let period = crate::lifecycle::IdleTimeout(std::time::Duration::from_secs(state.idle_seconds));
+    if state.idle_seconds == 0 {
+        println!("Idle stop: never ({})", state.source);
+    } else {
+        println!("Idle period: {period} ({})", state.source);
+    }
+    if state.leases.is_empty() {
+        if let Some(seconds) = state.stops_in_seconds {
+            let left = crate::lifecycle::IdleTimeout(std::time::Duration::from_secs(seconds));
+            println!("Stops by itself in: {left} unless something happens");
+        }
+    } else {
+        let held: Vec<String> = state.leases.iter().map(ToString::to_string).collect();
+        println!("Held by: {}", held.join(", "));
+    }
 }
 
 fn list(session: &Session, json: bool) -> Result<(), CliError> {
