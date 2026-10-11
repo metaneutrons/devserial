@@ -124,6 +124,8 @@ struct Inner {
     last_activity: Instant,
     leases: HashMap<String, (LeaseKind, Instant)>,
     last_lines: Option<u64>,
+    /// Requests being served right now.
+    in_flight: usize,
 }
 
 /// The daemon's idle timer and its leases. Shared by every clone of the
@@ -152,6 +154,7 @@ impl Lifecycle {
                 last_activity: now,
                 leases: HashMap::new(),
                 last_lines: None,
+                in_flight: 0,
             }),
         }
     }
@@ -164,6 +167,20 @@ impl Lifecycle {
     pub fn touch(&self) {
         let now = self.clock.now();
         self.lock().last_activity = now;
+    }
+
+    /// A request is being served. Until the returned guard is dropped the
+    /// daemon does not stop through idleness, and the idle period starts
+    /// again when it is: a file transfer or a flash may take longer than the
+    /// idle period without a line arriving.
+    #[must_use]
+    pub fn serving(&self) -> Serving<'_> {
+        let now = self.clock.now();
+        let mut inner = self.lock();
+        inner.in_flight += 1;
+        inner.last_activity = now;
+        drop(inner);
+        Serving { lifecycle: self }
     }
 
     /// Report the total number of captured lines across all ports. A change
@@ -231,7 +248,22 @@ impl Lifecycle {
         inner.leases.retain(|_, (_, expires)| *expires > now);
         inner.period > Duration::ZERO
             && inner.leases.is_empty()
+            && inner.in_flight == 0
             && now.saturating_duration_since(inner.last_activity) >= inner.period
+    }
+}
+
+/// A request being served; see [`Lifecycle::serving`].
+pub struct Serving<'a> {
+    lifecycle: &'a Lifecycle,
+}
+
+impl Drop for Serving<'_> {
+    fn drop(&mut self) {
+        let now = self.lifecycle.clock.now();
+        let mut inner = self.lifecycle.lock();
+        inner.in_flight = inner.in_flight.saturating_sub(1);
+        inner.last_activity = now;
     }
 }
 
@@ -359,6 +391,25 @@ pub(crate) mod tests {
         );
         clock.advance(Duration::from_secs(1));
         assert!(life.idle_expired());
+    }
+
+    /// A request longer than the idle period holds the daemon until it ends,
+    /// and the idle period starts again from its end.
+    #[test]
+    fn a_request_being_served_holds_the_daemon() {
+        let (lifecycle, clock) = lifecycle(15);
+        let serving = lifecycle.serving();
+        clock.advance(Duration::from_mins(40));
+        assert!(!lifecycle.idle_expired(), "stopped while serving a request");
+
+        drop(serving);
+        clock.advance(Duration::from_mins(14));
+        assert!(
+            !lifecycle.idle_expired(),
+            "the period did not restart at the end"
+        );
+        clock.advance(Duration::from_mins(1));
+        assert!(lifecycle.idle_expired());
     }
 
     #[test]

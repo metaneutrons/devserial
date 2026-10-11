@@ -235,18 +235,18 @@ impl CommandEngine {
     /// Returns the operation's error.
     pub async fn execute(&self, payload: RequestPayload) -> Result<ResponsePayload, EngineError> {
         if let Some(client) = &self.remote {
-            client.ensure_daemon().await?;
             let timeout = remote_timeout(&payload);
             return client
                 .clone()
                 .with_timeout(timeout)
-                .send(payload)
+                .send_starting(payload)
                 .await
                 .map_err(Into::into);
         }
         // Every request is something happening, whichever transport carried
-        // it: IPC from the CLI, a monitor or MCP, and HTTP alike (#114).
-        self.lifecycle.touch();
+        // it: IPC from the CLI, a monitor or MCP, and HTTP alike (#114). It
+        // holds the daemon for as long as it is being served.
+        let _serving = self.lifecycle.serving();
         match payload {
             RequestPayload::Ping => Ok(ResponsePayload::Pong),
             RequestPayload::ListPorts => self.list_ports().await,

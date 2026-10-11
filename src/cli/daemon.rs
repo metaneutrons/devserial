@@ -326,6 +326,41 @@ mod tests {
             .expect("server task");
     }
 
+    /// A request that takes longer than the idle period, a transfer or a
+    /// flash, holds the daemon while it runs; the idle period starts again
+    /// when it ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_request_holds_the_daemon_while_it_runs() {
+        let daemon = Idle::start().await;
+        let engine = daemon.engine.clone();
+        let waiting = tokio::spawn(async move {
+            engine
+                .execute(RequestPayload::ReadLines {
+                    port: "mock_idle".to_string(),
+                    window: crate::protocol::ReadWindow {
+                        wait_ms: Some(1500),
+                        ..crate::protocol::ReadWindow::default()
+                    },
+                })
+                .await
+        });
+        Idle::settle().await;
+        daemon.advance(40 * MIN).await;
+        assert!(daemon.running(), "stopped while a request was being served");
+
+        waiting.await.expect("task").expect("read");
+        daemon.advance(14 * MIN).await;
+        assert!(
+            daemon.running(),
+            "the idle period did not restart at the end"
+        );
+        daemon.advance(MIN).await;
+        tokio::time::timeout(Duration::from_secs(2), daemon.server)
+            .await
+            .expect("the daemon did not stop")
+            .expect("server task");
+    }
+
     /// `0` turns the idle stop off.
     #[tokio::test(flavor = "multi_thread")]
     async fn zero_never_stops() {
