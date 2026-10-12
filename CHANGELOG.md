@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.11](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.10...devserial-v0.2.11) (2026-10-12)
+
+
+### Features
+
+* **daemon:** warn when the daemon is another build ([#133](https://github.com/metaneutrons/devserial/issues/133)) ([4510dd0](https://github.com/metaneutrons/devserial/commit/4510dd0b2e1597032a9c53dfa7cd88c1adb3e058))
+
 ## [0.2.10](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.9...devserial-v0.2.10) (2026-10-12)
 
 
