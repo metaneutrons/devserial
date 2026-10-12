@@ -19,8 +19,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-skill-installer"
-version = "0.1.0"
-source = "git+https://github.com/metaneutrons/agent-skill-installer?rev=7498f854f3826852d7b795930c3223e5dbff7d32#7498f854f3826852d7b795930c3223e5dbff7d32"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2b629314adb5af1bbfef2c9f85b490cc8074826c2d4c1b6ea66544a880d9f80"
 dependencies = [
  "semver",
  "sha2 0.11.0",

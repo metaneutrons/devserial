@@ -694,23 +694,21 @@ fn without_an_ai_tool_nothing_is_offered() {
 
 /// Install the skill under `home` as devserial 0.0.1 would have.
 fn install_older_copy(sandbox: &Sandbox, home: &std::path::Path) -> std::path::PathBuf {
-    use agent_skill_installer::{Approval, Catalog, Consent, Environment, Installer, Program};
+    use agent_skill_installer::{AgentSkill, Environment, Program};
 
     std::fs::create_dir_all(home.join(".claude")).expect("claude");
     let skill = devserial::agent_skill::skill().expect("skill");
     let older = Program::new("devserial", "0.0.1").expect("program");
-    let (catalog, env) = (Catalog::builtin(), Environment::new(home));
-    let installer = Installer::new(&catalog, &env, &skill, &older);
-    let consent = Consent::load(sandbox.dir.path().join("older-consent")).expect("consent");
-    let assessment = installer.assess(&consent).expect("assess");
-    let approval = Approval {
-        install: assessment
-            .awaiting_approval()
-            .map(|step| step.place.clone())
-            .collect(),
-        overwrite: Vec::new(),
-    };
-    assert_eq!(installer.apply(&assessment, &approval).len(), 1);
+    let agent = AgentSkill::new(skill, older, sandbox.dir.path().join("older-consent"))
+        .expect("home")
+        .with_environment(Environment::new(home));
+    let installed = agent
+        .offer()
+        .expect("offer")
+        .expect("a place to offer")
+        .accept()
+        .expect("install");
+    assert_eq!(installed.len(), 1);
     let skill_md = home.join(".claude/skills/devserial/SKILL.md");
     assert_eq!(installed_version(&skill_md).as_deref(), Some("0.0.1"));
     skill_md

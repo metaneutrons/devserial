@@ -5096,14 +5096,14 @@ mod quit_tests {
     /// next time.
     #[test]
     fn the_skill_offer_installs_remembers_or_waits() {
-        use crate::agent_skill::{Offer, sandbox_setup};
+        use crate::agent_skill::{Offer, sandbox_agent};
         let dir = tempfile::tempdir().expect("dir");
         let (mut app, _) = app(OnQuit::Ask);
 
-        app.skill_offer = Offer::for_setup(sandbox_setup(dir.path(), &[".claude"]));
+        app.skill_offer = Offer::for_agent(sandbox_agent(dir.path(), &[".claude"]));
         app.answer_skill_offer(None);
         assert!(app.skill_offer.is_none() && app.skill_result.is_none());
-        let again = Offer::for_setup(sandbox_setup(dir.path(), &[]));
+        let again = Offer::for_agent(sandbox_agent(dir.path(), &[]));
         assert!(again.is_some(), "later did not ask again");
 
         app.skill_offer = again;
@@ -5115,9 +5115,9 @@ mod quit_tests {
             "{:?}",
             app.skill_result
         );
-        assert!(Offer::for_setup(sandbox_setup(dir.path(), &[])).is_none());
+        assert!(Offer::for_agent(sandbox_agent(dir.path(), &[])).is_none());
 
-        app.skill_offer = Offer::for_setup(sandbox_setup(dir.path(), &[".codex"]));
+        app.skill_offer = Offer::for_agent(sandbox_agent(dir.path(), &[".codex"]));
         app.answer_skill_offer(Some(true));
         assert!(
             dir.path()
