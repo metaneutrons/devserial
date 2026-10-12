@@ -275,6 +275,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
 | `F5` | Run a configured macro |
 | `F6` | Flash firmware to an ESP device |
+| `F7` | HTTP interface: address, port and token for the next start; `Tab` moves between the fields, `Enter` starts it, `Ctrl+K` stops it |
 | `F8` | Toggle semantic colors in the capture display |
 | `F9` | Daemon: idle period, what holds it, and what quitting does; `Enter` applies, `Ctrl+D` saves as default, `Tab` changes the quit setting |
 | `Ctrl+K` | Release the port, or take it back |
