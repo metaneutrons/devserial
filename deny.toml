@@ -52,7 +52,3 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# agent-skill-installer steht noch nicht auf crates.io. Bis dahin kommt es,
-# auf einen Commit festgelegt, aus dem eigenen Repository (#124). Der Eintrag
-# entfaellt mit der ersten Version auf crates.io.
-allow-git = ["https://github.com/metaneutrons/agent-skill-installer"]

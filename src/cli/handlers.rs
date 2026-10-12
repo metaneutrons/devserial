@@ -505,22 +505,26 @@ pub enum SkillRequest {
 /// Returns an error when the machine cannot be assessed, or an install is
 /// asked for without a terminal to ask on and without `--yes`.
 pub fn skill_control(request: SkillRequest) -> Result<(), CliError> {
-    let setup = crate::agent_skill::Setup::for_this_user().map_err(CliError::msg)?;
+    let agent = crate::agent_skill::agent().map_err(CliError::msg)?;
     match request {
-        SkillRequest::Status => skill_status(&setup),
-        SkillRequest::Install { ask } => skill_install(&setup, ask),
+        SkillRequest::Status => skill_status(&agent),
+        SkillRequest::Install { ask } => skill_install(&agent, ask),
         SkillRequest::Decline => {
-            let assessment = setup.assess().map_err(CliError::msg)?;
-            let places = crate::agent_skill::undecided(&assessment);
-            setup.decline(&places).map_err(CliError::msg)?;
+            let places = match agent.offer()? {
+                Some(offer) => {
+                    let places = offer.steps().len();
+                    offer.decline()?;
+                    places
+                }
+                None => 0,
+            };
             println!(
-                "Not offered again for {} place(s). `devserial skill --install` still installs there.",
-                places.len()
+                "Not offered again for {places} place(s). `devserial skill --install` still installs there."
             );
             Ok(())
         }
         SkillRequest::Remove => {
-            let outcomes = setup.remove().map_err(CliError::msg)?;
+            let outcomes = agent.remove()?;
             if outcomes.is_empty() {
                 println!("No copy of the skill to remove.");
             }
@@ -532,15 +536,21 @@ pub fn skill_control(request: SkillRequest) -> Result<(), CliError> {
     }
 }
 
-fn skill_status(setup: &crate::agent_skill::Setup) -> Result<(), CliError> {
+impl From<agent_skill_installer::Error> for CliError {
+    fn from(error: agent_skill_installer::Error) -> Self {
+        Self::msg(error.to_string())
+    }
+}
+
+fn skill_status(agent: &agent_skill_installer::AgentSkill) -> Result<(), CliError> {
     use crate::agent_skill::{NAME, describe, undecided};
-    let assessment = setup.assess().map_err(CliError::msg)?;
+    let assessment = agent.status()?;
     println!("Agent skill {NAME} {}", env!("CARGO_PKG_VERSION"));
     if assessment.steps.is_empty() {
         println!("No AI tool with a skills folder was found.");
     }
     for step in &assessment.steps {
-        println!("{}", describe(step, setup.catalog()));
+        println!("{}", describe(step, agent.catalog()));
     }
     for unserved in &assessment.plan.unserved {
         println!(
@@ -554,45 +564,40 @@ fn skill_status(setup: &crate::agent_skill::Setup) -> Result<(), CliError> {
     Ok(())
 }
 
-fn skill_install(setup: &crate::agent_skill::Setup, ask: bool) -> Result<(), CliError> {
+fn skill_install(agent: &agent_skill_installer::AgentSkill, ask: bool) -> Result<(), CliError> {
     use crate::agent_skill::{describe, installable, outcome};
     use std::io::IsTerminal as _;
 
-    let assessment = setup.assess().map_err(CliError::msg)?;
+    let assessment = agent.status()?;
     let steps = installable(&assessment);
-    if steps.is_empty() {
-        // Still bring copies devserial installed earlier up to date.
-        let outcomes = setup.install(&[]).map_err(CliError::msg)?;
-        if outcomes.is_empty() {
-            println!("Nothing to install: it is everywhere it can go.");
+    if !steps.is_empty() {
+        println!("The devserial skill would be installed into:");
+        for step in steps {
+            println!("  {}", describe(step, agent.catalog()));
         }
-        for done in &outcomes {
-            println!("{}", outcome(done));
-        }
-        return Ok(());
-    }
-    let places: Vec<_> = steps.iter().map(|step| step.place.clone()).collect();
-    println!("The devserial skill would be installed into:");
-    for step in steps {
-        println!("  {}", describe(step, setup.catalog()));
-    }
-    if ask {
-        if !std::io::stdin().is_terminal() {
-            return Err(CliError::msg(
-                "not installed: add --yes to install without being asked",
-            ));
-        }
-        print!("Install it there? [y/N] ");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            println!("Not installed.");
-            return Ok(());
+        if ask {
+            if !std::io::stdin().is_terminal() {
+                return Err(CliError::msg(
+                    "not installed: add --yes to install without being asked",
+                ));
+            }
+            print!("Install it there? [y/N] ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("Not installed.");
+                return Ok(());
+            }
         }
     }
-    for done in setup.install(&places).map_err(CliError::msg)? {
-        println!("{}", outcome(&done));
+    // Also brings copies devserial installed earlier up to date.
+    let outcomes = agent.install_everywhere()?;
+    if outcomes.is_empty() {
+        println!("Nothing to install: it is everywhere it can go.");
+    }
+    for done in &outcomes {
+        println!("{}", outcome(done));
     }
     Ok(())
 }

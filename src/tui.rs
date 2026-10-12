@@ -2726,8 +2726,8 @@ mod tests {
         assert!(nothing.input_mode == InputMode::Normal);
 
         let mut yes = AppState::new("/dev/x", &PortConfig::default());
-        yes.offer_skill(crate::agent_skill::Offer::for_setup(
-            crate::agent_skill::sandbox_setup(dir.path(), &[".claude"]),
+        yes.offer_skill(crate::agent_skill::Offer::for_agent(
+            crate::agent_skill::sandbox_agent(dir.path(), &[".claude"]),
         ));
         assert!(yes.input_mode == InputMode::SkillOffer);
         yes.answer_skill_offer(true);
@@ -2739,13 +2739,13 @@ mod tests {
         );
 
         let mut no = AppState::new("/dev/x", &PortConfig::default());
-        no.offer_skill(crate::agent_skill::Offer::for_setup(
-            crate::agent_skill::sandbox_setup(dir.path(), &[".codex"]),
+        no.offer_skill(crate::agent_skill::Offer::for_agent(
+            crate::agent_skill::sandbox_agent(dir.path(), &[".codex"]),
         ));
         assert!(no.input_mode == InputMode::SkillOffer);
         no.answer_skill_offer(false);
         assert!(
-            crate::agent_skill::Offer::for_setup(crate::agent_skill::sandbox_setup(
+            crate::agent_skill::Offer::for_agent(crate::agent_skill::sandbox_agent(
                 dir.path(),
                 &[]
             ))

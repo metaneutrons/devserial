@@ -13,8 +13,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use agent_skill_installer::{
-    Action, Approval, Assessment, Catalog, Consent, Done, Environment, Found, Installer, Outcome,
-    PlanError, Problem, Program, Skill, SkillError, Step, Why,
+    Action, AgentSkill, Assessment, Catalog, Done, Found, Outcome, Problem, Program, Skill,
+    SkillError, Step, Why,
 };
 
 /// The skill's name, which is also its directory in every skills folder.
@@ -49,124 +49,22 @@ pub fn skill() -> Result<Skill, SkillError> {
     Ok(skill)
 }
 
-/// Everything the installer needs on this machine: the skill, where the tools
-/// look for skills, and where the user's answers are kept.
-pub struct Setup {
-    catalog: Catalog,
-    env: Environment,
-    skill: Skill,
-    program: Program,
-    consent_file: PathBuf,
+/// devserial's skill on this machine, for the user running it.
+///
+/// # Errors
+/// Returns an error when there is no home directory to look for AI tools in.
+pub fn agent() -> Result<AgentSkill, String> {
+    let skill = skill().map_err(|e| e.to_string())?;
+    let program = Program::new(NAME, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+    AgentSkill::new(
+        skill,
+        program,
+        crate::paths::default_data_dir().join("skill-consent"),
+    )
+    .map_err(|e| e.to_string())
 }
 
-impl Setup {
-    /// The setup for the user running devserial.
-    ///
-    /// # Errors
-    /// Returns an error when there is no home directory to look in.
-    pub fn for_this_user() -> Result<Self, String> {
-        let env = Environment::from_process().ok_or("no home directory to look for AI tools in")?;
-        Self::new(env, crate::paths::default_data_dir().join("skill-consent"))
-    }
-
-    /// The setup for a given home and consent file, which a test points at a
-    /// temporary directory.
-    ///
-    /// # Errors
-    /// Returns an error when the skill or the version is malformed, which a
-    /// test rules out.
-    pub fn new(env: Environment, consent_file: PathBuf) -> Result<Self, String> {
-        Ok(Self {
-            catalog: Catalog::builtin(),
-            env,
-            skill: skill().map_err(|e| e.to_string())?,
-            program: Program::new(NAME, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?,
-            consent_file,
-        })
-    }
-
-    /// The tools and folders this setup knows.
-    #[must_use]
-    pub const fn catalog(&self) -> &Catalog {
-        &self.catalog
-    }
-
-    /// The installer for this setup.
-    #[must_use]
-    pub const fn installer(&self) -> Installer<'_> {
-        Installer::new(&self.catalog, &self.env, &self.skill, &self.program)
-    }
-
-    /// The user's answers so far.
-    ///
-    /// # Errors
-    /// Returns an error when the file exists but cannot be read.
-    pub fn consent(&self) -> std::io::Result<Consent> {
-        Consent::load(&self.consent_file)
-    }
-
-    /// What would happen, place by place.
-    ///
-    /// # Errors
-    /// Returns an error when the answers cannot be read or no plan can be made.
-    pub fn assess(&self) -> Result<Assessment, String> {
-        let consent = self.consent().map_err(|e| e.to_string())?;
-        self.installer()
-            .assess(&consent)
-            .map_err(|e: PlanError| e.to_string())
-    }
-
-    /// Install into `places`, and bring every unchanged older copy up to date
-    /// on the way. A place the user declined earlier counts as agreed now.
-    ///
-    /// # Errors
-    /// Returns an error when the answers cannot be read or written, or no plan
-    /// can be made.
-    pub fn install(&self, places: &[PathBuf]) -> Result<Vec<Outcome>, String> {
-        let mut consent = self.consent().map_err(|e| e.to_string())?;
-        for place in places {
-            consent.withdraw(place);
-        }
-        consent.save().map_err(|e| e.to_string())?;
-        let assessment = self.assess()?;
-        let approval = Approval {
-            install: places.to_vec(),
-            overwrite: Vec::new(),
-        };
-        Ok(self.installer().apply(&assessment, &approval))
-    }
-
-    /// Remember that the user does not want the skill in `places`.
-    ///
-    /// # Errors
-    /// Returns an error when the answers cannot be read or written.
-    pub fn decline(&self, places: &[PathBuf]) -> Result<(), String> {
-        let mut consent = self.consent().map_err(|e| e.to_string())?;
-        for place in places {
-            consent.decline(place).map_err(|e| e.to_string())?;
-        }
-        consent.save().map_err(|e| e.to_string())
-    }
-
-    /// Bring every copy devserial installed and nobody changed up to this
-    /// version. Installs nothing new and asks nothing.
-    ///
-    /// # Errors
-    /// Returns an error when no plan can be made.
-    pub fn update(&self) -> Result<Vec<Outcome>, String> {
-        self.installer().update().map_err(|e| e.to_string())
-    }
-
-    /// Remove every copy devserial installed that nobody changed.
-    ///
-    /// # Errors
-    /// Returns an error when no plan can be made.
-    pub fn remove(&self) -> Result<Vec<Outcome>, String> {
-        self.installer().remove().map_err(|e| e.to_string())
-    }
-}
-
-/// Run [`Setup::update`] for this user in the background (#124, A3).
+/// Bring the skill up to this version in the background (#124, A3).
 ///
 /// For the long-running surfaces: the GUI, the TUI, the daemon and the MCP
 /// server. Nothing goes to stdout or stderr, which belong to the MCP protocol
@@ -174,7 +72,7 @@ impl Setup {
 pub fn update_in_background() {
     let spawned = std::thread::Builder::new()
         .name("devserial-skill".to_string())
-        .spawn(|| match Setup::for_this_user().and_then(|setup| setup.update()) {
+        .spawn(|| match agent().and_then(|agent| agent.update().map_err(|e| e.to_string())) {
             Ok(outcomes) => {
                 for done in outcomes {
                     tracing::info!(place = %done.place.display(), done = %done.done, "agent skill");
@@ -187,11 +85,11 @@ pub fn update_in_background() {
     }
 }
 
-/// The question the GUI and the TUI ask once at start (#124, A2): install the
-/// skill where AI tools were found and nobody has decided yet?
+/// The question the GUI and the TUI ask once at start (#124, A2), held for as
+/// long as it is on screen. Answering asks the crate again, so it acts on the
+/// machine as it is then.
 pub struct Offer {
-    setup: Setup,
-    places: Vec<PathBuf>,
+    agent: AgentSkill,
     lines: Vec<String>,
 }
 
@@ -203,27 +101,20 @@ impl Offer {
     /// The offer for the user running devserial, when there is one.
     #[must_use]
     pub fn for_this_user() -> Option<Self> {
-        Setup::for_this_user().ok().and_then(Self::for_setup)
+        agent().ok().and_then(Self::for_agent)
     }
 
-    /// The offer for a setup: none when every place is decided.
+    /// The offer for an agent: none when every place is decided.
     #[must_use]
-    pub fn for_setup(setup: Setup) -> Option<Self> {
-        let assessment = setup.assess().ok()?;
-        let steps: Vec<&Step> = assessment.awaiting_approval().collect();
-        if steps.is_empty() {
-            return None;
-        }
-        let lines = steps
+    pub fn for_agent(agent: AgentSkill) -> Option<Self> {
+        let lines = agent
+            .offer()
+            .ok()??
+            .steps()
             .iter()
-            .map(|step| where_for_whom(step, &setup.catalog))
+            .map(|step| where_for_whom(step, agent.catalog()))
             .collect();
-        let places = steps.iter().map(|step| step.place.clone()).collect();
-        Some(Self {
-            setup,
-            places,
-            lines,
-        })
+        Some(Self { agent, lines })
     }
 
     /// One line per place: where, and which tools read it.
@@ -235,8 +126,12 @@ impl Offer {
     /// Install where offered. What happened, one line per place.
     #[must_use]
     pub fn accept(&self) -> Vec<String> {
-        match self.setup.install(&self.places) {
-            Ok(outcomes) => outcomes.iter().map(outcome).collect(),
+        match self.agent.offer() {
+            Ok(Some(offer)) => match offer.accept() {
+                Ok(outcomes) => outcomes.iter().map(outcome).collect(),
+                Err(e) => vec![format!("not installed: {e}")],
+            },
+            Ok(None) => vec!["nothing left to install".to_string()],
             Err(e) => vec![format!("not installed: {e}")],
         }
     }
@@ -246,7 +141,10 @@ impl Offer {
     /// # Errors
     /// Returns an error when the answer cannot be saved.
     pub fn decline(&self) -> Result<(), String> {
-        self.setup.decline(&self.places)
+        self.agent
+            .offer()
+            .map_err(|e| e.to_string())?
+            .map_or(Ok(()), |offer| offer.decline().map_err(|e| e.to_string()))
     }
 }
 
@@ -344,6 +242,8 @@ pub fn describe(step: &Step, catalog: &Catalog) -> String {
         Action::Report(Problem::Foreign(why)) => {
             format!("something else named {NAME} is there ({why}); left alone")
         }
+        // A case a newer agent-skill-installer adds; its own words, for now.
+        other => format!("{other:?}"),
     };
     let _ = write!(line, "\n    {state}");
     if let Some(root) = &step.git_root {
@@ -362,6 +262,7 @@ pub fn outcome(outcome: &Outcome) -> String {
         Done::Removed => "removed".to_string(),
         Done::Changed => "left alone: it changed while devserial was looking".to_string(),
         Done::Failed(why) => format!("failed: {why}"),
+        other => other.to_string(),
     };
     format!("{}: {what}", shown(&outcome.place))
 }
@@ -554,18 +455,21 @@ pub fn http_reference() -> String {
     out
 }
 
-/// A setup on a temporary home holding the given AI tool folders, for tests
-/// of the surfaces that offer the skill.
+/// devserial's skill on a temporary home holding the given AI tool folders,
+/// for tests of the surfaces that offer it.
 ///
 /// # Panics
 /// Panics when the folders cannot be created, which fails the test.
 #[cfg(test)]
 #[must_use]
-pub fn sandbox_setup(dir: &Path, tools: &[&str]) -> Setup {
+pub fn sandbox_agent(dir: &Path, tools: &[&str]) -> AgentSkill {
     for tool in tools {
         std::fs::create_dir_all(dir.join("home").join(tool)).expect("tool");
     }
-    Setup::new(Environment::new(dir.join("home")), dir.join("consent")).expect("setup")
+    let program = Program::new(NAME, env!("CARGO_PKG_VERSION")).expect("version");
+    AgentSkill::new(skill().expect("skill"), program, dir.join("consent"))
+        .expect("home")
+        .with_environment(agent_skill_installer::Environment::new(dir.join("home")))
 }
 
 #[cfg(test)]
@@ -578,7 +482,7 @@ mod tests {
     #[test]
     fn an_offer_installs_or_is_not_made_again() {
         let dir = tempfile::tempdir().expect("dir");
-        let offer = Offer::for_setup(sandbox_setup(dir.path(), &[".claude"])).expect("an offer");
+        let offer = Offer::for_agent(sandbox_agent(dir.path(), &[".claude"])).expect("an offer");
         assert_eq!(offer.lines().len(), 1, "{:?}", offer.lines());
         assert!(
             offer.lines()[0].contains("Claude Code"),
@@ -587,12 +491,12 @@ mod tests {
         );
         offer.decline().expect("decline");
         assert!(
-            Offer::for_setup(sandbox_setup(dir.path(), &[])).is_none(),
+            Offer::for_agent(sandbox_agent(dir.path(), &[])).is_none(),
             "a declined place was offered again"
         );
 
         let offer =
-            Offer::for_setup(sandbox_setup(dir.path(), &[".codex"])).expect("the new place");
+            Offer::for_agent(sandbox_agent(dir.path(), &[".codex"])).expect("the new place");
         assert_eq!(offer.lines().len(), 1, "{:?}", offer.lines());
         assert!(offer.lines()[0].contains(".agents"), "{:?}", offer.lines());
         let done = offer.accept();
@@ -602,7 +506,7 @@ mod tests {
                 .join("home/.agents/skills/devserial/SKILL.md")
                 .exists()
         );
-        assert!(Offer::for_setup(sandbox_setup(dir.path(), &[])).is_none());
+        assert!(Offer::for_agent(sandbox_agent(dir.path(), &[])).is_none());
     }
 
     /// The skill is valid under the specification as this build makes it.
