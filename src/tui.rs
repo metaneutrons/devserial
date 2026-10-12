@@ -103,6 +103,8 @@ pub struct TuiContext {
     pub config_file: Option<std::path::PathBuf>,
     /// The agent skill to offer at start, if any place is undecided (#124).
     pub skill_offer: Option<crate::agent_skill::Offer>,
+    /// Set when the daemon is another build than this TUI (#115).
+    pub build_warning: Option<String>,
 }
 
 /// Run the TUI monitor.
@@ -239,6 +241,8 @@ struct AppState {
     daemon_view: Option<crate::standalone::DaemonView>,
     /// The agent skill offered at start, until it is answered.
     skill_offer: Option<crate::agent_skill::Offer>,
+    /// Set when the daemon is another build than this TUI (#115).
+    build_warning: Option<String>,
 }
 
 /// Which field of the HTTP screen takes the keys.
@@ -550,6 +554,7 @@ impl AppState {
             config_file: None,
             daemon_view: None,
             skill_offer: None,
+            build_warning: None,
         }
     }
 
@@ -720,6 +725,10 @@ fn run_app(
     state.daemon = context.daemon;
     state.on_quit = context.on_quit;
     state.config_file = context.config_file;
+    if let Some(warning) = context.build_warning {
+        state.set_status(warning.clone());
+        state.build_warning = Some(warning);
+    }
     state.offer_skill(context.skill_offer);
 
     loop {
@@ -2083,8 +2092,13 @@ fn daemon_title(state: &AppState) -> String {
     let save = state.config_file.as_ref().map_or_else(String::new, |path| {
         format!(" | Ctrl+D save as default to {}", path.display())
     });
+    let build = if state.build_warning.is_some() {
+        " | other build, see devserial daemon --status"
+    } else {
+        ""
+    };
     format!(
-        " Daemon: {period}{holds} | on quit: {on_quit} (Tab) | Enter apply now{save} | Esc closes "
+        " Daemon: {period}{holds}{build} | on quit: {on_quit} (Tab) | Enter apply now{save} | Esc closes "
     )
 }
 

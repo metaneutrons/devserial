@@ -805,3 +805,121 @@ fn the_mcp_server_updates_the_skill_without_writing_to_stdout() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+/// Start a daemon that claims another commit, as a stale build would (#115).
+fn start_other_build(sandbox: &Sandbox) -> std::process::Child {
+    let daemon = sandbox
+        .std_command()
+        .arg("daemon")
+        .env("DEVSERIAL_TEST_COMMIT", "deadbeef0000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("daemon");
+    assert!(sandbox.wait_for_daemon(true), "the daemon did not start");
+    daemon
+}
+
+fn stop(sandbox: &Sandbox, mut daemon: std::process::Child) {
+    let _ = sandbox.command().args(["daemon", "--stop"]).output();
+    let _ = daemon.wait();
+}
+
+/// #115: another build is named on stderr, `--json` on stdout stays
+/// parseable, and the opt-out silences it.
+#[test]
+fn another_build_is_named_on_stderr_and_json_stays_clean() {
+    let sandbox = Sandbox::new();
+    let daemon = start_other_build(&sandbox);
+
+    let output = sandbox
+        .command()
+        .args(["list", "--json"])
+        .output()
+        .expect("list");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&output.stdout);
+
+    let quiet = sandbox
+        .command()
+        .env("DEVSERIAL_NO_VERSION_WARNING", "1")
+        .args(["list", "--json"])
+        .output()
+        .expect("list");
+    stop(&sandbox, daemon);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        parsed.is_ok(),
+        "stdout is not JSON: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(stderr.contains("warning: the daemon is"), "{stderr}");
+    assert!(stderr.contains("deadbeef0000"), "{stderr}");
+    assert!(stderr.contains("devserial daemon --restart"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("warning"),
+        "the opt-out did not silence it: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+}
+
+/// #115: the same build raises no warning.
+#[test]
+fn the_same_build_raises_no_warning() {
+    let sandbox = Sandbox::new();
+    start_daemon(&sandbox);
+    let output = sandbox
+        .command()
+        .args(["list", "--json"])
+        .output()
+        .expect("list");
+    let _ = sandbox.command().args(["daemon", "--stop"]).output();
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("warning"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #115: `--restart` replaces the daemon with one of the caller's build.
+#[test]
+fn restart_brings_up_the_callers_build() {
+    let sandbox = Sandbox::new();
+    let mut daemon = start_other_build(&sandbox);
+    let status = |sandbox: &Sandbox| {
+        let output = sandbox
+            .command()
+            .args(["daemon", "--status"])
+            .output()
+            .expect("status");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let before = status(&sandbox);
+
+    let restarted = sandbox
+        .command()
+        .args(["daemon", "--restart"])
+        .output()
+        .expect("restart");
+    let exited = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        matches!(daemon.try_wait(), Ok(Some(_)))
+    });
+    let after = status(&sandbox);
+    let _ = sandbox.command().args(["daemon", "--stop"]).output();
+    if !exited {
+        let _ = daemon.kill();
+    }
+
+    assert!(before.contains("deadbeef0000"), "{before}");
+    assert!(restarted.status.success(), "{restarted:?}");
+    let said = String::from_utf8_lossy(&restarted.stdout);
+    assert!(said.contains("Daemon restarted."), "{said}");
+    assert!(exited, "the old daemon kept running");
+    assert!(after.contains("RUNNING"), "{after}");
+    assert!(
+        !after.contains("deadbeef0000"),
+        "still the other build: {after}"
+    );
+}

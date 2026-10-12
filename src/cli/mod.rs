@@ -143,8 +143,13 @@ pub enum Command {
         status: bool,
 
         /// Stop a running daemon
-        #[arg(long, conflicts_with = "set_idle_timeout")]
+        #[arg(long, conflicts_with_all = ["set_idle_timeout", "restart"])]
         stop: bool,
+
+        /// Stop the running daemon and start one from this devserial, which
+        /// reopens the ports that were open
+        #[arg(long, conflicts_with_all = ["status", "set_idle_timeout", "idle_timeout"])]
+        restart: bool,
 
         /// Run with this idle period instead of the configured one (90s, 15m,
         /// 2h; 0 = never stop by itself)
@@ -471,9 +476,10 @@ const fn runs_for_a_while(command: Option<&Command>) -> bool {
         Some(Command::Daemon {
             status,
             stop,
+            restart,
             set_idle_timeout,
             ..
-        }) => !*status && !*stop && set_idle_timeout.is_none(),
+        }) => !*status && !*stop && !*restart && set_idle_timeout.is_none(),
         #[cfg(feature = "monitor")]
         Some(Command::Gui | Command::Monitor { .. }) => true,
         #[cfg(feature = "tui")]
@@ -511,12 +517,22 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         Some(Command::Daemon {
             status,
             stop,
+            restart,
             idle_timeout,
             set_idle_timeout,
         }) => {
-            if status || stop || set_idle_timeout.is_some() {
+            let action = if status {
+                Some(handlers::DaemonAction::Status)
+            } else if restart {
+                Some(handlers::DaemonAction::Restart)
+            } else if stop {
+                Some(handlers::DaemonAction::Stop)
+            } else {
+                set_idle_timeout.map(handlers::DaemonAction::SetIdle)
+            };
+            if let Some(action) = action {
                 let session = handlers::Session::new(cli.socket, config_path)?;
-                handlers::daemon_control(&session, status, stop, set_idle_timeout)
+                handlers::daemon_control(&session, action)
             } else {
                 daemon::run_daemon(
                     cli.socket,

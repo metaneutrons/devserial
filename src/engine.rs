@@ -329,6 +329,9 @@ impl CommandEngine {
                 Ok(ResponsePayload::Lifecycle(self.lifecycle.state()))
             }
             RequestPayload::GetLifecycle => Ok(ResponsePayload::Lifecycle(self.lifecycle.state())),
+            RequestPayload::Identify => Ok(ResponsePayload::Identity(
+                crate::identity::BuildIdentity::current(),
+            )),
             RequestPayload::Shutdown => Ok(ResponsePayload::ShutdownAck),
         }
     }
@@ -1353,6 +1356,11 @@ mod tests {
         let (engine, _dir) = make_test_engine();
         let resp = engine.execute(RequestPayload::Ping).await.unwrap();
         assert_eq!(resp, ResponsePayload::Pong);
+        // #115: the daemon says which build it is.
+        assert_eq!(
+            engine.execute(RequestPayload::Identify).await.unwrap(),
+            ResponsePayload::Identity(crate::identity::BuildIdentity::current())
+        );
 
         let list_resp = engine.execute(RequestPayload::ListPorts).await.unwrap();
         assert_eq!(list_resp, ResponsePayload::PortList(vec![]));

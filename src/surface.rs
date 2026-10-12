@@ -94,6 +94,8 @@ pub enum Capability {
     QuitAsksAboutDaemon,
     /// Offer the agent skill once at start where AI tools were found (#124).
     AgentSkillOffer,
+    /// Say when the daemon is another build than the surface (#115).
+    BuildMismatchNotice,
 }
 
 impl Capability {
@@ -124,6 +126,7 @@ impl Capability {
         Self::DaemonLifecycle,
         Self::QuitAsksAboutDaemon,
         Self::AgentSkillOffer,
+        Self::BuildMismatchNotice,
     ];
 }
 
@@ -162,6 +165,7 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::DaemonLifecycle, "fn render_daemon_dialog"),
     (Capability::QuitAsksAboutDaemon, "fn render_quit_question"),
     (Capability::AgentSkillOffer, "fn render_skill_offer"),
+    (Capability::BuildMismatchNotice, "other daemon build"),
 ];
 
 /// What the terminal interface offers, with the same kind of proof.
@@ -192,6 +196,10 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::DaemonLifecycle, "InputMode::Daemon"),
     (Capability::QuitAsksAboutDaemon, "InputMode::QuitDaemon"),
     (Capability::AgentSkillOffer, "InputMode::SkillOffer"),
+    (
+        Capability::BuildMismatchNotice,
+        "other build, see devserial daemon --status",
+    ),
 ];
 
 /// Capabilities the terminal interface does not have yet, and why.
