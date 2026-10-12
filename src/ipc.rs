@@ -822,17 +822,29 @@ mod tests {
         let stream = transport::connect(&endpoint).await.expect("connect");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = shutdown.send(());
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The stop takes effect once the server task gets to it, which on a
+        // loaded runner can take a while; a client arriving before that is
+        // served, and rightly so (#130). Once the stop has begun, a new client
+        // is refused. A fixed sleep here made the test flaky on Windows.
+        let mut last = String::new();
+        let mut refused = false;
+        for _ in 0..100 {
+            match client.send(RequestPayload::Ping).await {
+                Err(IpcError::Connect { .. }) => {
+                    refused = true;
+                    break;
+                }
+                other => last = format!("{other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            refused,
+            "new clients were still served after the stop; the last got {last}"
+        );
         assert!(
             !server.is_finished(),
             "the daemon ended with a connection still to answer"
-        );
-        assert!(
-            matches!(
-                client.send(RequestPayload::Ping).await,
-                Err(IpcError::Connect { .. })
-            ),
-            "a late client was not refused"
         );
 
         let (reader, mut writer) = tokio::io::split(stream);
