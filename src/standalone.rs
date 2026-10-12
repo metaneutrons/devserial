@@ -868,6 +868,7 @@ fn session_monitor(
         .map(|loaded| loaded.daemon.on_quit)
         .unwrap_or_default();
     monitor.config_file = crate::config::writable_config_path(config_path);
+    monitor.build_warning = runtime.block_on(client.build_warning());
     monitor
 }
 
@@ -1003,6 +1004,7 @@ fn run_tui_attached(
             .unwrap_or_default(),
         config_file: crate::config::writable_config_path(config_path),
         skill_offer: crate::agent_skill::Offer::for_this_user(),
+        build_warning: runtime.block_on(parts.client.build_warning()),
     };
 
     crate::tui::run_tui(port, config, &parts.shared_storage, runtime, context)

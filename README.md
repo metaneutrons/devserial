@@ -320,7 +320,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `stats` | Connection state and buffer statistics |
 | `flash` | Flash an ESP device through `espflash` |
 | `rest` | Show or change the HTTP interface of the daemon |
-| `daemon` | Run, inspect or stop the daemon, or change its idle period |
+| `daemon` | Run, inspect, stop or restart the daemon, or change its idle period |
 | `monitor` / `tui` | Interactive monitors |
 | `mcp` | Run as an MCP server |
 | `skill` | Show, install or remove the agent skill for AI tools |
@@ -403,7 +403,8 @@ Export writes one format, whichever front end asks for it. CSV carries the heade
 ### The daemon
 
 ```bash
-devserial daemon --status                  # running? idle period, what holds it
+devserial daemon --status                  # running? which build, idle period, what holds it
+devserial daemon --restart                 # replace it with one of this build
 devserial daemon                           # run it in the foreground
 devserial daemon --idle-timeout 2h         # ... with another idle period
 devserial daemon --set-idle-timeout 30m    # change it on the running daemon
@@ -453,6 +454,25 @@ The period comes from, in rising precedence: the built-in 15 minutes,
 starts, and `--set-idle-timeout` on the running daemon, which lasts until it
 stops. `--status` says which of these is in force. Durations are written `90s`,
 `15m`, `2h` or `0`.
+
+**It says when it is another build.** Every client talks to whatever daemon
+answers, and that can be a different build: a daemon started from a development
+build keeps running after you go back to the installed release, and both may
+report the same version number. Each build therefore knows its commit and
+whether it was built from a modified tree, and a client compares itself with
+the daemon. When they differ, the CLI prints one line on stderr, so stdout and
+`--json` stay clean; the window shows a notice next to its Daemon button, the
+terminal monitor in its status line and on `F9`, and the MCP server adds the
+warning to its next tool result, where the AI tool can pass it on. A daemon too
+old to say which build it is gets the same warning, as one that cannot tell.
+The same commit built cleanly is the same code wherever it is installed, so a
+Homebrew and a `cargo install` of one release do not warn.
+
+Nothing restarts the daemon on its own, because a restart interrupts the
+captures. `devserial daemon --restart` stops it and starts one from the calling
+binary, which reopens the ports that were open. Set
+`DEVSERIAL_NO_VERSION_WARNING=1` to silence the warning while you run another
+build as the daemon on purpose.
 
 **Quitting a monitor asks about the daemon.** Quitting the terminal monitor,
 closing the last window or quitting the application (`Cmd+Q` on macOS) asks
@@ -781,6 +801,7 @@ Three environment variables override the defaults without a configuration file. 
 | `DEVSERIAL_DATA_DIR` | the data directory |
 | `DEVSERIAL_SOCKET` | the IPC endpoint |
 | `DEVSERIAL_CONFIG` | the configuration file |
+| `DEVSERIAL_NO_VERSION_WARNING` | set to `1` to silence the warning about a daemon of another build |
 
 ---
 

@@ -2251,6 +2251,11 @@ mod tests {
             R::SetIdleTimeout { .. } | R::GetLifecycle => {
                 Err("the daemon's lifecycle is reached through the daemon, as the HTTP switch is")
             }
+            // #115. GET /v1/version already reports the build to an HTTP
+            // caller; this one is how a local client compares itself.
+            R::Identify => Err(
+                "GET /v1/version reports the build over HTTP; Identify serves the local clients comparing themselves",
+            ),
             R::WriteData { .. } => Ok(&["POST /v1/ports/{port}/write"]),
             R::SendBreak { .. } => Ok(&["POST /v1/ports/{port}/break"]),
             R::SetSignal { .. } => Ok(&["POST /v1/ports/{port}/signals"]),
@@ -2278,6 +2283,10 @@ mod tests {
     }
 
     /// One of every request variant, so the ratchet can walk them.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one entry per request, nothing to split"
+    )]
     fn every_request() -> Vec<crate::protocol::RequestPayload> {
         use crate::protocol::{ReadWindow, RequestPayload as R, SearchMode};
         let port = || "/dev/ttyUSB0".to_string();
@@ -2361,6 +2370,7 @@ mod tests {
             R::ReleaseLease { client: "c".into() },
             R::SetIdleTimeout { seconds: 900 },
             R::GetLifecycle,
+            R::Identify,
             R::Shutdown,
         ];
         #[cfg(feature = "esp")]

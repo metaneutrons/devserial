@@ -58,8 +58,19 @@ impl Session {
     /// # Errors
     /// Returns an error if the daemon cannot be reached or reports a failure.
     pub fn request(&self, payload: RequestPayload) -> Result<ResponsePayload, CliError> {
-        self.runtime
-            .block_on(async { Ok(self.client.send_starting(payload).await?) })
+        let response = self.runtime.block_on(self.client.send_starting(payload));
+        self.warn_once();
+        Ok(response?)
+    }
+
+    /// Say on stderr, once per process, when the daemon is another build
+    /// than this one (#115). Stdout, and with it `--json`, stays clean.
+    pub fn warn_once(&self) {
+        if !BUILD_CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && let Some(warning) = self.runtime.block_on(self.client.build_warning())
+        {
+            eprintln!("{warning}");
+        }
     }
 
     /// Send a request without starting a daemon.
@@ -67,10 +78,14 @@ impl Session {
     /// # Errors
     /// Returns an error if the daemon is not reachable.
     pub fn request_existing(&self, payload: RequestPayload) -> Result<ResponsePayload, CliError> {
-        self.runtime
-            .block_on(async { Ok(self.client.send(payload).await?) })
+        let response = self.runtime.block_on(self.client.send(payload));
+        self.warn_once();
+        Ok(response?)
     }
 }
+
+/// Whether this process has compared its build with the daemon's (#115).
+static BUILD_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Response of an unexpected shape, which would be an engine bug.
 fn unexpected(payload: &ResponsePayload) -> CliError {
@@ -422,63 +437,116 @@ pub fn rest_control(
     Ok(())
 }
 
-/// Handle `daemon --status` and `daemon --stop`.
+/// What `devserial daemon` was asked to do of a running daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Whether it runs, which build it is, its idle period and what holds it.
+    Status,
+    /// Stop it.
+    Stop,
+    /// Stop it and start one from this devserial (#115).
+    Restart,
+    /// Change its idle period until it stops.
+    SetIdle(crate::lifecycle::IdleTimeout),
+}
+
+/// `devserial daemon` with a flag: ask the running daemon, change it, stop it
+/// or restart it.
 ///
 /// # Errors
-/// Returns an error if the daemon cannot be reached while stopping it.
-pub fn daemon_control(
-    session: &Session,
-    status: bool,
-    stop: bool,
-    set_idle_timeout: Option<crate::lifecycle::IdleTimeout>,
-) -> Result<(), CliError> {
-    if status {
-        // Asked of a running daemon only: a status check that started one
-        // would report on a daemon nobody had.
-        match session.request_existing(RequestPayload::GetLifecycle) {
-            Ok(ResponsePayload::Lifecycle(state)) => {
-                println!(
-                    "Daemon is RUNNING (endpoint: {})",
+/// Returns an error when the daemon cannot be reached for a change, or a
+/// restart does not bring a new daemon up.
+pub fn daemon_control(session: &Session, action: DaemonAction) -> Result<(), CliError> {
+    match action {
+        DaemonAction::Status => {
+            // Asked of a running daemon only: a status check that started one
+            // would report on a daemon nobody had.
+            match session.request_existing(RequestPayload::GetLifecycle) {
+                Ok(ResponsePayload::Lifecycle(state)) => {
+                    println!(
+                        "Daemon is RUNNING (endpoint: {})",
+                        session.endpoint().display()
+                    );
+                    if let Ok(ResponsePayload::Identity(identity)) =
+                        session.request_existing(RequestPayload::Identify)
+                    {
+                        print_identity(&identity);
+                    }
+                    print_lifecycle(&state);
+                }
+                Ok(other) => return Err(unexpected(&other)),
+                Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => println!(
+                    "Daemon is STOPPED (endpoint: {})",
                     session.endpoint().display()
-                );
-                print_lifecycle(&state);
+                ),
+                Err(e) => return Err(e),
             }
-            Ok(other) => return Err(unexpected(&other)),
-            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => println!(
-                "Daemon is STOPPED (endpoint: {})",
-                session.endpoint().display()
-            ),
-            Err(e) => return Err(e),
         }
-        return Ok(());
-    }
-
-    if let Some(timeout) = set_idle_timeout {
-        match session.request_existing(RequestPayload::SetIdleTimeout {
-            seconds: timeout.0.as_secs(),
-        }) {
-            Ok(ResponsePayload::Lifecycle(state)) => print_lifecycle(&state),
-            Ok(other) => return Err(unexpected(&other)),
-            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
-                return Err(CliError::msg(
-                    "the daemon is not running; start it with `devserial daemon --idle-timeout`",
-                ));
+        DaemonAction::SetIdle(timeout) => {
+            match session.request_existing(RequestPayload::SetIdleTimeout {
+                seconds: timeout.0.as_secs(),
+            }) {
+                Ok(ResponsePayload::Lifecycle(state)) => print_lifecycle(&state),
+                Ok(other) => return Err(unexpected(&other)),
+                Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
+                    return Err(CliError::msg(
+                        "the daemon is not running; start it with `devserial daemon --idle-timeout`",
+                    ));
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
-        return Ok(());
-    }
-
-    if stop {
-        match session.request_existing(RequestPayload::Shutdown) {
+        DaemonAction::Stop => match session.request_existing(RequestPayload::Shutdown) {
             Ok(_) => println!("Daemon shutdown requested."),
             Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
                 println!("Daemon is not running.");
             }
             Err(e) => return Err(e),
-        }
+        },
+        DaemonAction::Restart => restart_daemon(session)?,
     }
     Ok(())
+}
+
+/// Stop the daemon, wait until it is gone, and start one from this binary.
+/// The new daemon reopens the ports that were open, as after any start.
+fn restart_daemon(session: &Session) -> Result<(), CliError> {
+    match session.request_existing(RequestPayload::Shutdown) {
+        Ok(_) => {}
+        Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. })) => {
+            println!("No daemon was running.");
+        }
+        Err(e) => return Err(e),
+    }
+    let gone = (0..200).any(|_| {
+        let stopped = matches!(
+            session.request_existing(RequestPayload::Ping),
+            Err(CliError::Ipc(crate::ipc::IpcError::Connect { .. }))
+        );
+        if !stopped {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        stopped
+    });
+    if !gone {
+        return Err(CliError::msg("the daemon did not stop within ten seconds"));
+    }
+    match session.request(RequestPayload::Identify)? {
+        ResponsePayload::Identity(identity) => {
+            println!("Daemon restarted.");
+            print_identity(&identity);
+            Ok(())
+        }
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Which build the daemon is, and from where.
+fn print_identity(identity: &crate::identity::BuildIdentity) {
+    match &identity.executable {
+        Some(path) => println!("Build: {} from {path}", identity.short()),
+        None => println!("Build: {}", identity.short()),
+    }
 }
 
 /// The idle period, where it came from, and what keeps the daemon running.

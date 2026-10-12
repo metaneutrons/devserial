@@ -20,6 +20,7 @@ pub mod export;
 #[cfg(feature = "monitor")]
 pub mod gui_ipc;
 pub mod hex;
+pub mod identity;
 pub mod ipc;
 pub mod lifecycle;
 pub mod modem;

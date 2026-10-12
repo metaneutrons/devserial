@@ -1294,6 +1294,8 @@ pub struct PortMonitorState {
     pub on_quit: crate::config::OnQuit,
     /// Where a setting saved from this window is written.
     pub config_file: Option<std::path::PathBuf>,
+    /// Set when the daemon is another build than this window (#115).
+    pub build_warning: Option<String>,
     show_daemon_dialog: bool,
     daemon_view: Option<crate::standalone::DaemonView>,
     daemon_idle: String,
@@ -1412,6 +1414,7 @@ impl PortMonitorState {
             daemon: None,
             on_quit: crate::config::OnQuit::Ask,
             config_file: None,
+            build_warning: None,
             show_daemon_dialog: false,
             daemon_view: None,
             daemon_idle: String::new(),
@@ -4277,6 +4280,32 @@ impl PortMonitorState {
         });
     }
 
+    /// The Daemon button, and the notice when the daemon is another build.
+    fn render_daemon_controls(&mut self, ui: &mut egui::Ui) {
+        if self.daemon.is_some() {
+            ui.separator();
+            if ui
+                .add(egui::Button::new("Daemon").small())
+                .on_hover_text("When the daemon stops by itself, and what quitting does")
+                .clicked()
+            {
+                self.open_daemon_dialog();
+            }
+            if let Some(warning) = &self.build_warning {
+                let notice = egui::RichText::new("\u{26a0} other daemon build")
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 160, 40));
+                if ui
+                    .add(egui::Button::new(notice).small().frame(false))
+                    .on_hover_text(warning.as_str())
+                    .clicked()
+                {
+                    self.open_daemon_dialog();
+                }
+            }
+        }
+    }
+
     fn render_status(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
@@ -4368,16 +4397,7 @@ impl PortMonitorState {
                     }
                 }
 
-                if self.daemon.is_some() {
-                    ui.separator();
-                    if ui
-                        .add(egui::Button::new("Daemon").small())
-                        .on_hover_text("When the daemon stops by itself, and what quitting does")
-                        .clicked()
-                    {
-                        self.open_daemon_dialog();
-                    }
-                }
+                self.render_daemon_controls(ui);
             });
         });
     }
@@ -4470,6 +4490,13 @@ impl PortMonitorState {
                 ui.set_max_width(FORM_WIDTH);
                 if let Some(view) = &self.daemon_view {
                     daemon_state_labels(ui, view);
+                }
+                if let Some(warning) = &self.build_warning {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(warning.trim_start_matches("warning: "))
+                            .color(egui::Color32::from_rgb(230, 160, 40)),
+                    );
                 }
 
                 ui.add_space(8.0);

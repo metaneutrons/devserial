@@ -262,6 +262,10 @@ pub struct LifecycleState {
 pub enum RequestPayload {
     /// Liveness check.
     Ping,
+    /// Which build the daemon is, so a client can tell a different one
+    /// (#115). Separate from `Ping`, which stays as it is: a client has to be
+    /// able to reach an older daemon to warn about it.
+    Identify,
     /// List all currently managed ports.
     ListPorts,
     /// List serial ports the operating system reports.
@@ -422,6 +426,7 @@ impl RequestPayload {
             | Self::ReleaseLease { .. }
             | Self::SetIdleTimeout { .. }
             | Self::GetLifecycle
+            | Self::Identify
             | Self::Shutdown => None,
         }
     }
@@ -495,6 +500,8 @@ pub enum ResponsePayload {
     RestState(RestState),
     /// The daemon's lifecycle state.
     Lifecycle(LifecycleState),
+    /// The daemon's build (#115).
+    Identity(crate::identity::BuildIdentity),
     /// Daemon shutdown initiated.
     ShutdownAck,
 }

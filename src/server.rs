@@ -42,6 +42,9 @@ pub struct DevSerialServer {
     engine: CommandEngine,
     #[cfg(feature = "monitor")]
     monitors: Arc<std::sync::Mutex<std::collections::HashMap<String, MonitorState>>>,
+    /// A warning for the AI tool to pass on, delivered with the next tool
+    /// result and then dropped (#115). Nobody reads an MCP server's stderr.
+    notice: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// State for a running monitor window (feature-gated).
@@ -59,6 +62,29 @@ impl DevSerialServer {
             engine,
             #[cfg(feature = "monitor")]
             monitors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            notice: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// The same server, passing `notice` on with the next tool result.
+    #[must_use]
+    pub fn with_notice(self, notice: Option<String>) -> Self {
+        if let Ok(mut slot) = self.notice.lock() {
+            *slot = notice;
+        }
+        self
+    }
+
+    /// Add the pending notice to a tool result, once.
+    fn deliver_notice(&self, response: &mut rmcp::model::CallToolResponse) {
+        let rmcp::model::CallToolResponse::Complete(result) = response else {
+            return;
+        };
+        let pending = self.notice.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(notice) = pending {
+            result.content.push(rmcp::model::ContentBlock::text(format!(
+                "Note for the user from devserial: {notice}"
+            )));
         }
     }
 
@@ -1266,6 +1292,17 @@ fn monitor_event_payload(port: &str, event: crate::gui_ipc::MonitorEvent) -> Req
 #[tool_handler(router = self.tool_router)]
 #[allow(clippy::manual_async_fn)]
 impl ServerHandler for DevSerialServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut response = self.tool_router.call(call).await?;
+        self.deliver_notice(&mut response);
+        Ok(response)
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()
@@ -1436,6 +1473,33 @@ mod tests {
             server,
             _ctrl: ctrl,
         }
+    }
+
+    /// #115: a warning reaches the AI tool with the next tool result, once.
+    #[tokio::test]
+    async fn a_notice_rides_on_the_next_tool_result_once() {
+        let server = DevSerialServer::with_port_manager(PortManagerHandle::new())
+            .with_notice(Some("the daemon is another build".to_string()));
+        let text = |response: &rmcp::model::CallToolResponse| match response {
+            rmcp::model::CallToolResponse::Complete(result) => {
+                serde_json::to_string(&result.content).expect("json")
+            }
+            _ => String::new(),
+        };
+        let mut first = CallToolResult::success(vec![ContentBlock::text("ok")]).into();
+        server.deliver_notice(&mut first);
+        assert!(
+            text(&first).contains("the daemon is another build"),
+            "{}",
+            text(&first)
+        );
+        let mut second = CallToolResult::success(vec![ContentBlock::text("ok")]).into();
+        server.deliver_notice(&mut second);
+        assert!(
+            !text(&second).contains("another build"),
+            "{}",
+            text(&second)
+        );
     }
 
     #[tokio::test]

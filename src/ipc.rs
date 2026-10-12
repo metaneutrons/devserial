@@ -460,6 +460,29 @@ impl IpcClient {
         response.result.map_err(IpcError::Remote)
     }
 
+    /// The warning when the daemon is another build than this process (#115),
+    /// or `None` when it is the same build, the user opted out, or no daemon
+    /// answers.
+    ///
+    /// A daemon too old to know `Identify` refuses the request; that is
+    /// reported as a build that cannot say which it is, which it certainly
+    /// differs from this one.
+    pub async fn build_warning(&self) -> Option<String> {
+        let ours = crate::identity::BuildIdentity::current();
+        let theirs = match self.send(RequestPayload::Identify).await {
+            Ok(ResponsePayload::Identity(identity)) => identity,
+            Err(IpcError::Remote(_)) => crate::identity::BuildIdentity {
+                version: "an older build".to_string(),
+                commit: None,
+                dirty: None,
+                stamp: String::new(),
+                executable: None,
+            },
+            _ => return None,
+        };
+        crate::identity::warning(&ours, &theirs)
+    }
+
     /// Send a request, starting the daemon first if none answers.
     ///
     /// A daemon can stop between that check and the request, through its

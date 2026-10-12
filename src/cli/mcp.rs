@@ -39,8 +39,10 @@ pub fn run_mcp(socket: Option<PathBuf>, config_path: Option<&Path>) -> Result<()
         let state_db = Arc::new(Mutex::new(
             StateDb::open_memory().map_err(|e| CliError::msg(e.to_string()))?,
         ));
+        let notice = client.build_warning().await;
         let engine = CommandEngine::new(port_manager, state_db, config).with_remote(client);
         let service = DevSerialServer::new(engine)
+            .with_notice(notice)
             .serve(stdio())
             .await
             .map_err(|e| CliError::msg(format!("MCP transport error: {e}")))?;
