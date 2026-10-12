@@ -275,6 +275,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
 | `F5` | Run a configured macro |
 | `F6` | Flash firmware to an ESP device |
+| `F7` | HTTP interface: address, port and token for the next start; `Tab` moves between the fields, `Enter` starts it, `Ctrl+K` stops it |
 | `F8` | Toggle semantic colors in the capture display |
 | `F9` | Daemon: idle period, what holds it, and what quitting does; `Enter` applies, `Ctrl+D` saves as default, `Tab` changes the quit setting |
 | `Ctrl+K` | Release the port, or take it back |
@@ -493,6 +494,15 @@ ask the daemon: `devserial rest` on the command line, `F7` in the terminal
 monitor, and a clickable **REST** status entry in each window's bottom bar. It
 shows `REST off` when stopped and the listening port when active; click it to
 open the separate REST API window.
+
+That window and the `F7` screen set address, port and token for the next start,
+the way `--bind`, `--port` and `--token-file` do on the command line. On the
+`F7` screen, Tab moves between the three fields and the token shows as dots. A
+blank field means the configured value. The address has to be an IP address,
+because the daemon refuses a name. The token field is masked, never filled from
+the daemon, and cleared after a successful start or when the window or screen
+closes. To make a network bind permanent, set `bind` and `token` under `[rest]`
+in the configuration.
 
 **Port 9600, on `127.0.0.1`.** The number is the one a serial developer recalls
 without looking it up. `/etc/services` assigns it to `micromuse-ncpw`; that
