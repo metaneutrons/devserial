@@ -4,6 +4,19 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.10](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.9...devserial-v0.2.10) (2026-10-12)
+
+
+### Features
+
+* address and token for the REST interface in the window and the TUI ([#111](https://github.com/metaneutrons/devserial/issues/111)) ([391f383](https://github.com/metaneutrons/devserial/commit/391f383aded1b3fadac27f2c8dc0b0f81eefccc1))
+* **skill:** ship an agent skill and keep it current ([#125](https://github.com/metaneutrons/devserial/issues/125)) ([3295535](https://github.com/metaneutrons/devserial/commit/32955355f2848a91793de155b51f0bc60c395531))
+
+
+### Bug Fixes
+
+* **gui:** name no interfaces in the window's subtitle ([#126](https://github.com/metaneutrons/devserial/issues/126)) ([5087797](https://github.com/metaneutrons/devserial/commit/5087797197263ec732fe0c40ea257aec3e2c4287))
+
 ## [0.2.9](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.8...devserial-v0.2.9) (2026-10-11)
 
 
