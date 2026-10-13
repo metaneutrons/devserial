@@ -82,12 +82,26 @@ fn program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(ESPFLASH))
 }
 
+/// How much of the `PATH` a message shows. A Windows `PATH` runs to several
+/// kilobytes, which would bury the sentence it is in.
+const MAX_SHOWN_PATH: usize = 240;
+
+/// `text` cut to at most `max` characters, with an ellipsis where it was cut.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}\u{2026}")
+}
+
 /// What to tell the user when the tool is nowhere to be found.
 ///
 /// It names where it looked, because the usual cause is a `PATH` shorter than
 /// the one in the user's shell, and that cannot be seen from the outside.
 fn not_found_message() -> String {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = shorten(&path.to_string_lossy(), MAX_SHOWN_PATH);
     let extra: Vec<String> = environment_dirs()
         .iter()
         .map(|dir| dir.display().to_string())
@@ -95,7 +109,7 @@ fn not_found_message() -> String {
     format!(
         "espflash was not found. Looked in PATH ({}) and in {}. Install it with \
          `cargo install espflash`, or start devserial from a shell where it is on the PATH.",
-        path.to_string_lossy(),
+        path,
         extra.join(", "),
     )
 }
@@ -664,5 +678,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_long_path_is_cut_in_the_message() {
+        assert_eq!(shorten("/usr/bin:/bin", 240), "/usr/bin:/bin");
+        let long = "x".repeat(5000);
+        let cut = shorten(&long, 240);
+        assert_eq!(cut.chars().count(), 241);
+        assert!(cut.ends_with('\u{2026}'));
+        // Cutting counts characters, so a multi-byte one is never split.
+        assert_eq!(shorten("äöü", 2), "äö\u{2026}");
     }
 }
