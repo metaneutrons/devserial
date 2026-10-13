@@ -881,12 +881,9 @@ fn run_app(
             }
             #[cfg(feature = "esp")]
             KeyCode::F(6) => {
-                if runtime.block_on(crate::esp::is_available()) {
-                    state.input_mode = toggle(&state.input_mode, InputMode::Flash);
-                } else {
-                    state.set_status(
-                        "espflash was not found; install it with cargo install espflash",
-                    );
+                match runtime.block_on(crate::esp::check()) {
+                    Ok(()) => state.input_mode = toggle(&state.input_mode, InputMode::Flash),
+                    Err(reason) => state.set_status(reason),
                 }
                 continue;
             }

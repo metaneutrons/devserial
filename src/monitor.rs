@@ -122,9 +122,12 @@ struct FlashDialog {
     path: String,
     /// Empty means espflash picks its own flashing baud rate.
     baud: String,
-    /// Whether espflash was found in `PATH`; `None` until the probe answers.
+    /// Whether espflash can be run; `None` until the probe answers.
     available: Option<bool>,
-    probing: bool,
+    /// Why it cannot, as the probe words it, for the user to read.
+    unavailable_reason: String,
+    /// The probe that is still running.
+    probe: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     /// Lines from the running tool, oldest first.
     log: Vec<String>,
     running: Option<RunningFlash>,
@@ -146,14 +149,6 @@ struct RunningFlash {
 /// Longest run of tool output the firmware dialog keeps.
 #[cfg(feature = "esp")]
 const MAX_FLASH_LOG_LINES: usize = 2000;
-
-/// Result of the one-off espflash probe, shared with the frame that asked.
-#[cfg(feature = "esp")]
-static ESPFLASH_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(feature = "esp")]
-const PROBE_FOUND: u8 = 1;
-#[cfg(feature = "esp")]
-const PROBE_MISSING: u8 = 2;
 
 /// Check what the dialog was asked to do before anything is released.
 ///
@@ -1470,35 +1465,27 @@ impl PortMonitorState {
         self.keepalive.as_ref().and_then(|k| k.handle())
     }
 
-    /// Ask once whether espflash is installed, without blocking the frame.
+    /// Ask whether espflash can be run, without blocking the frame.
     #[cfg(feature = "esp")]
     fn probe_espflash(&mut self, ctx: &egui::Context) {
-        if self.flash.available.is_some() || self.flash.probing {
+        if self.flash.available.is_some() || self.flash.probe.is_some() {
             return;
         }
         let Some(runtime) = self.session_runtime() else {
             // No runtime means this window does not own the port, and the
             // dialog will say so rather than pretend to look.
             self.flash.available = Some(false);
+            self.flash.unavailable_reason =
+                "This window has no session, so it cannot run espflash.".to_string();
             return;
         };
-        self.flash.probing = true;
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let repaint = ctx.clone();
         runtime.spawn(async move {
-            let _ = tx.send(crate::esp::is_available().await);
+            let _ = tx.send(crate::esp::check().await);
+            repaint.request_repaint();
         });
-        // The answer is picked up by the poll below; parking the receiver in
-        // the running slot would confuse it with an actual flash.
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            if let Ok(found) = rx.blocking_recv() {
-                ESPFLASH_PROBE.store(
-                    if found { PROBE_FOUND } else { PROBE_MISSING },
-                    std::sync::atomic::Ordering::Release,
-                );
-                ctx.request_repaint();
-            }
-        });
+        self.flash.probe = Some(rx);
     }
 
     /// Start espflash with the port released, and remember how to get it back.
@@ -1566,17 +1553,23 @@ impl PortMonitorState {
     /// Move finished lines into the log and finish the run when it ends.
     #[cfg(feature = "esp")]
     fn poll_flash_operation(&mut self, ctx: &egui::Context) {
-        if self.flash.probing {
-            match ESPFLASH_PROBE.load(std::sync::atomic::Ordering::Acquire) {
-                PROBE_FOUND => {
-                    self.flash.available = Some(true);
-                    self.flash.probing = false;
+        if let Some(probe) = self.flash.probe.as_mut() {
+            let answer = match probe.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(Err(
+                    "the check for espflash ended without an answer".to_string(),
+                )),
+            };
+            if let Some(answer) = answer {
+                self.flash.probe = None;
+                match answer {
+                    Ok(()) => self.flash.available = Some(true),
+                    Err(reason) => {
+                        self.flash.available = Some(false);
+                        self.flash.unavailable_reason = reason;
+                    }
                 }
-                PROBE_MISSING => {
-                    self.flash.available = Some(false);
-                    self.flash.probing = false;
-                }
-                _ => {}
             }
         }
 
@@ -1670,14 +1663,18 @@ impl PortMonitorState {
                     Some(false) => {
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 180, 60),
-                            "espflash was not found on this machine.",
+                            "espflash cannot be run.",
                         );
+                        ui.add_space(4.0);
+                        ui.label(self.flash.unavailable_reason.as_str());
                         ui.add_space(4.0);
                         ui.label(
                             "devserial drives espflash rather than talking to the chip \
-                             itself. Install it with `cargo install espflash`, then reopen \
-                             this window.",
+                             itself.",
                         );
+                        if ui.button("Check again").clicked() {
+                            self.flash.available = None;
+                        }
                         return;
                     }
                     Some(true) => {}
