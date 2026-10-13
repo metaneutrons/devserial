@@ -235,7 +235,7 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Transfers and export.** File transfer over ZMODEM, YMODEM and XMODEM from a dialog, and export of the whole database, the visible buffer or a line range to TXT, CSV or JSONL, either to a file or to the clipboard.
 
-**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. Needs `espflash` on the `PATH`.
+**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. Needs `espflash`. It is looked for in the `PATH`, then in `~/.cargo/bin` (or `$CARGO_HOME/bin`), `~/.local/bin` and Homebrew's directories, so a window started from the Dock finds a tool installed with `cargo install espflash`. When it is not found, the message says where it looked. When the port cannot be opened again after a run, the result says so.
 
 **Interface scale.** View > Zoom In, Zoom Out and Actual Size, the same two steps and a readout at the right end of the status bar, and `Cmd+Plus`, `Cmd+Minus` and `Cmd+0` on the keyboard. The scale is remembered between runs. Off macOS there is no menu bar, so the keyboard and the status bar are the way there.
 
