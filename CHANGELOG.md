@@ -4,6 +4,14 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.12](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.11...devserial-v0.2.12) (2026-10-13)
+
+
+### Bug Fixes
+
+* **esp:** find espflash outside the shell's PATH and say why it is missing ([#135](https://github.com/metaneutrons/devserial/issues/135)) ([09e184c](https://github.com/metaneutrons/devserial/commit/09e184c9ed97b3d84616cc010918070122eea60b))
+* **gui:** set the timestamp in the monospaced font ([#136](https://github.com/metaneutrons/devserial/issues/136)) ([e745f8b](https://github.com/metaneutrons/devserial/commit/e745f8b3a820b9279eda4a83ff7f5327c8a63603))
+
 ## [0.2.11](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.10...devserial-v0.2.11) (2026-10-12)
 
 
