@@ -51,6 +51,20 @@ type RestWorkerMessage = (
 #[cfg(feature = "rest")]
 type RestWorkerReceiver = std::sync::mpsc::Receiver<RestWorkerMessage>;
 
+/// The time of day in front of a row.
+///
+/// It is set in the same monospaced font as the row, so every row's text
+/// starts at the same place. In the proportional font of the rest of the
+/// window the digits have different widths (a `1` is narrower than a `0`),
+/// and the text after the stamp moved sideways from row to row.
+fn timestamp_text(timestamp: &str, color: Option<egui::Color32>) -> egui::RichText {
+    let text = egui::RichText::new(timestamp).monospace();
+    match color {
+        Some(color) => text.color(color),
+        None => text,
+    }
+}
+
 /// Wording for the global REST indicator, independent of serial-port state.
 #[cfg(feature = "rest")]
 fn rest_indicator_label(state: Option<&crate::protocol::RestState>, unavailable: bool) -> String {
@@ -4087,11 +4101,8 @@ impl PortMonitorState {
                 };
                 ui.horizontal(|ui| {
                     if self.show_timestamps {
-                        if color_enabled {
-                            ui.colored_label(ui.visuals().weak_text_color(), &line.timestamp);
-                        } else {
-                            ui.label(&line.timestamp);
-                        }
+                        let weak = color_enabled.then(|| ui.visuals().weak_text_color());
+                        ui.label(timestamp_text(&line.timestamp, weak));
                         ui.add_space(6.0);
                     }
                     let resp = if line.is_sent {
@@ -5273,5 +5284,45 @@ mod quit_tests {
         assert!(app.quit_from_menu());
         assert!(!app.monitors[0].is_open);
         assert_eq!(*asked.lock().unwrap(), vec![DaemonRequest::Stop]);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    /// The font family a label's text is laid out in.
+    fn family_of(text: impl Into<egui::WidgetText>) -> egui::FontFamily {
+        let text = text.into();
+        let mut family = None;
+        egui::__run_test_ui(|ui| {
+            let galley = text
+                .clone()
+                .into_galley(ui, None, f32::INFINITY, egui::TextStyle::Body);
+            family = galley
+                .job
+                .sections
+                .first()
+                .map(|section| section.format.font_id.family.clone());
+        });
+        family.expect("the text has a section")
+    }
+
+    /// The stamp is in the font of the row after it. In a proportional face,
+    /// as the system font is on macOS, its width depends on its digits and the
+    /// text behind it shifts from row to row.
+    #[test]
+    fn the_timestamp_is_set_in_the_monospaced_font() {
+        assert_eq!(
+            family_of(timestamp_text("21:04:31.101", None)),
+            egui::FontFamily::Monospace
+        );
+        assert_eq!(
+            family_of(timestamp_text("21:04:31.101", Some(egui::Color32::GRAY))),
+            egui::FontFamily::Monospace
+        );
+        // Counter-probe: the plain label this replaces is proportional, so the
+        // check can tell the two apart.
+        assert_eq!(family_of("21:04:31.101"), egui::FontFamily::Proportional);
     }
 }
