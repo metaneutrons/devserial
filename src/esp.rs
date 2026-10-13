@@ -3,15 +3,150 @@
 
 //! ESP tooling via the `espflash` subprocess.
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::OnceCell;
 
 /// Name of the tool we shell out to.
 const ESPFLASH: &str = "espflash";
 
-/// Cached availability of the espflash binary.
-static AVAILABLE: OnceCell<bool> = OnceCell::const_new();
+/// Set once espflash has answered. A negative answer is not kept: the tool
+/// can be installed while the daemon runs.
+static AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Where the tool is looked for in addition to `PATH`.
+///
+/// A window started from the Dock or Finder, and the daemon it starts, get
+/// the system's short `PATH`, which holds neither `~/.cargo/bin` (where
+/// `cargo install espflash` puts the tool) nor Homebrew's directory.
+fn extra_dirs(home: Option<&Path>, cargo_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(cargo) = cargo_home {
+        dirs.push(cargo.join("bin"));
+    } else if let Some(home) = home {
+        dirs.push(home.join(".cargo").join("bin"));
+    }
+    if let Some(home) = home {
+        dirs.push(home.join(".local").join("bin"));
+    }
+    #[cfg(unix)]
+    {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+    dirs
+}
+
+/// Whether `path` is a file the user may run.
+fn is_runnable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+/// The first `espflash` in the directories of `path_var`, then in `extra`.
+fn find_in(path_var: Option<&OsStr>, extra: &[PathBuf]) -> Option<PathBuf> {
+    let name = format!("{ESPFLASH}{}", std::env::consts::EXE_SUFFIX);
+    path_var
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(extra.iter().cloned())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| is_runnable(candidate))
+}
+
+/// The directories searched besides `PATH`, from the environment.
+fn environment_dirs() -> Vec<PathBuf> {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+    extra_dirs(home.as_deref(), cargo_home.as_deref())
+}
+
+/// The `espflash` to run: the one found, or the bare name, whose failure
+/// then says what is missing.
+fn program() -> PathBuf {
+    find_in(std::env::var_os("PATH").as_deref(), &environment_dirs())
+        .unwrap_or_else(|| PathBuf::from(ESPFLASH))
+}
+
+/// What to tell the user when the tool is nowhere to be found.
+///
+/// It names where it looked, because the usual cause is a `PATH` shorter than
+/// the one in the user's shell, and that cannot be seen from the outside.
+fn not_found_message() -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let extra: Vec<String> = environment_dirs()
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect();
+    format!(
+        "espflash was not found. Looked in PATH ({}) and in {}. Install it with \
+         `cargo install espflash`, or start devserial from a shell where it is on the PATH.",
+        path.to_string_lossy(),
+        extra.join(", "),
+    )
+}
+
+/// Make sure espflash can be run, and say why not when it cannot.
+///
+/// The probe runs a subprocess, so it is asynchronous. Once the tool has
+/// answered, the answer is kept; while it has not, the next call looks again,
+/// because the tool can be installed while the daemon runs.
+///
+/// # Errors
+/// Returns a sentence for the user: where the tool was looked for, or what it
+/// answered when it was found but would not run.
+pub async fn check() -> Result<(), String> {
+    if AVAILABLE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let program = program();
+    let output = Command::new(&program)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, program = %program.display(), "espflash cannot be run");
+            if error.kind() == std::io::ErrorKind::NotFound {
+                not_found_message()
+            } else {
+                format!(
+                    "espflash at {} could not be run: {error}",
+                    program.display()
+                )
+            }
+        })?;
+    if !output.status.success() {
+        let said = String::from_utf8_lossy(&output.stderr);
+        let reason = format!(
+            "`{} --version` ended with {}: {}",
+            program.display(),
+            output.status,
+            said.trim()
+        );
+        tracing::warn!(%reason, "espflash does not answer");
+        return Err(reason);
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    tracing::info!(version = %version, program = %program.display(), "espflash detected");
+    AVAILABLE.store(true, Ordering::Relaxed);
+    Ok(())
+}
 
 /// Which of the tool's two streams a line came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,35 +170,6 @@ pub struct OutputLine {
 /// from the call itself, so a caller that does not care changes nothing.
 pub type Progress = tokio::sync::mpsc::UnboundedSender<OutputLine>;
 
-/// Whether espflash is available in `PATH`.
-///
-/// The probe runs a subprocess, so it is asynchronous and cached. Calling it
-/// from an async context used to block the runtime thread.
-pub async fn is_available() -> bool {
-    *AVAILABLE
-        .get_or_init(|| async {
-            match Command::new(ESPFLASH)
-                .arg("--version")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => {
-                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    tracing::info!(version = %version, "espflash detected");
-                    true
-                }
-                Ok(_) => false,
-                Err(e) => {
-                    tracing::debug!(error = %e, "espflash not available");
-                    false
-                }
-            }
-        })
-        .await
-}
-
 /// Flash firmware to an ESP device.
 ///
 /// # Errors
@@ -82,7 +188,7 @@ pub async fn flash_with_progress(
     baud: Option<u32>,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(ESPFLASH);
+    let mut cmd = Command::new(program());
     cmd.arg("flash").arg("--port").arg(port);
     if let Some(baud) = baud {
         cmd.arg("--baud").arg(baud.to_string());
@@ -97,7 +203,7 @@ pub async fn flash_with_progress(
 /// # Errors
 /// Returns error if espflash fails or is not available.
 pub async fn board_info(port: &str) -> Result<String, String> {
-    let mut cmd = Command::new(ESPFLASH);
+    let mut cmd = Command::new(program());
     cmd.arg("board-info").arg("--port").arg(port);
     run(cmd, None).await
 }
@@ -118,7 +224,7 @@ pub async fn erase_flash_with_progress(
     port: &str,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(ESPFLASH);
+    let mut cmd = Command::new(program());
     cmd.arg("erase-flash").arg("--port").arg(port);
     run(cmd, progress).await
 }
@@ -128,7 +234,7 @@ pub async fn erase_flash_with_progress(
 /// # Errors
 /// Returns error if espflash fails or is not available.
 pub async fn write_bin(port: &str, file_path: &str, address: &str) -> Result<String, String> {
-    let mut cmd = Command::new(ESPFLASH);
+    let mut cmd = Command::new(program());
     cmd.arg("write-bin")
         .arg("--port")
         .arg(port)
@@ -143,7 +249,13 @@ async fn run(mut cmd: Command, progress: Option<&Progress>) -> Result<String, St
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to run {ESPFLASH}: {e}"))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                not_found_message()
+            } else {
+                format!("failed to run {ESPFLASH}: {e}")
+            }
+        })?;
 
     // Both pipes are drained at the same time. Reading one to the end first
     // would block the tool as soon as it filled the other one.
@@ -255,11 +367,58 @@ fn join_streams(primary: &str, secondary: &str) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn availability_is_cached() {
-        let first = is_available().await;
-        let second = is_available().await;
-        assert_eq!(first, second);
+    #[test]
+    fn the_tool_is_found_in_path_and_then_in_the_usual_places() {
+        let root = tempfile::tempdir().unwrap();
+        let name = format!("{ESPFLASH}{}", std::env::consts::EXE_SUFFIX);
+        let make = |dir: &str| {
+            let dir = root.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(&name);
+            std::fs::write(&file, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            (dir, file)
+        };
+        let (path_dir, path_file) = make("on-path");
+        let (cargo_dir, cargo_file) = make(".cargo/bin");
+        let path_var = std::env::join_paths([&path_dir]).unwrap();
+        let extra = extra_dirs(Some(root.path()), None);
+        assert_eq!(extra[0], cargo_dir);
+
+        // PATH wins over the usual places.
+        assert_eq!(find_in(Some(&path_var), &extra), Some(path_file));
+        // A short PATH, as in a window started from the Dock, still finds it.
+        let short = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        assert_eq!(find_in(Some(&short), &extra), Some(cargo_file.clone()));
+        assert_eq!(find_in(None, &extra), Some(cargo_file));
+        // `CARGO_HOME` replaces `~/.cargo`.
+        let elsewhere = root.path().join("cargo-home");
+        assert_eq!(
+            extra_dirs(Some(root.path()), Some(&elsewhere))[0],
+            elsewhere.join("bin")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unrunnable_tool_is_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let name = format!("{ESPFLASH}{}", std::env::consts::EXE_SUFFIX);
+        let extra = vec![root.path().to_path_buf()];
+        assert_eq!(find_in(None, &extra), None);
+        // A directory of that name is not the tool.
+        std::fs::create_dir(root.path().join(&name)).unwrap();
+        assert_eq!(find_in(None, &extra), None);
+        // Neither is a file without the execute bit.
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(root.path().join(&name)).unwrap();
+            std::fs::write(root.path().join(&name), "x").unwrap();
+            assert_eq!(find_in(None, &extra), None);
+        }
     }
 
     /// Collect what `split_lines` reports for a sequence of chunks.
@@ -472,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn flash_reports_failure_for_a_missing_device() {
-        if !is_available().await {
+        if check().await.is_err() {
             return; // espflash is not installed on this machine
         }
         let result = flash(
@@ -486,9 +645,24 @@ mod tests {
 
     #[tokio::test]
     async fn board_info_reports_failure_for_a_missing_device() {
-        if !is_available().await {
+        if check().await.is_err() {
             return;
         }
         assert!(board_info("/dev/nonexistent_port_xyz").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_missing_tool_is_reported_with_where_it_was_looked_for() {
+        let message = not_found_message();
+        assert!(message.contains("PATH ("), "{message}");
+        assert!(message.contains("cargo install espflash"), "{message}");
+        // The bare name, spawned from an empty directory list, fails with
+        // `NotFound`, which is what the message is for.
+        let missing = Command::new("espflash-that-does-not-exist-xyz")
+            .arg("--version")
+            .output()
+            .await
+            .unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
     }
 }

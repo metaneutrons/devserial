@@ -1111,16 +1111,21 @@ impl CommandEngine {
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        if !crate::esp::is_available().await {
-            return Err(EngineError::Tool(
-                "espflash not found in PATH. Install with: cargo install espflash".to_string(),
-            ));
+        if let Err(reason) = crate::esp::check().await {
+            return Err(EngineError::Tool(reason));
         }
 
         let reopen = self.release_port(port).await;
-        let result = op(port.to_string()).await;
-        if let Some(config) = reopen {
-            self.reopen_port(port, config).await;
+        let mut result = op(port.to_string()).await;
+        if let Some(config) = reopen
+            && let Err(reason) = self.reopen_port(port, config).await
+        {
+            // The tool's own answer stays; the caller learns in addition
+            // that the port is closed now, which nothing else would tell it.
+            let note = format!(
+                "devserial could not open {port} again: {reason}. Connect it again to continue."
+            );
+            result = with_note(result, &note);
         }
 
         if let Some(log) = log {
@@ -1154,16 +1159,16 @@ impl CommandEngine {
 
     /// Reopen a port previously released by [`Self::release_port`].
     #[cfg(feature = "esp")]
-    async fn reopen_port(&self, port: &str, config: PortConfig) {
+    async fn reopen_port(&self, port: &str, config: PortConfig) -> Result<(), String> {
         tokio::time::sleep(ESP_REOPEN_DELAY).await;
-        match self
-            .port_manager
+        self.port_manager
             .open_serial(port.to_string(), config, self.data_dir().to_path_buf())
             .await
-        {
-            Ok(()) => tracing::info!(port = %port, "reopened port"),
-            Err(e) => tracing::warn!(port = %port, error = %e, "failed to reopen port"),
-        }
+            .inspect(|()| tracing::info!(port = %port, "reopened port"))
+            .map_err(|e| {
+                tracing::warn!(port = %port, error = %e, "failed to reopen port");
+                e.to_string()
+            })
     }
 
     /// Insert an informational message or event marker into a port's buffer.
@@ -1293,6 +1298,15 @@ impl From<EngineError> for String {
 #[must_use]
 pub fn payloads(lines: &[StoredLine]) -> Vec<&str> {
     lines.iter().map(|l| l.payload.as_str()).collect()
+}
+
+/// Add a note to what a tool answered, on success and on failure alike.
+#[cfg(feature = "esp")]
+fn with_note(result: Result<String, String>, note: &str) -> Result<String, String> {
+    match result {
+        Ok(output) => Ok(format!("{output}\n\n{note}")),
+        Err(message) => Err(format!("{message}\n\n{note}")),
+    }
 }
 
 #[cfg(test)]
@@ -2052,5 +2066,18 @@ mod tests {
             panic!("expected a state");
         };
         assert_eq!(state.port, port, "the override was ignored");
+    }
+
+    #[cfg(feature = "esp")]
+    #[test]
+    fn a_note_is_added_to_a_success_and_to_a_failure() {
+        assert_eq!(
+            with_note(Ok("flashed".into()), "port closed"),
+            Ok("flashed\n\nport closed".to_string())
+        );
+        assert_eq!(
+            with_note(Err("failed".into()), "port closed"),
+            Err("failed\n\nport closed".to_string())
+        );
     }
 }
