@@ -51,6 +51,86 @@ type RestWorkerMessage = (
 #[cfg(feature = "rest")]
 type RestWorkerReceiver = std::sync::mpsc::Receiver<RestWorkerMessage>;
 
+/// What the window knows about a control line (DTR or RTS).
+///
+/// Only the window's own writes are known. The level of an output line cannot
+/// be read back, and a macro or a freshly opened port sets it without the
+/// window's say, so the state is unknown until the window sets it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SignalLine {
+    /// Not set by this window since the port was opened or a macro ran.
+    #[default]
+    Unknown,
+    /// Last set low (released) by this window.
+    Low,
+    /// Last set high (asserted) by this window.
+    High,
+}
+
+impl SignalLine {
+    /// The state a click asks for: a line that is not known to be high is
+    /// asserted, one that is high is released.
+    const fn after_click(self) -> Self {
+        match self {
+            Self::High => Self::Low,
+            Self::Low | Self::Unknown => Self::High,
+        }
+    }
+}
+
+/// What the hover text says about a control line and what a click does.
+fn signal_hint(name: &str, state: SignalLine) -> String {
+    let (known, click) = match state {
+        SignalLine::High => ("set high (asserted) by this window", "release it"),
+        SignalLine::Low => ("set low (released) by this window", "assert it"),
+        SignalLine::Unknown => (
+            "not set by this window since the port was opened or a macro ran; \
+             the real level cannot be read back",
+            "assert it",
+        ),
+    };
+    format!("{name}: {known}. Click to {click}.")
+}
+
+/// A button for a control line with an indicator in front of it: a filled
+/// dot when the window set it high, a ring when it set it low, a dash when it
+/// does not know. Returns whether the button was clicked.
+fn signal_control(ui: &mut egui::Ui, name: &str, state: SignalLine) -> bool {
+    let hint = signal_hint(name, state);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (rect, led) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        let center = rect.center();
+        let weak = ui.visuals().weak_text_color();
+        let painter = ui.painter();
+        match state {
+            SignalLine::High => {
+                painter.circle_filled(center, 5.0, egui::Color32::from_rgb(70, 200, 110));
+            }
+            SignalLine::Low => {
+                painter.circle_stroke(
+                    center,
+                    4.5,
+                    egui::Stroke::new(1.5, ui.visuals().text_color()),
+                );
+            }
+            SignalLine::Unknown => {
+                painter.line_segment(
+                    [center - egui::vec2(4.0, 0.0), center + egui::vec2(4.0, 0.0)],
+                    egui::Stroke::new(1.5, weak),
+                );
+            }
+        }
+        led.on_hover_text(hint.clone());
+        clicked = ui
+            .add(egui::Button::new(name).selected(state == SignalLine::High))
+            .on_hover_text(hint)
+            .clicked();
+    });
+    clicked
+}
+
 /// The time of day in front of a row.
 ///
 /// It is set in the same monospaced font as the row, so every row's text
@@ -1234,8 +1314,8 @@ pub struct PortMonitorState {
     line_ending: LineEnding,
     show_timestamps: bool,
     hex_view: bool,
-    dtr_state: bool,
-    rts_state: bool,
+    dtr_state: SignalLine,
+    rts_state: SignalLine,
     last_id: i64,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -1378,8 +1458,8 @@ impl PortMonitorState {
             line_ending: LineEnding::CrLf,
             show_timestamps: true,
             hex_view: false,
-            dtr_state: false,
-            rts_state: false,
+            dtr_state: SignalLine::Unknown,
+            rts_state: SignalLine::Unknown,
             last_id: i64::MAX,
             history,
             history_idx: None,
@@ -1620,7 +1700,10 @@ impl PortMonitorState {
         let config = self.current_config();
         if let Some(toggle) = self.toggle_connect.clone() {
             match toggle(true, &config) {
-                Ok(()) => self.connected = true,
+                Ok(()) => {
+                    self.connected = true;
+                    self.forget_signal_lines();
+                }
                 Err(e) => {
                     self.flash.outcome = Some((
                         format!("{what} done, but the port did not come back: {e}"),
@@ -1825,6 +1908,7 @@ impl PortMonitorState {
         }
 
         self.connected = connect;
+        self.forget_signal_lines();
         let notice = if connect {
             format!(
                 "━━━ PORT CONNECTED: {} ({}) ━━━",
@@ -3956,16 +4040,18 @@ impl PortMonitorState {
             ui.separator();
 
             // Group 4: DTR / RTS live toggles
-            if ui.toggle_value(&mut self.dtr_state, "DTR").changed() {
+            if signal_control(ui, "DTR", self.dtr_state) {
+                self.dtr_state = self.dtr_state.after_click();
                 self.request(&MonitorEvent::Signal {
-                    dtr: Some(self.dtr_state),
+                    dtr: Some(self.dtr_state == SignalLine::High),
                     rts: None,
                 });
             }
-            if ui.toggle_value(&mut self.rts_state, "RTS").changed() {
+            if signal_control(ui, "RTS", self.rts_state) {
+                self.rts_state = self.rts_state.after_click();
                 self.request(&MonitorEvent::Signal {
                     dtr: None,
-                    rts: Some(self.rts_state),
+                    rts: Some(self.rts_state == SignalLine::High),
                 });
             }
             ui.separator();
@@ -4586,6 +4672,16 @@ impl PortMonitorState {
         self.request(&MonitorEvent::Macro {
             name: name.to_string(),
         });
+        // A macro drives DTR and RTS itself, so what this window set before
+        // no longer says what the lines are.
+        self.forget_signal_lines();
+    }
+
+    /// The lines are no longer known to be what this window set: a macro ran,
+    /// or the port was opened again, which sets them as the system does.
+    const fn forget_signal_lines(&mut self) {
+        self.dtr_state = SignalLine::Unknown;
+        self.rts_state = SignalLine::Unknown;
     }
 
     /// Send an event and surface a failure in the status line.
@@ -5324,5 +5420,62 @@ mod timestamp_tests {
         // Counter-probe: the plain label this replaces is proportional, so the
         // check can tell the two apart.
         assert_eq!(family_of("21:04:31.101"), egui::FontFamily::Proportional);
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    #[test]
+    fn a_click_asserts_a_line_that_is_not_known_to_be_high() {
+        assert_eq!(SignalLine::Unknown.after_click(), SignalLine::High);
+        assert_eq!(SignalLine::Low.after_click(), SignalLine::High);
+        // Counter-probe: a line known to be high is released.
+        assert_eq!(SignalLine::High.after_click(), SignalLine::Low);
+    }
+
+    #[test]
+    fn the_hover_text_says_what_the_window_knows() {
+        assert!(signal_hint("DTR", SignalLine::High).contains("set high"));
+        assert!(signal_hint("DTR", SignalLine::Low).contains("set low"));
+        let unknown = signal_hint("RTS", SignalLine::Unknown);
+        assert!(unknown.contains("cannot be read back"), "{unknown}");
+        assert!(unknown.starts_with("RTS:"), "{unknown}");
+    }
+
+    fn window() -> PortMonitorState {
+        PortMonitorState::new(
+            "test".to_string(),
+            "test".to_string(),
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// A macro drives the lines itself, so the window stops claiming a state.
+    #[test]
+    fn a_macro_makes_the_lines_unknown() {
+        let mut monitor = window();
+        assert_eq!(monitor.dtr_state, SignalLine::Unknown);
+        monitor.dtr_state = SignalLine::High;
+        monitor.rts_state = SignalLine::Low;
+        monitor.run_macro("reset");
+        assert_eq!(monitor.dtr_state, SignalLine::Unknown);
+        assert_eq!(monitor.rts_state, SignalLine::Unknown);
+    }
+
+    /// The control draws a button and an indicator, in every state, and a
+    /// click reports once.
+    #[test]
+    fn the_control_is_drawn_in_every_state() {
+        for state in [SignalLine::Unknown, SignalLine::Low, SignalLine::High] {
+            let mut clicked = true;
+            egui::__run_test_ui(|ui| {
+                clicked = signal_control(ui, "DTR", state);
+            });
+            assert!(!clicked, "nothing was clicked in {state:?}");
+        }
     }
 }
