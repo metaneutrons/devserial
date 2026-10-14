@@ -881,10 +881,7 @@ fn run_app(
             }
             #[cfg(feature = "esp")]
             KeyCode::F(6) => {
-                match runtime.block_on(crate::esp::check()) {
-                    Ok(()) => state.input_mode = toggle(&state.input_mode, InputMode::Flash),
-                    Err(reason) => state.set_status(reason),
-                }
+                state.input_mode = toggle(&state.input_mode, InputMode::Flash);
                 continue;
             }
             KeyCode::F(9) => {
