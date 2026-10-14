@@ -339,7 +339,7 @@ pub enum Command {
         json: bool,
     },
 
-    /// Flash firmware to an ESP device (requires espflash)
+    /// Flash firmware to an ESP device
     #[cfg(feature = "esp")]
     Flash {
         /// Serial port path

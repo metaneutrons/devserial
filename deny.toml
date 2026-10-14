@@ -8,11 +8,22 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Keine Ausnahmen. Der bisherige Eintrag fuer RUSTSEC-2024-0436 (paste
+# Eine Ausnahme. Der bisherige Eintrag fuer RUSTSEC-2024-0436 (paste
 # unmaintained) nannte als Bedingung "entfernen sobald ratatui auf 0.30 oder
 # neuer steht"; ratatui 0.30 zieht paste nicht mehr, und die Abhaengigkeit ist
 # aus dem Baum verschwunden.
-ignore = []
+ignore = [
+    # ruzstd 0.8.3 (Decompression Bomb, nur Denial of Service), gezogen ueber
+    # espflash 4.6.0 -> object 0.39.1 (Standard-Feature "compression"). Die
+    # Korrektur steht erst in ruzstd 0.9.1, und object 0.39 verlangt ruzstd 0.8,
+    # also hilft ein Update im Baum nicht. Erreichbarkeit: espflash liest die
+    # Firmware-ELF nur mit `data()` und ruft weder `compressed_data` noch
+    # `uncompressed_data` auf (Quelltext von espflash 4.6.0 durchsucht), der
+    # Dekoder wird also nicht ausgefuehrt. Die Eingabe ist ausserdem die
+    # Datei, die der Nutzer selbst zum Flashen angibt. Entfernen, sobald
+    # espflash oder object ruzstd >= 0.9.1 verlangt (#139).
+    { id = "RUSTSEC-2026-0344", reason = "ruzstd 0.8.3 only through espflash -> object; the decoder is not called on the firmware ELF; fixed upstream only in 0.9.1 which object 0.39 does not accept (#139)" },
+]
 
 [licenses]
 version = 2
@@ -30,6 +41,10 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    # serialport, mit dem espflash die serielle Schnittstelle oeffnet (#139).
+    # Dateiweises Copyleft: ungeaenderte Dateien einer Abhaengigkeit loesen
+    # keine Pflicht fuer den Rest des Programms aus.
+    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
     # Ueber error-code, gezogen von clipboard-win, arboard und egui-winit.
