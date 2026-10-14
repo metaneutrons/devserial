@@ -235,7 +235,7 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Transfers and export.** File transfer over ZMODEM, YMODEM and XMODEM from a dialog, and export of the whole database, the visible buffer or a line range to TXT, CSV or JSONL, either to a file or to the clipboard.
 
-**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. Needs `espflash`. It is looked for in the `PATH`, then in `~/.cargo/bin` (or `$CARGO_HOME/bin`), `~/.local/bin` and Homebrew's directories, so a window started from the Dock finds a tool installed with `cargo install espflash`. When it is not found, the message says where it looked. When the port cannot be opened again after a run, the result says so.
+**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. The `espflash` library is built in, so no separate tool has to be installed. The port is released while it runs and opened again afterwards, and a port that cannot be opened again is reported in the result.
 
 **Interface scale.** View > Zoom In, Zoom Out and Actual Size, the same two steps and a readout at the right end of the status bar, and `Cmd+Plus`, `Cmd+Minus` and `Cmd+0` on the keyboard. The scale is remembered between runs. Off macOS there is no menu bar, so the keyboard and the status bar are the way there.
 
@@ -318,7 +318,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `export` | Write the capture to a file |
 | `clear` | Empty the buffer, optionally archiving it first |
 | `stats` | Connection state and buffer statistics |
-| `flash` | Flash an ESP device through `espflash` |
+| `flash` | Flash an ESP device with the built-in `espflash` library |
 | `rest` | Show or change the HTTP interface of the daemon |
 | `daemon` | Run, inspect, stop or restart the daemon, or change its idle period |
 | `monitor` / `tui` | Interactive monitors |
@@ -695,7 +695,7 @@ The configuration file lives at `~/Library/Application Support/Claude/claude_des
 | `serial_receive_file` | Receive a file over the same protocols |
 | `serial_monitor_open` | Open a GUI window for a port the model is watching |
 | `serial_monitor_close` | Close that window |
-| `serial_esp_flash` | Flash firmware through `espflash` |
+| `serial_esp_flash` | Flash firmware with the built-in `espflash` library |
 | `serial_esp_info` | Chip type, flash size, MAC address |
 | `serial_esp_erase` | Erase the entire flash |
 | `serial_esp_write_bin` | Write a raw binary to a flash address |
@@ -861,7 +861,7 @@ devserial daemon
 
 | Feature | Default | Contents |
 |---------|:-------:|----------|
-| `esp` | yes | Flashing, chip info and flash erase through `espflash` |
+| `esp` | yes | Flashing, chip info and flash erase with the `espflash` library |
 | `monitor` | no | The desktop GUI (`egui` and `eframe`) |
 | `rest` | no | The HTTP interface (`axum` and `tower-http`) |
 | `tui` | no | The terminal monitor (`ratatui` and `crossterm`) |

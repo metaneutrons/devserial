@@ -30,6 +30,10 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    # serialport, mit dem espflash die serielle Schnittstelle oeffnet (#139).
+    # Dateiweises Copyleft: ungeaenderte Dateien einer Abhaengigkeit loesen
+    # keine Pflicht fuer den Rest des Programms aus.
+    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
     # Ueber error-code, gezogen von clipboard-win, arboard und egui-winit.

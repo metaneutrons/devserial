@@ -1,166 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Fabian Schmieder
 
-//! ESP tooling via the `espflash` subprocess.
+//! ESP tooling through the `espflash` library.
+//!
+//! The library speaks to the chip over a serial port of its own, opened here
+//! with `serialport`; devserial's ports are `serial2`. The two do not share a
+//! handle, which is why the callers release the port before an operation and
+//! open it again afterwards.
+//!
+//! Everything blocks, so each operation runs on a thread of its own, and the
+//! lines it reports travel over the channel the caller handed in.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use espflash::connection::{Connection, ResetAfterOperation, ResetBeforeOperation};
+use espflash::flasher::{FlashData, FlashSettings, FlashSize, Flasher};
+use espflash::image_format::Metadata;
+use espflash::image_format::idf::IdfBootloaderFormat;
+use espflash::target::ProgressCallbacks;
+use serialport::{FlowControl, SerialPortType, UsbPortInfo};
 
-/// Name of the tool we shell out to.
-const ESPFLASH: &str = "espflash";
-
-/// Set once espflash has answered. A negative answer is not kept: the tool
-/// can be installed while the daemon runs.
-static AVAILABLE: AtomicBool = AtomicBool::new(false);
-
-/// Where the tool is looked for in addition to `PATH`.
-///
-/// A window started from the Dock or Finder, and the daemon it starts, get
-/// the system's short `PATH`, which holds neither `~/.cargo/bin` (where
-/// `cargo install espflash` puts the tool) nor Homebrew's directory.
-fn extra_dirs(home: Option<&Path>, cargo_home: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(cargo) = cargo_home {
-        dirs.push(cargo.join("bin"));
-    } else if let Some(home) = home {
-        dirs.push(home.join(".cargo").join("bin"));
-    }
-    if let Some(home) = home {
-        dirs.push(home.join(".local").join("bin"));
-    }
-    #[cfg(unix)]
-    {
-        dirs.push(PathBuf::from("/opt/homebrew/bin"));
-        dirs.push(PathBuf::from("/usr/local/bin"));
-    }
-    dirs
-}
-
-/// Whether `path` is a file the user may run.
-fn is_runnable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.is_file()
-    }
-}
-
-/// The first `espflash` in the directories of `path_var`, then in `extra`.
-fn find_in(path_var: Option<&OsStr>, extra: &[PathBuf]) -> Option<PathBuf> {
-    let name = format!("{ESPFLASH}{}", std::env::consts::EXE_SUFFIX);
-    path_var
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .chain(extra.iter().cloned())
-        .map(|dir| dir.join(&name))
-        .find(|candidate| is_runnable(candidate))
-}
-
-/// The directories searched besides `PATH`, from the environment.
-fn environment_dirs() -> Vec<PathBuf> {
-    let home =
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
-    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
-    extra_dirs(home.as_deref(), cargo_home.as_deref())
-}
-
-/// The `espflash` to run: the one found, or the bare name, whose failure
-/// then says what is missing.
-fn program() -> PathBuf {
-    find_in(std::env::var_os("PATH").as_deref(), &environment_dirs())
-        .unwrap_or_else(|| PathBuf::from(ESPFLASH))
-}
-
-/// How much of the `PATH` a message shows. A Windows `PATH` runs to several
-/// kilobytes, which would bury the sentence it is in.
-const MAX_SHOWN_PATH: usize = 240;
-
-/// `text` cut to at most `max` characters, with an ellipsis where it was cut.
-fn shorten(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(max).collect();
-    format!("{kept}\u{2026}")
-}
-
-/// What to tell the user when the tool is nowhere to be found.
-///
-/// It names where it looked, because the usual cause is a `PATH` shorter than
-/// the one in the user's shell, and that cannot be seen from the outside.
-fn not_found_message() -> String {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let path = shorten(&path.to_string_lossy(), MAX_SHOWN_PATH);
-    let extra: Vec<String> = environment_dirs()
-        .iter()
-        .map(|dir| dir.display().to_string())
-        .collect();
-    format!(
-        "espflash was not found. Looked in PATH ({}) and in {}. Install it with \
-         `cargo install espflash`, or start devserial from a shell where it is on the PATH.",
-        path,
-        extra.join(", "),
-    )
-}
-
-/// Make sure espflash can be run, and say why not when it cannot.
-///
-/// The probe runs a subprocess, so it is asynchronous. Once the tool has
-/// answered, the answer is kept; while it has not, the next call looks again,
-/// because the tool can be installed while the daemon runs.
-///
-/// # Errors
-/// Returns a sentence for the user: where the tool was looked for, or what it
-/// answered when it was found but would not run.
-pub async fn check() -> Result<(), String> {
-    if AVAILABLE.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    let program = program();
-    let output = Command::new(&program)
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, program = %program.display(), "espflash cannot be run");
-            if error.kind() == std::io::ErrorKind::NotFound {
-                not_found_message()
-            } else {
-                format!(
-                    "espflash at {} could not be run: {error}",
-                    program.display()
-                )
-            }
-        })?;
-    if !output.status.success() {
-        let said = String::from_utf8_lossy(&output.stderr);
-        let reason = format!(
-            "`{} --version` ended with {}: {}",
-            program.display(),
-            output.status,
-            said.trim()
-        );
-        tracing::warn!(%reason, "espflash does not answer");
-        return Err(reason);
-    }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    tracing::info!(version = %version, program = %program.display(), "espflash detected");
-    AVAILABLE.store(true, Ordering::Relaxed);
-    Ok(())
-}
+/// The baud rate the chip's ROM bootloader starts at.
+const CONNECT_BAUD: u32 = 115_200;
 
 /// Which of the tool's two streams a line came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,10 +45,166 @@ pub struct OutputLine {
 /// from the call itself, so a caller that does not care changes nothing.
 pub type Progress = tokio::sync::mpsc::UnboundedSender<OutputLine>;
 
+/// What an operation has said so far, and where it goes meanwhile.
+struct Report {
+    sink: Option<Progress>,
+    lines: Vec<String>,
+}
+
+impl Report {
+    const fn new(sink: Option<Progress>) -> Self {
+        Self {
+            sink,
+            lines: Vec::new(),
+        }
+    }
+
+    fn line(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if let Some(sink) = &self.sink {
+            // A closed receiver means the caller stopped listening. The
+            // operation carries on and the full output still reaches the
+            // return value.
+            let _ = sink.send(OutputLine {
+                stream: Stream::Stdout,
+                text: text.clone(),
+            });
+        }
+        self.lines.push(text);
+    }
+
+    fn into_output(self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+/// Reports the progress of a write as a line at every tenth of it.
+struct LineProgress<'a> {
+    report: &'a mut Report,
+    total: usize,
+    reached: usize,
+}
+
+impl<'a> LineProgress<'a> {
+    const fn new(report: &'a mut Report) -> Self {
+        Self {
+            report,
+            total: 0,
+            reached: 0,
+        }
+    }
+}
+
+impl ProgressCallbacks for LineProgress<'_> {
+    fn init(&mut self, addr: u32, total: usize) {
+        self.total = total;
+        self.reached = 0;
+        self.report
+            .line(format!("Writing {total} bytes at {addr:#x}"));
+    }
+
+    fn update(&mut self, current: usize) {
+        let tenth = tenth_of(current, self.total);
+        if tenth > self.reached {
+            self.reached = tenth;
+            self.report.line(format!("  {}%", tenth * 10));
+        }
+    }
+
+    fn verifying(&mut self) {
+        self.report.line("Verifying");
+    }
+
+    fn finish(&mut self, skipped: bool) {
+        self.report.line(if skipped {
+            "Unchanged, skipped"
+        } else {
+            "Written"
+        });
+    }
+}
+
+/// How many tenths of `total` `current` is, from 0 to 10.
+fn tenth_of(current: usize, total: usize) -> usize {
+    if total == 0 {
+        return 10;
+    }
+    (current.min(total).saturating_mul(10) / total).min(10)
+}
+
+/// Run a blocking operation on a thread of its own.
+async fn blocking<F>(operation: F) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("the ESP operation ended without an answer: {error}"))?
+}
+
+/// Open `port` and connect to the chip behind it.
+fn connect(port: &str, baud: Option<u32>) -> Result<Flasher, String> {
+    let serial = serialport::new(port, CONNECT_BAUD)
+        .flow_control(FlowControl::None)
+        .open_native()
+        .map_err(|error| format!("could not open {port}: {error}"))?;
+    let connection = Connection::new(
+        serial,
+        usb_info(port),
+        ResetAfterOperation::HardReset,
+        ResetBeforeOperation::DefaultReset,
+        baud.unwrap_or(CONNECT_BAUD),
+    );
+    // Use the flasher stub, verify what was written, and skip regions that are
+    // already as they should be: the defaults of the `espflash` command.
+    Flasher::connect(connection, true, true, true, None, baud)
+        .map_err(|error| format!("could not connect to a chip on {port}: {error}"))
+}
+
+/// The USB identity of `port`, which picks the reset sequence for the chip.
+/// A port the system does not list as USB gets zeros, as the `espflash`
+/// command does.
+fn usb_info(port: &str) -> UsbPortInfo {
+    let found = serialport::available_ports()
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.port_name == port);
+    match found.map(|candidate| candidate.port_type) {
+        Some(SerialPortType::UsbPort(info)) => info,
+        _ => UsbPortInfo {
+            vid: 0,
+            pid: 0,
+            serial_number: None,
+            manufacturer: None,
+            product: None,
+        },
+    }
+}
+
+/// Describe the chip, as the `board-info` command does.
+fn describe(flasher: &mut Flasher, report: &mut Report) -> Result<(), String> {
+    let info = flasher
+        .device_info()
+        .map_err(|error| format!("could not read the board's information: {error}"))?;
+    let revision = info.revision.map_or_else(String::new, |(major, minor)| {
+        format!(" (revision v{major}.{minor})")
+    });
+    report.line(format!("Chip type:         {}{revision}", info.chip));
+    report.line(format!("Crystal frequency: {}", info.crystal_frequency));
+    report.line(format!("Flash size:        {}", info.flash_size));
+    report.line(format!("Features:          {}", info.features.join(", ")));
+    if let Some(mac) = info.mac_address {
+        report.line(format!("MAC address:       {mac}"));
+    }
+    Ok(())
+}
+
 /// Flash firmware to an ESP device.
 ///
 /// # Errors
-/// Returns error if espflash fails or is not available.
+/// Returns error if the firmware cannot be read, the chip cannot be reached
+/// or the write fails.
 pub async fn flash(port: &str, firmware_path: &str, baud: Option<u32>) -> Result<String, String> {
     flash_with_progress(port, firmware_path, baud, None).await
 }
@@ -195,37 +212,98 @@ pub async fn flash(port: &str, firmware_path: &str, baud: Option<u32>) -> Result
 /// Flash firmware to an ESP device, reporting each line as it is written.
 ///
 /// # Errors
-/// Returns error if espflash fails or is not available.
+/// Returns error if the firmware cannot be read, the chip cannot be reached
+/// or the write fails.
 pub async fn flash_with_progress(
     port: &str,
     firmware_path: &str,
     baud: Option<u32>,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(program());
-    cmd.arg("flash").arg("--port").arg(port);
-    if let Some(baud) = baud {
-        cmd.arg("--baud").arg(baud.to_string());
+    let (port, firmware, sink) = (
+        port.to_owned(),
+        PathBuf::from(firmware_path),
+        progress.cloned(),
+    );
+    blocking(move || flash_blocking(&port, &firmware, baud, Report::new(sink))).await
+}
+
+fn flash_blocking(
+    port: &str,
+    firmware: &Path,
+    baud: Option<u32>,
+    mut report: Report,
+) -> Result<String, String> {
+    // Read the image first: a missing file should not cost a reset of the chip.
+    let elf = std::fs::read(firmware)
+        .map_err(|error| format!("could not read {}: {error}", firmware.display()))?;
+    let mut flasher = connect(port, baud)?;
+    describe(&mut flasher, &mut report)?;
+
+    let chip = flasher.chip();
+    let metadata = Metadata::from_bytes(Some(&elf));
+    if let Some(built_for) = metadata.chip_name()
+        && !built_for.eq_ignore_ascii_case(&chip.to_string())
+    {
+        return Err(format!(
+            "this firmware is built for {built_for}, the chip on {port} is {chip}"
+        ));
     }
-    // `--` keeps a path that begins with a dash from being read as an option.
-    cmd.arg("--").arg(firmware_path);
-    run(cmd, progress).await
+    if !flasher.secure_download_mode() {
+        let wanted = metadata.min_chip_revision().unwrap_or(0);
+        if wanted > 0 {
+            flasher
+                .verify_minimum_revision(wanted)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    let xtal = chip
+        .xtal_frequency(flasher.connection())
+        .map_err(|error| format!("could not read the crystal frequency: {error}"))?;
+    let size = flasher
+        .flash_detect()
+        .ok()
+        .flatten()
+        .unwrap_or_else(FlashSize::default);
+    flasher.set_flash_size(size);
+    let flash_data = FlashData::new(
+        FlashSettings::new(None, Some(size), None),
+        0,
+        None,
+        chip,
+        xtal,
+    );
+    let image = IdfBootloaderFormat::new(&elf, &flash_data, None, None, None, None)
+        .map_err(|error| format!("could not build the flash image: {error}"))?;
+
+    report.line(format!("Flashing {}", firmware.display()));
+    flasher
+        .load_image_to_flash(&mut LineProgress::new(&mut report), image.into())
+        .map_err(|error| format!("flashing failed: {error}"))?;
+    report.line("Flashing has completed");
+    Ok(report.into_output())
 }
 
 /// Get board and chip information.
 ///
 /// # Errors
-/// Returns error if espflash fails or is not available.
+/// Returns error if the chip cannot be reached.
 pub async fn board_info(port: &str) -> Result<String, String> {
-    let mut cmd = Command::new(program());
-    cmd.arg("board-info").arg("--port").arg(port);
-    run(cmd, None).await
+    let port = port.to_owned();
+    blocking(move || {
+        let mut report = Report::new(None);
+        let mut flasher = connect(&port, None)?;
+        describe(&mut flasher, &mut report)?;
+        Ok(report.into_output())
+    })
+    .await
 }
 
 /// Erase the entire flash.
 ///
 /// # Errors
-/// Returns error if espflash fails or is not available.
+/// Returns error if the chip cannot be reached or the erase fails.
 pub async fn erase_flash(port: &str) -> Result<String, String> {
     erase_flash_with_progress(port, None).await
 }
@@ -233,148 +311,57 @@ pub async fn erase_flash(port: &str) -> Result<String, String> {
 /// Erase the entire flash, reporting each line as it is written.
 ///
 /// # Errors
-/// Returns error if espflash fails or is not available.
+/// Returns error if the chip cannot be reached or the erase fails.
 pub async fn erase_flash_with_progress(
     port: &str,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(program());
-    cmd.arg("erase-flash").arg("--port").arg(port);
-    run(cmd, progress).await
+    let (port, sink) = (port.to_owned(), progress.cloned());
+    blocking(move || {
+        let mut report = Report::new(sink);
+        let mut flasher = connect(&port, None)?;
+        describe(&mut flasher, &mut report)?;
+        report.line("Erasing the flash");
+        flasher
+            .erase_flash()
+            .map_err(|error| format!("erasing failed: {error}"))?;
+        report.line("Flash has been erased");
+        Ok(report.into_output())
+    })
+    .await
 }
 
 /// Write a binary file to a specific flash address.
 ///
 /// # Errors
-/// Returns error if espflash fails or is not available.
+/// Returns error if the address or the file is not usable, the chip cannot be
+/// reached or the write fails.
 pub async fn write_bin(port: &str, file_path: &str, address: &str) -> Result<String, String> {
-    let mut cmd = Command::new(program());
-    cmd.arg("write-bin")
-        .arg("--port")
-        .arg(port)
-        .arg("--")
-        .arg(address)
-        .arg(file_path);
-    run(cmd, None).await
+    let address = parse_address(address)?;
+    let (port, file) = (port.to_owned(), PathBuf::from(file_path));
+    blocking(move || {
+        let data = std::fs::read(&file)
+            .map_err(|error| format!("could not read {}: {error}", file.display()))?;
+        let mut report = Report::new(None);
+        let mut flasher = connect(&port, None)?;
+        describe(&mut flasher, &mut report)?;
+        flasher
+            .write_bin_to_flash(address, &data, &mut LineProgress::new(&mut report))
+            .map_err(|error| format!("writing failed: {error}"))?;
+        report.line("Binary successfully written to flash");
+        Ok(report.into_output())
+    })
+    .await
 }
 
-async fn run(mut cmd: Command, progress: Option<&Progress>) -> Result<String, String> {
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                not_found_message()
-            } else {
-                format!("failed to run {ESPFLASH}: {e}")
-            }
-        })?;
-
-    // Both pipes are drained at the same time. Reading one to the end first
-    // would block the tool as soon as it filled the other one.
-    let out = child.stdout.take();
-    let err = child.stderr.take();
-    let (stdout, stderr) = tokio::join!(
-        drain(out, Stream::Stdout, progress),
-        drain(err, Stream::Stderr, progress),
-    );
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("failed to wait for {ESPFLASH}: {e}"))?;
-
-    if status.success() {
-        Ok(join_streams(&stdout, &stderr))
-    } else {
-        let mut message = join_streams(&stderr, &stdout);
-        if message.trim().is_empty() {
-            message = format!("{ESPFLASH} exited with status {status}");
-        }
-        Err(message)
-    }
-}
-
-/// Read one pipe to its end, forwarding lines and returning the raw text.
-///
-/// The returned string is what the pipe wrote, byte for byte as the previous
-/// implementation returned it. The forwarded lines are a second, lossier view
-/// of the same bytes and never replace it.
-async fn drain<R>(reader: Option<R>, stream: Stream, progress: Option<&Progress>) -> String
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let Some(mut reader) = reader else {
-        return String::new();
-    };
-    let mut raw: Vec<u8> = Vec::new();
-    let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                raw.extend_from_slice(&chunk[..n]);
-                if let Some(sink) = progress {
-                    split_lines(&chunk[..n], &mut pending, |text| {
-                        // A closed receiver means the caller stopped
-                        // listening. The operation carries on and its full
-                        // output still reaches the return value.
-                        let _ = sink.send(OutputLine { stream, text });
-                    });
-                }
-            }
-        }
-    }
-
-    // A tool that ends without a final terminator still wrote a line.
-    if let Some(sink) = progress
-        && let Some(text) = take_line(&mut pending)
-    {
-        let _ = sink.send(OutputLine { stream, text });
-    }
-    String::from_utf8_lossy(&raw).into_owned()
-}
-
-/// Hand every complete line in `chunk` to `line`, keeping the tail in `pending`.
-///
-/// A line ends at a newline **or** a carriage return, because espflash draws
-/// its progress bar by returning to the start of the line. Ending only at the
-/// newline would show nothing at all until the bar was finished.
-///
-/// This is the whole of what the streaming does, and it is the same on every
-/// platform, which is why it is a function of its own rather than a loop
-/// inside a subprocess.
-fn split_lines(chunk: &[u8], pending: &mut Vec<u8>, mut line: impl FnMut(String)) {
-    for byte in chunk {
-        if *byte == b'\n' || *byte == b'\r' {
-            if let Some(text) = take_line(pending) {
-                line(text);
-            }
-        } else {
-            pending.push(*byte);
-        }
-    }
-}
-
-/// The pending bytes as one line, or `None` when there is nothing to report.
-///
-/// `\r\n` would otherwise report an empty line after the carriage return, and
-/// a blank line in a progress bar is noise rather than information.
-fn take_line(pending: &mut Vec<u8>) -> Option<String> {
-    let text = String::from_utf8_lossy(pending).trim_end().to_string();
-    pending.clear();
-    (!text.is_empty()).then_some(text)
-}
-
-fn join_streams(primary: &str, secondary: &str) -> String {
-    match (primary.trim().is_empty(), secondary.trim().is_empty()) {
-        (true, _) => secondary.to_string(),
-        (false, true) => primary.to_string(),
-        (false, false) => format!("{primary}\n{secondary}"),
-    }
+/// A flash address as the tool takes it: decimal, or hexadecimal with `0x`.
+fn parse_address(text: &str) -> Result<u32, String> {
+    let text = text.trim();
+    let parsed = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .map_or_else(|| text.parse::<u32>(), |hex| u32::from_str_radix(hex, 16));
+    parsed.map_err(|_| format!("`{text}` is not a flash address; use 0x10000 or 65536"))
 }
 
 #[cfg(test)]
@@ -382,312 +369,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tool_is_found_in_path_and_then_in_the_usual_places() {
-        let root = tempfile::tempdir().unwrap();
-        let name = format!("{ESPFLASH}{}", std::env::consts::EXE_SUFFIX);
-        let make = |dir: &str| {
-            let dir = root.path().join(dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let file = dir.join(&name);
-            std::fs::write(&file, "#!/bin/sh\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            (dir, file)
-        };
-        let (path_dir, path_file) = make("on-path");
-        let (cargo_dir, cargo_file) = make(".cargo/bin");
-        let path_var = std::env::join_paths([&path_dir]).unwrap();
-        let extra = extra_dirs(Some(root.path()), None);
-        assert_eq!(extra[0], cargo_dir);
-
-        // PATH wins over the usual places.
-        assert_eq!(find_in(Some(&path_var), &extra), Some(path_file));
-        // A short PATH, as in a window started from the Dock, still finds it.
-        let short = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
-        assert_eq!(find_in(Some(&short), &extra), Some(cargo_file.clone()));
-        assert_eq!(find_in(None, &extra), Some(cargo_file));
-        // `CARGO_HOME` replaces `~/.cargo`.
-        let elsewhere = root.path().join("cargo-home");
-        assert_eq!(
-            extra_dirs(Some(root.path()), Some(&elsewhere))[0],
-            elsewhere.join("bin")
-        );
+    fn addresses_are_read_in_decimal_and_hexadecimal() {
+        assert_eq!(parse_address("0x10000"), Ok(0x10000));
+        assert_eq!(parse_address(" 0X1000 "), Ok(0x1000));
+        assert_eq!(parse_address("65536"), Ok(65536));
+        // Counter-probes: text, a sign and a value past 32 bits are refused.
+        assert!(parse_address("flash").is_err());
+        assert!(parse_address("-1").is_err());
+        assert!(parse_address("0x100000000").is_err());
     }
 
     #[test]
-    fn a_missing_or_unrunnable_tool_is_not_found() {
-        let root = tempfile::tempdir().unwrap();
-        let name = format!("{ESPFLASH}{}", std::env::consts::EXE_SUFFIX);
-        let extra = vec![root.path().to_path_buf()];
-        assert_eq!(find_in(None, &extra), None);
-        // A directory of that name is not the tool.
-        std::fs::create_dir(root.path().join(&name)).unwrap();
-        assert_eq!(find_in(None, &extra), None);
-        // Neither is a file without the execute bit.
-        #[cfg(unix)]
+    fn progress_counts_in_tenths_and_never_past_the_end() {
+        assert_eq!(tenth_of(0, 100), 0);
+        assert_eq!(tenth_of(9, 100), 0);
+        assert_eq!(tenth_of(10, 100), 1);
+        assert_eq!(tenth_of(100, 100), 10);
+        // More than the total, or nothing to write: still 10, not an overflow.
+        assert_eq!(tenth_of(500, 100), 10);
+        assert_eq!(tenth_of(0, 0), 10);
+    }
+
+    #[test]
+    fn a_write_reports_a_line_at_each_tenth() {
+        let (sink, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let mut report = Report::new(Some(sink));
         {
-            std::fs::remove_dir(root.path().join(&name)).unwrap();
-            std::fs::write(root.path().join(&name), "x").unwrap();
-            assert_eq!(find_in(None, &extra), None);
+            let mut progress = LineProgress::new(&mut report);
+            progress.init(0x10000, 1000);
+            for current in (0..=1000).step_by(50) {
+                progress.update(current);
+            }
+            progress.verifying();
+            progress.finish(false);
         }
-    }
-
-    /// Collect what `split_lines` reports for a sequence of chunks.
-    fn lines_of(chunks: &[&[u8]]) -> (Vec<String>, Vec<u8>) {
-        let mut pending = Vec::new();
-        let mut lines = Vec::new();
-        for chunk in chunks {
-            split_lines(chunk, &mut pending, |text| lines.push(text));
+        let mut seen = Vec::new();
+        while let Ok(line) = lines.try_recv() {
+            seen.push(line.text);
         }
-        (lines, pending)
-    }
-
-    #[test]
-    fn a_newline_ends_a_line() {
-        let (lines, rest) = lines_of(&[b"one\ntwo\n"]);
-        assert_eq!(lines, ["one", "two"]);
-        assert!(rest.is_empty(), "{rest:?}");
-    }
-
-    #[test]
-    fn a_carriage_return_ends_a_line_too() {
-        // This is how espflash reports progress.
-        let (lines, _) = lines_of(&[b"10%\r55%\r100%\r"]);
-        assert_eq!(lines, ["10%", "55%", "100%"]);
-    }
-
-    #[test]
-    fn a_windows_line_ending_reports_one_line() {
-        let (lines, _) = lines_of(&[b"one\r\ntwo\r\n"]);
-        assert_eq!(lines, ["one", "two"]);
-    }
-
-    #[test]
-    fn blank_lines_are_not_reported() {
-        let (lines, _) = lines_of(&[b"\n\n\r\n   \n"]);
-        assert!(lines.is_empty(), "got: {lines:?}");
-    }
-
-    #[test]
-    fn a_line_split_across_chunks_arrives_whole() {
-        // 4096 bytes at a time means a line is regularly cut in half.
-        let (lines, rest) = lines_of(&[b"beg", b"in", b"ning\nnext"]);
-        assert_eq!(lines, ["beginning"]);
-        assert_eq!(rest, b"next");
-    }
-
-    #[test]
-    fn an_unterminated_tail_stays_pending() {
-        let (lines, mut rest) = lines_of(&[b"done\nhalf"]);
-        assert_eq!(lines, ["done"]);
-        assert_eq!(take_line(&mut rest), Some("half".to_string()));
-    }
-
-    #[test]
-    fn invalid_utf8_is_replaced_rather_than_dropped() {
-        let (lines, _) = lines_of(&[&[b'a', 0xff, b'b', b'\n']]);
-        assert_eq!(lines, ["a\u{fffd}b"]);
-    }
-
-    /// A subprocess that writes exactly what the test asks for.
-    ///
-    /// espflash is not installed everywhere, and the point of these tests is
-    /// `run` itself rather than the tool it happens to start. The fixture
-    /// needs a POSIX shell, so these tests are Unix-only; what they exercise
-    /// beyond the platform-independent tests above is the subprocess
-    /// plumbing, not the line splitting.
-    #[cfg(unix)]
-    fn shell(script: &str) -> Command {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(script);
-        cmd
-    }
-
-    #[cfg(unix)]
-    fn channel() -> (Progress, tokio::sync::mpsc::UnboundedReceiver<OutputLine>) {
-        tokio::sync::mpsc::unbounded_channel()
-    }
-
-    #[cfg(unix)]
-    fn drained(rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutputLine>) -> Vec<OutputLine> {
-        let mut lines = Vec::new();
-        while let Ok(line) = rx.try_recv() {
-            lines.push(line);
-        }
-        lines
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn every_line_arrives_and_the_whole_output_still_comes_back() {
-        let (tx, mut rx) = channel();
-        let out = run(shell("printf 'one\\ntwo\\n'"), Some(&tx))
-            .await
-            .expect("the script succeeds");
-        assert_eq!(out, "one\ntwo\n");
-        let lines = drained(&mut rx);
-        assert_eq!(
-            lines,
-            vec![
-                OutputLine {
-                    stream: Stream::Stdout,
-                    text: "one".into()
-                },
-                OutputLine {
-                    stream: Stream::Stdout,
-                    text: "two".into()
-                },
-            ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_carriage_return_ends_a_line_but_survives_in_the_output() {
-        // espflash draws its progress bar this way. Every step has to be
-        // visible, and the returned text has to stay what the tool wrote.
-        let (tx, mut rx) = channel();
-        let out = run(shell("printf '10%%\\r55%%\\rdone\\n'"), Some(&tx))
-            .await
-            .expect("the script succeeds");
-        assert_eq!(out, "10%\r55%\rdone\n");
-        let texts: Vec<String> = drained(&mut rx).into_iter().map(|l| l.text).collect();
-        assert_eq!(texts, vec!["10%", "55%", "done"]);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_two_streams_stay_apart() {
-        let (tx, mut rx) = channel();
-        let message = run(
-            shell("printf 'note\\n'; printf 'boom\\n' >&2; exit 3"),
-            Some(&tx),
-        )
-        .await
-        .expect_err("the script fails");
-        // On failure stderr leads, because that is what explains the failure.
-        assert_eq!(message, "boom\n\nnote\n");
-        let mut lines = drained(&mut rx);
-        lines.sort_by_key(|l| l.text.clone());
-        assert_eq!(
-            lines,
-            vec![
-                OutputLine {
-                    stream: Stream::Stderr,
-                    text: "boom".into()
-                },
-                OutputLine {
-                    stream: Stream::Stdout,
-                    text: "note".into()
-                },
-            ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_silent_failure_still_names_the_status() {
-        let (tx, _rx) = channel();
-        let message = run(shell("exit 7"), Some(&tx))
-            .await
-            .expect_err("the script fails");
-        assert!(message.contains("exit status: 7"), "got: {message}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_caller_that_stops_listening_does_not_stop_the_run() {
-        let (tx, rx) = channel();
-        drop(rx);
-        let out = run(shell("printf 'still here\\n'"), Some(&tx))
-            .await
-            .expect("the script succeeds");
-        assert_eq!(out, "still here\n");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn output_larger_than_one_read_is_complete() {
-        // One read is 4096 bytes. A tool that writes more must not lose any of
-        // it, and no line may be cut in half at the boundary.
-        let (tx, mut rx) = channel();
-        let out = run(
-            shell("for i in $(seq 1 900); do echo line$i; done"),
-            Some(&tx),
-        )
-        .await
-        .expect("the script succeeds");
-        assert!(out.len() > 4096, "the test needs more than one read");
-        let lines = drained(&mut rx);
-        assert_eq!(lines.len(), 900);
-        assert_eq!(lines[0].text, "line1");
-        assert_eq!(lines[899].text, "line900");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn without_a_channel_the_output_is_unchanged() {
-        let out = run(shell("printf 'quiet\\n'"), None)
-            .await
-            .expect("the script succeeds");
-        assert_eq!(out, "quiet\n");
-    }
-
-    #[test]
-    fn stream_joining_prefers_the_primary_stream() {
-        assert_eq!(join_streams("out", ""), "out");
-        assert_eq!(join_streams("", "err"), "err");
-        assert_eq!(join_streams("out", "err"), "out\nerr");
+        assert_eq!(seen.first().unwrap(), "Writing 1000 bytes at 0x10000");
+        assert_eq!(seen.iter().filter(|line| line.ends_with('%')).count(), 10);
+        assert!(seen.contains(&"  100%".to_string()));
+        assert_eq!(seen.last().unwrap(), "Written");
+        // The same lines are in the output the call returns.
+        assert_eq!(report.into_output().lines().count(), seen.len());
     }
 
     #[tokio::test]
-    async fn flash_reports_failure_for_a_missing_device() {
-        if check().await.is_err() {
-            return; // espflash is not installed on this machine
-        }
-        let result = flash(
+    async fn a_missing_firmware_file_is_named_before_the_port_is_touched() {
+        let error = flash(
             "/dev/nonexistent_port_xyz",
             "/nonexistent/firmware.elf",
             None,
         )
-        .await;
-        assert!(result.is_err());
+        .await
+        .unwrap_err();
+        assert!(error.contains("/nonexistent/firmware.elf"), "{error}");
     }
 
     #[tokio::test]
-    async fn board_info_reports_failure_for_a_missing_device() {
-        if check().await.is_err() {
-            return;
-        }
-        assert!(board_info("/dev/nonexistent_port_xyz").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn a_missing_tool_is_reported_with_where_it_was_looked_for() {
-        let message = not_found_message();
-        assert!(message.contains("PATH ("), "{message}");
-        assert!(message.contains("cargo install espflash"), "{message}");
-        // The bare name, spawned from an empty directory list, fails with
-        // `NotFound`, which is what the message is for.
-        let missing = Command::new("espflash-that-does-not-exist-xyz")
-            .arg("--version")
-            .output()
-            .await
-            .unwrap_err();
-        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn a_long_path_is_cut_in_the_message() {
-        assert_eq!(shorten("/usr/bin:/bin", 240), "/usr/bin:/bin");
-        let long = "x".repeat(5000);
-        let cut = shorten(&long, 240);
-        assert_eq!(cut.chars().count(), 241);
-        assert!(cut.ends_with('\u{2026}'));
-        // Cutting counts characters, so a multi-byte one is never split.
-        assert_eq!(shorten("äöü", 2), "äö\u{2026}");
+    async fn a_missing_port_is_named() {
+        let error = board_info("/dev/nonexistent_port_xyz").await.unwrap_err();
+        assert!(error.contains("/dev/nonexistent_port_xyz"), "{error}");
+        let error = erase_flash("/dev/nonexistent_port_xyz").await.unwrap_err();
+        assert!(error.contains("/dev/nonexistent_port_xyz"), "{error}");
     }
 }

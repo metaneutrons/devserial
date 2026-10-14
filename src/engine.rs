@@ -1111,10 +1111,6 @@ impl CommandEngine {
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        if let Err(reason) = crate::esp::check().await {
-            return Err(EngineError::Tool(reason));
-        }
-
         let reopen = self.release_port(port).await;
         let mut result = op(port.to_string()).await;
         if let Some(config) = reopen
