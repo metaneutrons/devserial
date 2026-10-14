@@ -832,8 +832,12 @@ fn another_build_is_named_on_stderr_and_json_stays_clean() {
     let sandbox = Sandbox::new();
     let daemon = start_other_build(&sandbox);
 
+    // The client claims a commit of its own, so the comparison does not
+    // depend on whether this tree has git. A build from a source archive has
+    // no commit, and the warning then says it cannot tell instead.
     let output = sandbox
         .command()
+        .env("DEVSERIAL_TEST_COMMIT", "cafe00000000")
         .args(["list", "--json"])
         .output()
         .expect("list");
@@ -842,6 +846,7 @@ fn another_build_is_named_on_stderr_and_json_stays_clean() {
 
     let quiet = sandbox
         .command()
+        .env("DEVSERIAL_TEST_COMMIT", "cafe00000000")
         .env("DEVSERIAL_NO_VERSION_WARNING", "1")
         .args(["list", "--json"])
         .output()

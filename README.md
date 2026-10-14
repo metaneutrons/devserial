@@ -466,7 +466,11 @@ terminal monitor in its status line and on `F9`, and the MCP server adds the
 warning to its next tool result, where the AI tool can pass it on. A daemon too
 old to say which build it is gets the same warning, as one that cannot tell.
 The same commit built cleanly is the same code wherever it is installed, so a
-Homebrew and a `cargo install` of one release do not warn.
+Homebrew and a `cargo install` of one release do not warn. A build without git,
+as from a source archive, has no commit; a client and a daemon are then the
+same build when they share the version and the moment they were built, and a
+daemon of the same version built at another moment gets the warning that cannot
+tell.
 
 Nothing restarts the daemon on its own, because a restart interrupts the
 captures. `devserial daemon --restart` stops it and starts one from the calling
