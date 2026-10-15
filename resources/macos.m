@@ -279,6 +279,7 @@ static void forward_edit_action(id target, unsigned short keyCode, NSString *cha
 - (void)openPort:(id)sender;
 - (void)showPortSettings:(id)sender;
 - (void)toggleConnect:(id)sender;
+- (void)focusFilter:(id)sender;
 - (void)zoomIn:(id)sender;
 - (void)zoomOut:(id)sender;
 - (void)zoomReset:(id)sender;
@@ -291,6 +292,7 @@ static BOOL g_exportRequested = NO;
 static BOOL g_openPortRequested = NO;
 static BOOL g_portSettingsRequested = NO;
 static BOOL g_toggleConnectRequested = NO;
+static BOOL g_focusFilterRequested = NO;
 static BOOL g_zoomInRequested = NO;
 static BOOL g_zoomOutRequested = NO;
 static BOOL g_zoomResetRequested = NO;
@@ -342,6 +344,11 @@ static BOOL g_colorLocked = NO;
 - (void)toggleConnect:(id)sender {
     (void)sender;
     g_toggleConnectRequested = YES;
+}
+
+- (void)focusFilter:(id)sender {
+    (void)sender;
+    g_focusFilterRequested = YES;
 }
 
 - (void)zoomIn:(id)sender {
@@ -417,6 +424,14 @@ BOOL devserial_check_port_settings_requested(void) {
 BOOL devserial_check_toggle_connect_requested(void) {
     if (g_toggleConnectRequested) {
         g_toggleConnectRequested = NO;
+        return YES;
+    }
+    return NO;
+}
+
+BOOL devserial_check_focus_filter_requested(void) {
+    if (g_focusFilterRequested) {
+        g_focusFilterRequested = NO;
         return YES;
     }
     return NO;
@@ -706,6 +721,15 @@ void devserial_init_macos_app(const char *version_cstr, const uint8_t *icon_png_
                                                                action:@selector(selectAll:)
                                                         keyEquivalent:@"a"];
         [editMenu addItem:selectAllItem];
+
+        [editMenu addItem:[NSMenuItem separatorItem]];
+
+        // Filter Output (Cmd+F): puts the cursor in the filter field.
+        NSMenuItem *filterItem = [[NSMenuItem alloc] initWithTitle:@"Filter Output"
+                                                            action:@selector(focusFilter:)
+                                                     keyEquivalent:@"f"];
+        [filterItem setTarget:g_aboutHandler];
+        [editMenu addItem:filterItem];
 
         // ==========================================
         // 4. View Menu (Darstellung)

@@ -46,6 +46,8 @@ pub enum MenuRequest {
     ZoomOut,
     /// Return the interface to its unscaled size.
     ZoomReset,
+    /// Put the cursor in the filter field.
+    FocusFilter,
     /// Toggle semantic colours in the monitor display.
     ToggleColor,
     /// Quit the application, as closing every window would (#114).
@@ -62,6 +64,7 @@ impl MenuRequest {
         Self::ZoomIn,
         Self::ZoomOut,
         Self::ZoomReset,
+        Self::FocusFilter,
         Self::ToggleColor,
         Self::Quit,
     ];
@@ -90,6 +93,7 @@ mod macos {
         fn devserial_check_zoom_in_requested() -> bool;
         fn devserial_check_zoom_out_requested() -> bool;
         fn devserial_check_zoom_reset_requested() -> bool;
+        fn devserial_check_focus_filter_requested() -> bool;
         fn devserial_check_toggle_color_requested() -> bool;
         fn devserial_check_quit_requested() -> bool;
         fn devserial_update_color_state(color_enabled: bool, locked: bool);
@@ -144,6 +148,7 @@ mod macos {
                 MenuRequest::ZoomIn => devserial_check_zoom_in_requested(),
                 MenuRequest::ZoomOut => devserial_check_zoom_out_requested(),
                 MenuRequest::ZoomReset => devserial_check_zoom_reset_requested(),
+                MenuRequest::FocusFilter => devserial_check_focus_filter_requested(),
                 MenuRequest::ToggleColor => devserial_check_toggle_color_requested(),
                 MenuRequest::Quit => devserial_check_quit_requested(),
             }
@@ -283,6 +288,7 @@ mod tests {
             MenuRequest::ZoomIn => ("devserial_check_zoom_in_requested", "zoomIn:"),
             MenuRequest::ZoomOut => ("devserial_check_zoom_out_requested", "zoomOut:"),
             MenuRequest::ZoomReset => ("devserial_check_zoom_reset_requested", "zoomReset:"),
+            MenuRequest::FocusFilter => ("devserial_check_focus_filter_requested", "focusFilter:"),
             MenuRequest::ToggleColor => ("devserial_check_toggle_color_requested", "toggleColor:"),
             MenuRequest::Quit => ("devserial_check_quit_requested", "quitApp:"),
         }
