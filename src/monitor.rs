@@ -51,6 +51,30 @@ type RestWorkerMessage = (
 #[cfg(feature = "rest")]
 type RestWorkerReceiver = std::sync::mpsc::Receiver<RestWorkerMessage>;
 
+/// Whether Cmd+F (Ctrl+F off macOS) was pressed, without Shift or Alt.
+fn filter_shortcut_pressed(input: &egui::InputState) -> bool {
+    input.modifiers.command
+        && !input.modifiers.shift
+        && !input.modifiers.alt
+        && input.key_pressed(egui::Key::F)
+}
+
+/// Give a text field the cursor and select what is in it, so that typing
+/// replaces the old text, as in the find field of other applications.
+fn focus_text_field(ctx: &egui::Context, id: egui::Id, text: &str) {
+    ctx.memory_mut(|memory| memory.request_focus(id));
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let end = text.chars().count();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(end),
+            )));
+        state.store(ctx, id);
+    }
+}
+
 /// What the window knows about a control line (DTR or RTS).
 ///
 /// Only the window's own writes are known. The level of an output line cannot
@@ -1348,6 +1372,8 @@ pub struct PortMonitorState {
     line_ending: LineEnding,
     show_timestamps: bool,
     hex_view: bool,
+    /// The filter field takes the cursor in the next frame (Cmd+F).
+    focus_filter: bool,
     dtr_state: SignalLine,
     rts_state: SignalLine,
     last_id: i64,
@@ -1492,6 +1518,7 @@ impl PortMonitorState {
             line_ending: LineEnding::CrLf,
             show_timestamps: true,
             hex_view: false,
+            focus_filter: false,
             dtr_state: SignalLine::Unknown,
             rts_state: SignalLine::Unknown,
             last_id: i64::MAX,
@@ -1980,6 +2007,15 @@ impl PortMonitorState {
                 let now = crate::export::now_for_filename();
                 self.export_path = format!("devserial_export_{sanitized_port}_{now}.txt");
             }
+        }
+
+        // Cmd+F puts the cursor in the filter field. On macOS the menu item
+        // gets the key first and reports it as a request; elsewhere, and in a
+        // window the menu does not reach, the shortcut itself arrives here.
+        if platform::take_menu_request(MenuRequest::FocusFilter)
+            || ui.input(filter_shortcut_pressed)
+        {
+            self.focus_filter = true;
         }
 
         // Toolbar (top)
@@ -4090,6 +4126,9 @@ impl PortMonitorState {
             // Group 7: Instant Filter
             ui.label("Filter:");
             let filter_id = egui::Id::new(format!("filter_text_{}", self.port_name));
+            if std::mem::take(&mut self.focus_filter) {
+                focus_text_field(ui.ctx(), filter_id, &self.filter);
+            }
             let filter_response = ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .id(filter_id)
@@ -5480,5 +5519,80 @@ mod signal_tests {
             });
             assert!(!clicked, "nothing was clicked in {state:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    /// Whether the shortcut sees this key press, in a frame of its own.
+    fn pressed(modifiers: egui::Modifiers, key: egui::Key) -> bool {
+        let mut raw = egui::RawInput::default();
+        // The frame's modifiers come from this event, not from the key's.
+        raw.events.push(egui::Event::ModifiersChanged(modifiers));
+        raw.events.push(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let mut seen = false;
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(raw, |ui| {
+            seen = ui.input(filter_shortcut_pressed);
+        });
+        // Nothing paints here, so the frame's textures are not wanted.
+        output.textures_delta.clear();
+        seen
+    }
+
+    #[test]
+    fn cmd_f_is_the_shortcut_and_nothing_near_it() {
+        let command = egui::Modifiers::COMMAND;
+        assert!(pressed(command, egui::Key::F));
+        // Counter-probes: F alone, another key with Cmd, and Cmd with Shift or
+        // Alt (other shortcuts) are not it.
+        assert!(!pressed(egui::Modifiers::NONE, egui::Key::F));
+        assert!(!pressed(command, egui::Key::G));
+        assert!(!pressed(command | egui::Modifiers::SHIFT, egui::Key::F));
+        assert!(!pressed(command | egui::Modifiers::ALT, egui::Key::F));
+    }
+
+    /// The field takes the cursor and its text is selected, so that typing
+    /// replaces it. A field that was not asked is left alone.
+    #[test]
+    fn the_filter_field_takes_the_cursor_with_its_text_selected() {
+        let id = egui::Id::new("filter-under-test");
+        let other = egui::Id::new("another-field");
+        let ctx = egui::Context::default();
+        let mut text = "grep me".to_string();
+        let mut other_text = String::new();
+        let frame = |text: &mut String, other_text: &mut String| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.add(egui::TextEdit::singleline(text).id(id));
+                ui.add(egui::TextEdit::singleline(other_text).id(other));
+            });
+            output.textures_delta.clear();
+        };
+        // The first frames create the fields and their state.
+        frame(&mut text, &mut other_text);
+        frame(&mut text, &mut other_text);
+        assert!(!ctx.memory(|memory| memory.has_focus(id)));
+
+        focus_text_field(&ctx, id, &text);
+        frame(&mut text, &mut other_text);
+        frame(&mut text, &mut other_text);
+        assert!(ctx.memory(|memory| memory.has_focus(id)), "no focus");
+        assert!(!ctx.memory(|memory| memory.has_focus(other)));
+        let range = egui::TextEdit::load_state(&ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .expect("a cursor");
+        assert_eq!(
+            range,
+            egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(7)),
+            "the text should be selected from start to end"
+        );
     }
 }
