@@ -1647,7 +1647,7 @@ mod tests {
             .serial_read(Parameters(read_params("/dev/absent")))
             .await
             .unwrap_err();
-        assert!(err.message.contains("not found"));
+        assert!(err.message.contains("is not open"));
     }
 
     #[tokio::test]

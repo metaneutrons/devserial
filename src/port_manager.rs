@@ -102,8 +102,8 @@ enum PortCommand {
 /// Errors from the port manager.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PortManagerError {
-    #[error("port '{0}' not found")]
-    NotFound(String),
+    #[error("port '{0}' is not open. Open it first with `devserial open {0}` (MCP: serial_open)")]
+    NotOpen(String),
     #[error("port '{0}' already managed")]
     AlreadyManaged(String),
     #[error("serial port error: {0}")]
@@ -205,7 +205,7 @@ impl PortManagerHandle {
     /// Close a managed port.
     ///
     /// # Errors
-    /// Returns error if the port is not found.
+    /// Returns error if the port is not open.
     pub async fn close(&self, name: &str) -> Result<(), PortManagerError> {
         self.request_flat(|reply| PortCommand::Close {
             name: name.to_string(),
@@ -217,7 +217,7 @@ impl PortManagerHandle {
     /// Close a managed port and return its config for reopening.
     ///
     /// # Errors
-    /// Returns error if the port is not found.
+    /// Returns error if the port is not open.
     pub async fn close_with_config(&self, name: &str) -> Result<PortConfig, PortManagerError> {
         self.request_flat(|reply| PortCommand::CloseWithConfig {
             name: name.to_string(),
@@ -236,7 +236,7 @@ impl PortManagerHandle {
     /// Get connection state of a specific port.
     ///
     /// # Errors
-    /// Returns error if the port is not found.
+    /// Returns error if the port is not open.
     pub async fn get_state(&self, name: &str) -> Result<ConnectionState, PortManagerError> {
         self.request_flat(|reply| PortCommand::GetState {
             name: name.to_string(),
@@ -248,7 +248,7 @@ impl PortManagerHandle {
     /// Get the effective configuration of a managed port.
     ///
     /// # Errors
-    /// Returns error if the port is not found.
+    /// Returns error if the port is not open.
     pub async fn get_config(&self, name: &str) -> Result<PortConfig, PortManagerError> {
         self.request_flat(|reply| PortCommand::GetConfig {
             name: name.to_string(),
@@ -260,7 +260,7 @@ impl PortManagerHandle {
     /// Get storage handle for a specific port.
     ///
     /// # Errors
-    /// Returns error if the port is not found.
+    /// Returns error if the port is not open.
     pub async fn get_storage(
         &self,
         name: &str,
@@ -275,7 +275,7 @@ impl PortManagerHandle {
     /// Get the serial port handle for signal control.
     ///
     /// # Errors
-    /// Returns error if the port is not found or is a mock port.
+    /// Returns error if the port is not open or is a mock port.
     pub async fn get_serial_port(&self, name: &str) -> Result<SerialPortHandle, PortManagerError> {
         self.request_flat(|reply| PortCommand::GetSerialPort {
             name: name.to_string(),
@@ -287,7 +287,7 @@ impl PortManagerHandle {
     /// Write data to a serial port.
     ///
     /// # Errors
-    /// Returns error if the port is not found or write fails.
+    /// Returns error if the port is not open or write fails.
     pub async fn write(&self, name: &str, data: Vec<u8>) -> Result<(), PortManagerError> {
         self.request_flat(|reply| PortCommand::Write {
             name: name.to_string(),
@@ -300,7 +300,7 @@ impl PortManagerHandle {
     /// Reconfigure an open serial port with new baud rate and framing settings.
     ///
     /// # Errors
-    /// Returns error if the port is not found or reconfiguration fails.
+    /// Returns error if the port is not open or reconfiguration fails.
     pub async fn reconfigure(
         &self,
         name: &str,
@@ -640,7 +640,7 @@ async fn handle_command(
                     port.reader_handle.shutdown().await;
                     reply.send(Ok(())).ok();
                 } else {
-                    reply.send(Err(PortManagerError::NotFound(name))).ok();
+                    reply.send(Err(PortManagerError::NotOpen(name))).ok();
                 }
             }
             PortCommand::CloseWithConfig { name, reply } => {
@@ -648,7 +648,7 @@ async fn handle_command(
                     port.reader_handle.shutdown().await;
                     reply.send(Ok(port.config)).ok();
                 } else {
-                    reply.send(Err(PortManagerError::NotFound(name))).ok();
+                    reply.send(Err(PortManagerError::NotOpen(name))).ok();
                 }
             }
             PortCommand::List { reply } => {
@@ -675,21 +675,21 @@ async fn handle_command(
                 let result = ports
                     .get(&name)
                     .map(|p| p.reader_handle.state())
-                    .ok_or(PortManagerError::NotFound(name));
+                    .ok_or(PortManagerError::NotOpen(name));
                 reply.send(result).ok();
             }
             PortCommand::GetConfig { name, reply } => {
                 let result = ports
                     .get(&name)
                     .map(|p| p.config.clone())
-                    .ok_or(PortManagerError::NotFound(name));
+                    .ok_or(PortManagerError::NotOpen(name));
                 reply.send(result).ok();
             }
             PortCommand::GetStorage { name, reply } => {
                 let result = ports
                     .get(&name)
                     .map(|p| Arc::clone(&p.storage))
-                    .ok_or(PortManagerError::NotFound(name));
+                    .ok_or(PortManagerError::NotOpen(name));
                 reply.send(result).ok();
             }
             PortCommand::GetSerialPort { name, reply } => {
@@ -699,7 +699,7 @@ async fn handle_command(
                         .as_ref()
                         .map(Arc::clone)
                         .ok_or(PortManagerError::NoHardware(name)),
-                    None => Err(PortManagerError::NotFound(name)),
+                    None => Err(PortManagerError::NotOpen(name)),
                 };
                 reply.send(result).ok();
             }
@@ -710,7 +710,7 @@ async fn handle_command(
                         .as_ref()
                         .map(Arc::clone)
                         .ok_or(PortManagerError::NoHardware(name)),
-                    None => Err(PortManagerError::NotFound(name)),
+                    None => Err(PortManagerError::NotOpen(name)),
                 };
                 let result = match handle {
                     Ok(sp) => {
@@ -781,7 +781,7 @@ async fn reconfigure_managed(
 ) -> Result<(), PortManagerError> {
     let port = ports
         .get_mut(name)
-        .ok_or_else(|| PortManagerError::NotFound(name.to_string()))?;
+        .ok_or_else(|| PortManagerError::NotOpen(name.to_string()))?;
     let handle = port
         .serial_port
         .as_ref()
@@ -938,14 +938,18 @@ mod tests {
     async fn test_close_nonexistent() {
         let mgr = PortManagerHandle::new();
         let err = mgr.close("nope").await.unwrap_err();
-        assert!(matches!(err, PortManagerError::NotFound(_)));
+        assert!(matches!(err, PortManagerError::NotOpen(_)));
+        assert_eq!(
+            err.to_string(),
+            "port 'nope' is not open. Open it first with `devserial open nope` (MCP: serial_open)"
+        );
     }
 
     #[tokio::test]
     async fn test_get_state_nonexistent() {
         let mgr = PortManagerHandle::new();
         let err = mgr.get_state("nope").await.unwrap_err();
-        assert!(matches!(err, PortManagerError::NotFound(_)));
+        assert!(matches!(err, PortManagerError::NotOpen(_)));
     }
 
     #[tokio::test]
