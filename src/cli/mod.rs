@@ -757,6 +757,16 @@ mod tests {
     /// that was renamed or removed, or an example that never matched the
     /// program, fails here and not in front of a reader. This runs nothing: it
     /// proves the words parse, not that the command does what the text says.
+    ///
+    /// The README describes a full build. A build without the window, the
+    /// terminal, the HTTP interface or the firmware tool has no `gui`, `tui`,
+    /// `rest` or `flash` command to parse, so the check runs where they exist.
+    #[cfg(all(
+        feature = "monitor",
+        feature = "tui",
+        feature = "rest",
+        feature = "esp"
+    ))]
     #[test]
     fn every_command_in_the_readme_parses() {
         let commands = readme_commands(include_str!("../../README.md"));
