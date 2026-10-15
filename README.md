@@ -247,13 +247,14 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 | `Cmd+K` | Connect or disconnect |
 | `Cmd+Shift+P` | Port settings |
 | `Cmd+E` | Export buffer |
+| `Cmd+F` | Filter output: puts the cursor in the filter field and selects its text (Edit > Filter Output) |
 | `Cmd+Plus`, `Cmd+Minus` | Enlarge or shrink the interface |
 | `Cmd+0` | Back to 100 % |
 | `Cmd+Ctrl+F` | Full screen |
 | `Cmd+W` | Close window |
 | `Cmd+Q` | Quit, asking about the daemon unless the quit setting says otherwise |
 
-Both keys for opening a port reach the same dialog, which raises the existing window when the port is already shown. The dialog offers a port that can actually be opened rather than the first one in the list.
+Off macOS the same shortcut is `Ctrl+F`, which is the usual one for finding on Windows and Linux. Both keys for opening a port reach the same dialog, which raises the existing window when the port is already shown. The dialog offers a port that can actually be opened rather than the first one in the list.
 
 The buffer view is virtualized and keeps the most recent 100 000 lines on screen. The full history stays in the database and is reachable through search and export.
 
