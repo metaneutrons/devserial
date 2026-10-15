@@ -1060,4 +1060,40 @@ mod tests {
         assert!(matches!(again, Err(StorageError::ArchiveExists(_))));
         assert_eq!(storage.line_count().unwrap(), 1);
     }
+
+    /// What is deleted is not left readable in the database file or in its
+    /// log: the reason people delete lines, more often than the space.
+    #[test]
+    fn deleted_text_is_gone_from_the_file_and_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.db");
+        let storage = SqliteStorage::open(&path).expect("storage");
+        let secret = "wifi password hunter2-SECRET-4711";
+        storage
+            .insert_lines(&[(1, secret), (2, "keep"), (3, "keep too")])
+            .unwrap();
+
+        // Everything the database keeps on disk: the file and its log.
+        let on_disk = |path: &Path| -> Vec<u8> {
+            let mut bytes = std::fs::read(path).unwrap_or_default();
+            let mut log = path.as_os_str().to_owned();
+            log.push("-wal");
+            bytes.extend(std::fs::read(Path::new(&log)).unwrap_or_default());
+            bytes
+        };
+        let contains = |haystack: &[u8]| {
+            haystack
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        };
+        // Counter-probe: before the delete the text is there, so the check
+        // below can find it.
+        assert!(contains(&on_disk(&path)), "the secret was never on disk");
+
+        assert_eq!(storage.delete_around(LineBound::Above(2), None).unwrap(), 1);
+        assert!(
+            !contains(&on_disk(&path)),
+            "the deleted text is still in the file or the log"
+        );
+    }
 }
