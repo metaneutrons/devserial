@@ -471,6 +471,27 @@ pub enum CaptureRequest {
     Summary,
     /// Empty it, after a copy in the archive directory when `archive` is set.
     Clear { archive: bool },
+    /// Delete the lines on one side of a line, which stays. With `dry_run`
+    /// only count them.
+    ///
+    /// `through` ends a deletion below the line at the last id the asker has
+    /// seen, so lines that arrived since are not taken.
+    Delete {
+        side: LineSide,
+        through: Option<i64>,
+        archive: bool,
+        dry_run: bool,
+    },
+}
+
+/// Which side of a line a deletion takes, with the id of that line.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineSide {
+    /// The lines with a smaller id.
+    Above(i64),
+    /// The lines with a larger id.
+    Below(i64),
 }
 
 /// What the daemon answered about the capture.
@@ -481,6 +502,12 @@ pub enum CaptureAnswer {
     Summary { lines: u64, bytes: u64 },
     /// The capture is empty; this is what it held, and where the copy went.
     Cleared { lines: u64, archive: Option<String> },
+    /// Lines deleted around a line, or counted for a dry run.
+    Deleted {
+        lines: u64,
+        archive: Option<String>,
+        dry_run: bool,
+    },
 }
 
 /// Looks at the capture of a port, and empties it.
@@ -517,6 +544,13 @@ pub fn fake_capture_control(
             CaptureRequest::Clear { archive } => CaptureAnswer::Cleared {
                 lines,
                 archive: archive.then(|| "/archive/port_2026.db".to_string()),
+            },
+            CaptureRequest::Delete {
+                archive, dry_run, ..
+            } => CaptureAnswer::Deleted {
+                lines: lines / 2,
+                archive: (archive && !dry_run).then(|| "/archive/port_2026.db".to_string()),
+                dry_run,
             },
         })
     });
@@ -563,6 +597,40 @@ pub fn capture_control(
                 } => Ok(CaptureAnswer::Cleared {
                     lines: lines_cleared,
                     archive: archive_path,
+                }),
+                _ => Err("unexpected answer from the daemon".to_string()),
+            }
+        }
+        CaptureRequest::Delete {
+            side,
+            through,
+            archive,
+            dry_run,
+        } => {
+            let (above, below) = match side {
+                LineSide::Above(id) => (Some(id), None),
+                LineSide::Below(id) => (None, Some(id)),
+            };
+            match ask(
+                &runtime,
+                &client,
+                RequestPayload::DeleteLines {
+                    port: port.clone(),
+                    above,
+                    below,
+                    through,
+                    archive_current: Some(archive),
+                    dry_run: Some(dry_run),
+                },
+            )? {
+                ResponsePayload::LinesDeleted {
+                    lines,
+                    archive_path,
+                    dry_run,
+                } => Ok(CaptureAnswer::Deleted {
+                    lines,
+                    archive: archive_path,
+                    dry_run,
                 }),
                 _ => Err("unexpected answer from the daemon".to_string()),
             }
@@ -1401,6 +1469,70 @@ mod tests {
             panic!("not a clear");
         };
         assert!(archive.is_none());
+    }
+
+    /// The capture control deletes around a line through the real daemon: it
+    /// counts first, deletes with a copy, stops at `through`, and leaves the
+    /// line itself.
+    #[cfg(all(unix, feature = "testutil", feature = "monitor"))]
+    #[test]
+    fn a_window_can_delete_around_a_line_through_the_daemon() {
+        let daemon = FakeDaemon::start();
+        let parts = attach_session(
+            FakeDaemon::PORT,
+            &PortConfig::default(),
+            &daemon.data_dir,
+            Some(daemon.socket.clone()),
+            None,
+            LeaseKind::Gui,
+        )
+        .expect("attaching");
+        let runtime = parts.keepalive.handle().expect("runtime");
+        let storage = SqliteStorage::open(&crate::paths::port_db_path(
+            &daemon.data_dir,
+            FakeDaemon::PORT,
+        ))
+        .expect("storage");
+        storage
+            .insert_lines(&[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
+            .expect("lines");
+        let control = capture_control(FakeDaemon::PORT, &parts.client, &runtime);
+        let delete = |side, through, archive, dry_run| {
+            control(CaptureRequest::Delete {
+                side,
+                through,
+                archive,
+                dry_run,
+            })
+            .expect("an answer")
+        };
+
+        // Counting changes nothing.
+        let CaptureAnswer::Deleted { lines, dry_run, .. } =
+            delete(LineSide::Above(3), None, false, true)
+        else {
+            panic!("not a deletion");
+        };
+        assert_eq!((lines, dry_run), (2, true));
+        assert_eq!(storage.line_count().unwrap(), 5);
+
+        // Below line 2, but only through line 4: 3 and 4 go, 5 arrived later.
+        let CaptureAnswer::Deleted { lines, archive, .. } =
+            delete(LineSide::Below(2), Some(4), true, false)
+        else {
+            panic!("not a deletion");
+        };
+        assert_eq!(lines, 2);
+        let archive = archive.expect("a copy was asked for");
+        assert!(std::path::Path::new(&archive).exists());
+        let kept: Vec<i64> = storage
+            .read_lines(1, 100)
+            .unwrap()
+            .iter()
+            .map(|line| line.id)
+            .filter(|id| *id <= 5)
+            .collect();
+        assert_eq!(kept, vec![1, 2, 5]);
     }
 
     /// #114: an attached window holds a lease on the daemon for as long as

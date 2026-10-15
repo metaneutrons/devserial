@@ -48,11 +48,18 @@ impl LineBound {
         }
     }
 
-    /// The SQL condition on `id` with one parameter.
-    const fn condition(self) -> &'static str {
-        match self {
-            Self::Above(_) => "id < ?1",
-            Self::Below(_) => "id > ?1",
+    /// The SQL condition on `id` and its parameters.
+    ///
+    /// `through` limits a deletion below a line to the lines up to and
+    /// including that id. A capture that is running adds lines at the end;
+    /// without the limit, "below" would take lines that arrived after the
+    /// person asking had looked, and the count they were shown would not be
+    /// what went. It has no meaning above a line, where nothing arrives.
+    fn clause(self, through: Option<i64>) -> (&'static str, Vec<i64>) {
+        match (self, through) {
+            (Self::Above(id), _) => ("id < ?1", vec![id]),
+            (Self::Below(id), None) => ("id > ?1", vec![id]),
+            (Self::Below(id), Some(last)) => ("id > ?1 AND id <= ?2", vec![id, last]),
         }
     }
 }
@@ -452,14 +459,19 @@ impl SqliteStorage {
     ///
     /// # Errors
     /// Returns error on `SQLite` failure.
-    pub fn count_around(&self, bound: LineBound) -> Result<u64, StorageError> {
+    pub fn count_around(
+        &self,
+        bound: LineBound,
+        through: Option<i64>,
+    ) -> Result<u64, StorageError> {
         let conn = self
             .read_conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (condition, parameters) = bound.clause(through);
         let count = conn.query_row(
-            &format!("SELECT COUNT(*) FROM lines WHERE {}", bound.condition()),
-            [bound.id()],
+            &format!("SELECT COUNT(*) FROM lines WHERE {condition}"),
+            rusqlite::params_from_iter(parameters),
             |r| r.get::<_, i64>(0),
         )?;
         drop(conn);
@@ -475,7 +487,8 @@ impl SqliteStorage {
     /// or in the log. That is the reason for deleting lines, more often than
     /// the space.
     ///
-    /// Returns how many lines were deleted.
+    /// `through` ends a deletion below a line at that id; see
+    /// [`LineBound`]. Returns how many lines were deleted.
     ///
     /// # Errors
     /// Returns error on `SQLite` or IO failure. Nothing is deleted when the
@@ -483,6 +496,7 @@ impl SqliteStorage {
     pub fn delete_around(
         &self,
         bound: LineBound,
+        through: Option<i64>,
         archive_path: Option<&Path>,
     ) -> Result<u64, StorageError> {
         let conn = self
@@ -494,9 +508,10 @@ impl SqliteStorage {
             Self::archive_to(&conn, archive)?;
         }
 
+        let (condition, parameters) = bound.clause(through);
         let deleted = conn.execute(
-            &format!("DELETE FROM lines WHERE {}", bound.condition()),
-            [bound.id()],
+            &format!("DELETE FROM lines WHERE {condition}"),
+            rusqlite::params_from_iter(parameters),
         )?;
         conn.execute_batch("VACUUM;")?;
         // The checkpoint can be refused while a reader is busy; the deletion
@@ -1002,11 +1017,16 @@ mod tests {
         storage.insert_lines(&refs).expect("insert");
 
         // Counting does not delete, and the line itself is on neither side.
-        assert_eq!(storage.count_around(LineBound::Above(4)).unwrap(), 3);
-        assert_eq!(storage.count_around(LineBound::Below(4)).unwrap(), 6);
+        assert_eq!(storage.count_around(LineBound::Above(4), None).unwrap(), 3);
+        assert_eq!(storage.count_around(LineBound::Below(4), None).unwrap(), 6);
         assert_eq!(storage.line_count().unwrap(), 10);
 
-        assert_eq!(storage.delete_around(LineBound::Above(4), None).unwrap(), 3);
+        assert_eq!(
+            storage
+                .delete_around(LineBound::Above(4), None, None)
+                .unwrap(),
+            3
+        );
         let left: Vec<i64> = storage
             .read_lines(1, 100)
             .unwrap()
@@ -1015,7 +1035,12 @@ mod tests {
             .collect();
         assert_eq!(left, vec![4, 5, 6, 7, 8, 9, 10]);
 
-        assert_eq!(storage.delete_around(LineBound::Below(7), None).unwrap(), 3);
+        assert_eq!(
+            storage
+                .delete_around(LineBound::Below(7), None, None)
+                .unwrap(),
+            3
+        );
         let left: Vec<i64> = storage
             .read_lines(1, 100)
             .unwrap()
@@ -1025,8 +1050,18 @@ mod tests {
         assert_eq!(left, vec![4, 5, 6, 7]);
 
         // A bound with nothing on its side deletes nothing.
-        assert_eq!(storage.delete_around(LineBound::Above(4), None).unwrap(), 0);
-        assert_eq!(storage.delete_around(LineBound::Below(7), None).unwrap(), 0);
+        assert_eq!(
+            storage
+                .delete_around(LineBound::Above(4), None, None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .delete_around(LineBound::Below(7), None, None)
+                .unwrap(),
+            0
+        );
         assert_eq!(storage.line_count().unwrap(), 4);
 
         // Ids go on counting past a deleted tail, so no cursor is reused.
@@ -1045,7 +1080,7 @@ mod tests {
 
         assert_eq!(
             storage
-                .delete_around(LineBound::Above(3), Some(&archive))
+                .delete_around(LineBound::Above(3), None, Some(&archive))
                 .unwrap(),
             2
         );
@@ -1056,7 +1091,7 @@ mod tests {
 
         // Counter-probe: a copy that already exists is refused, and then
         // nothing is deleted.
-        let again = storage.delete_around(LineBound::Below(0), Some(&archive));
+        let again = storage.delete_around(LineBound::Below(0), None, Some(&archive));
         assert!(matches!(again, Err(StorageError::ArchiveExists(_))));
         assert_eq!(storage.line_count().unwrap(), 1);
     }
@@ -1090,7 +1125,12 @@ mod tests {
         // below can find it.
         assert!(contains(&on_disk(&path)), "the secret was never on disk");
 
-        assert_eq!(storage.delete_around(LineBound::Above(2), None).unwrap(), 1);
+        assert_eq!(
+            storage
+                .delete_around(LineBound::Above(2), None, None)
+                .unwrap(),
+            1
+        );
         assert!(
             !contains(&on_disk(&path)),
             "the deleted text is still in the file or the log"

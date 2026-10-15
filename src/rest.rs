@@ -2365,6 +2365,7 @@ mod tests {
                 port: port(),
                 above: Some(1),
                 below: None,
+                through: None,
                 archive_current: None,
                 dry_run: None,
             },

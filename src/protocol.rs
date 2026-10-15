@@ -348,6 +348,10 @@ pub enum RequestPayload {
         above: Option<i64>,
         /// Delete the lines with a larger id than this.
         below: Option<i64>,
+        /// With `below`: stop at this id, so lines that arrived after the
+        /// caller looked are not taken.
+        #[serde(default)]
+        through: Option<i64>,
         archive_current: Option<bool>,
         dry_run: Option<bool>,
     },
