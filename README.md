@@ -229,7 +229,7 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Windows and sessions.** All sessions live in one process with one Dock icon. A second `devserial monitor` invocation opens a window in the running instance instead of starting a second application. Ports already shown are marked and cannot be opened twice. A port the daemon already holds keeps its line settings when a monitor attaches to it; use the settings dialog or `devserial open` to change them.
 
-**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS buttons with an indicator beside each (a filled dot when the window set the line high, a ring when it set it low, a dash when it does not know, as after a macro or when the port was opened again; the level of an output line cannot be read back), timestamp, hex and color views, pause and auto-follow, clearing the view without touching the capture, and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
+**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS buttons with an indicator beside each (a filled dot when the window set the line high, a ring when it set it low, a dash when it does not know, as after a macro or when the port was opened again; the level of an output line cannot be read back), timestamp, hex and color views, pause and auto-follow, clearing the view without touching the capture (Clear > Clear display), and emptying the stored capture (Clear > Clear capture…, also in the context menu of the buffer), which asks first, shows how many lines it would delete and offers a copy in the archive folder (on by default), and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
 
 **Runtime reconfiguration.** Baud rate, framing and flow control can be changed while the session is open, without losing the buffer. The change is recorded as a marker line in the capture.
 
@@ -281,6 +281,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `Ctrl+K` | Release the port, or take it back |
 | `Ctrl+F` | Filter the view, `Esc` clears the filter |
 | `Ctrl+L` | Clear the view; the capture on disk is untouched |
+| `Ctrl+X` | Clear the stored capture, after asking: `a` copies it to the archive folder first and clears it, `d` clears it without a copy, `Esc` keeps it. `Enter` does nothing there |
 | `Ctrl+E` | Export the capture, format chosen with `↑` `↓` |
 | `Ctrl+S` / `Ctrl+R` | Send or receive a file, protocol chosen with `↑` `↓` |
 | `Ctrl+T` | Show or hide timestamps |
