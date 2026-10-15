@@ -62,6 +62,13 @@ const SUN_PATH_CAPACITY: usize = if cfg!(any(
 /// # Errors
 /// Returns `InvalidInput` naming the path, its length, the limit and the two
 /// ways to choose another path.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "only Unix socket paths have a length limit; elsewhere there is nothing to check"
+    )
+)]
 pub fn check_endpoint(endpoint: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
