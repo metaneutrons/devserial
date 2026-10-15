@@ -330,6 +330,28 @@ pub enum Command {
         archive: bool,
     },
 
+    /// Delete the lines before or after one line, which stays
+    ///
+    /// A copy of the buffer is made first, in the archive directory, unless
+    /// `--no-archive` is given. `--dry-run` only counts.
+    #[command(group(clap::ArgGroup::new("side").required(true).args(["above", "below"])))]
+    Delete {
+        /// Serial port path
+        port: String,
+        /// Delete the lines with a smaller id than this
+        #[arg(long)]
+        above: Option<i64>,
+        /// Delete the lines with a larger id than this
+        #[arg(long)]
+        below: Option<i64>,
+        /// Do not copy the buffer to the archive directory first
+        #[arg(long)]
+        no_archive: bool,
+        /// Only say how many lines would be deleted
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Show connection state and buffer statistics
     Stats {
         /// Serial port path

@@ -331,6 +331,45 @@ pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<()
             Ok(())
         }
 
+        Command::Delete {
+            port,
+            above,
+            below,
+            no_archive,
+            dry_run,
+        } => {
+            let response = session.request(RequestPayload::DeleteLines {
+                port: port.clone(),
+                above,
+                below,
+                archive_current: Some(!no_archive),
+                dry_run: Some(dry_run),
+            })?;
+            let ResponsePayload::LinesDeleted {
+                lines,
+                archive_path,
+                dry_run,
+            } = response
+            else {
+                return Err(unexpected(&response));
+            };
+            let place = match (above, below) {
+                (Some(id), _) => format!("above line {id}"),
+                (_, Some(id)) => format!("below line {id}"),
+                _ => String::new(),
+            };
+            match (dry_run, archive_path) {
+                (true, _) => println!("Would delete {lines} lines {place} on {port}"),
+                (false, Some(path)) => {
+                    println!(
+                        "Deleted {lines} lines {place} on {port} (copy of the buffer in {path})"
+                    );
+                }
+                (false, None) => println!("Deleted {lines} lines {place} on {port}"),
+            }
+            Ok(())
+        }
+
         Command::Stats { port, json } => {
             let response = session.request(RequestPayload::GetStatus { port })?;
             let ResponsePayload::Status { name, state, stats } = response else {

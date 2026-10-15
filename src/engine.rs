@@ -303,6 +303,7 @@ impl CommandEngine {
                 port,
                 archive_current,
             } => self.clear(&port, archive_current.unwrap_or(false)).await,
+            payload @ RequestPayload::DeleteLines { .. } => self.execute_delete(payload).await,
             RequestPayload::GetStats { port } => self.stats(&port).await,
             #[cfg(feature = "esp")]
             payload @ (RequestPayload::EspFlash { .. }
@@ -669,6 +670,79 @@ impl CommandEngine {
         Ok(ResponsePayload::ClearSuccess {
             lines_cleared,
             archive_path: archive_path.map(|p| p.display().to_string()),
+        })
+    }
+
+    /// Carry out a deletion around a line. Split out of `execute` so the
+    /// dispatcher stays inside the line budget.
+    async fn execute_delete(
+        &self,
+        payload: RequestPayload,
+    ) -> Result<ResponsePayload, EngineError> {
+        let RequestPayload::DeleteLines {
+            port,
+            above,
+            below,
+            archive_current,
+            dry_run,
+        } = payload
+        else {
+            return Err(EngineError::Internal(format!(
+                "{payload:?} is not a deletion"
+            )));
+        };
+        let bound = line_bound(above, below)?;
+        self.delete_lines(
+            &port,
+            bound,
+            archive_current.unwrap_or(true),
+            dry_run.unwrap_or(false),
+        )
+        .await
+    }
+
+    /// Delete the lines on one side of a line, with a copy of the buffer
+    /// first unless `archive` is off, or only count them.
+    ///
+    /// A marker line records what was deleted, as the other changes to a
+    /// capture are recorded, so that a reader of the capture finds the place.
+    async fn delete_lines(
+        &self,
+        port: &str,
+        bound: crate::storage::LineBound,
+        archive: bool,
+        dry_run: bool,
+    ) -> Result<ResponsePayload, EngineError> {
+        if dry_run {
+            let lines = self
+                .with_storage(port, move |storage| storage.count_around(bound))
+                .await?;
+            return Ok(ResponsePayload::LinesDeleted {
+                lines,
+                archive_path: None,
+                dry_run: true,
+            });
+        }
+        let archive_path = archive
+            .then(|| paths::archive_path(self.archive_dir(), port, &paths::archive_timestamp()));
+        let target = archive_path.clone();
+        let lines = self
+            .with_storage(port, move |storage| {
+                storage.delete_around(bound, target.as_deref())
+            })
+            .await?;
+        if lines > 0 {
+            let side = match bound {
+                crate::storage::LineBound::Above(id) => format!("above line {id}"),
+                crate::storage::LineBound::Below(id) => format!("below line {id}"),
+            };
+            self.log_to_buffer(port, &format!("━━━ {lines} LINES DELETED {side} ━━━"))
+                .await;
+        }
+        Ok(ResponsePayload::LinesDeleted {
+            lines,
+            archive_path: archive_path.map(|p| p.display().to_string()),
+            dry_run: false,
         })
     }
 
@@ -1243,6 +1317,20 @@ fn validate_output_path(path: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// The side of a line a deletion takes: exactly one of the two is given.
+fn line_bound(
+    above: Option<i64>,
+    below: Option<i64>,
+) -> Result<crate::storage::LineBound, EngineError> {
+    match (above, below) {
+        (Some(id), None) => Ok(crate::storage::LineBound::Above(id)),
+        (None, Some(id)) => Ok(crate::storage::LineBound::Below(id)),
+        _ => Err(EngineError::Invalid(
+            "give exactly one of `above` and `below`".to_string(),
+        )),
+    }
+}
+
 /// Write a received file only under the caller's chosen directory.
 ///
 /// The sender controls the protocol filename. `create_new` also prevents an
@@ -1747,6 +1835,117 @@ mod tests {
             archive.starts_with(dir.path().join("archive").to_str().unwrap()),
             "archive {archive} must sit in the configured archive dir"
         );
+    }
+
+    /// Deleting around a line: a dry run only counts, a real run keeps a copy
+    /// unless told not to, leaves the line and the other side, and records
+    /// itself with one marker line.
+    #[tokio::test]
+    async fn lines_can_be_deleted_around_one_line() {
+        let (engine, dir) = make_test_engine();
+        let ctrl = open_mock(&engine, "p").await;
+        ctrl.feed_lines(&["one", "two", "three", "four", "five"])
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let delete = |above, below, archive, dry_run| RequestPayload::DeleteLines {
+            port: "p".into(),
+            above,
+            below,
+            archive_current: archive,
+            dry_run,
+        };
+
+        // A dry run counts and changes nothing.
+        let ResponsePayload::LinesDeleted { lines, dry_run, .. } = engine
+            .execute(delete(Some(3), None, None, Some(true)))
+            .await
+            .unwrap()
+        else {
+            panic!("not a deletion")
+        };
+        assert_eq!((lines, dry_run), (2, true));
+        assert_eq!(
+            engine
+                .storage("p")
+                .await
+                .unwrap()
+                .lock()
+                .unwrap()
+                .line_count()
+                .unwrap(),
+            5
+        );
+
+        // The default makes a copy, in the archive folder.
+        let ResponsePayload::LinesDeleted {
+            lines,
+            archive_path,
+            dry_run,
+        } = engine
+            .execute(delete(Some(3), None, None, None))
+            .await
+            .unwrap()
+        else {
+            panic!("not a deletion")
+        };
+        assert_eq!((lines, dry_run), (2, false));
+        let archive = archive_path.expect("a copy is the default");
+        assert!(archive.starts_with(dir.path().join("archive").to_str().unwrap()));
+        assert!(std::path::Path::new(&archive).exists());
+
+        // `archive_current: false` makes none, and the line itself stays.
+        let ResponsePayload::LinesDeleted {
+            lines,
+            archive_path,
+            ..
+        } = engine
+            .execute(delete(None, Some(3), Some(false), None))
+            .await
+            .unwrap()
+        else {
+            panic!("not a deletion")
+        };
+        assert!(lines >= 2);
+        assert!(archive_path.is_none());
+
+        let storage = engine.storage("p").await.unwrap();
+        let payloads: Vec<String> = storage
+            .lock()
+            .unwrap()
+            .read_lines(1, 100)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.payload)
+            .collect();
+        assert!(payloads.contains(&"three".to_string()), "{payloads:?}");
+        assert!(!payloads.contains(&"one".to_string()), "{payloads:?}");
+        assert!(!payloads.contains(&"five".to_string()), "{payloads:?}");
+        assert!(
+            payloads.iter().any(|p| p.contains("LINES DELETED")),
+            "no marker: {payloads:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_needs_exactly_one_side() {
+        let (engine, _dir) = make_test_engine();
+        let _ctrl = open_mock(&engine, "p").await;
+        for (above, below) in [(None, None), (Some(1), Some(2))] {
+            let refused = engine
+                .execute(RequestPayload::DeleteLines {
+                    port: "p".into(),
+                    above,
+                    below,
+                    archive_current: None,
+                    dry_run: Some(true),
+                })
+                .await;
+            assert!(
+                matches!(refused, Err(EngineError::Invalid(_))),
+                "{above:?} {below:?}"
+            );
+        }
     }
 
     #[tokio::test]
