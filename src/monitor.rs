@@ -253,6 +253,15 @@ fn daemon_state_labels(ui: &mut egui::Ui, view: &crate::standalone::DaemonView) 
     );
 }
 
+/// The question that comes before the capture of a port is emptied.
+struct ClearCaptureQuestion {
+    /// Lines and bytes the capture holds, or why that could not be read.
+    summary: Result<(u64, u64), String>,
+    /// Copy the capture to the archive folder first. On unless the user
+    /// turns it off: what is deleted here can only come back from the copy.
+    archive: bool,
+}
+
 /// Everything the firmware dialog needs to keep between frames.
 ///
 /// One struct rather than a dozen fields on the window, so the whole feature
@@ -1439,6 +1448,10 @@ pub struct PortMonitorState {
     pub show_settings_dialog: bool,
     /// Shows and changes the daemon's lifecycle, and stops it (#114).
     pub daemon: Option<crate::standalone::DaemonControlFn>,
+    /// Looks at the capture of this port and empties it.
+    pub capture: Option<crate::standalone::CaptureControlFn>,
+    /// The question before the capture is emptied, while it is open.
+    clear_capture: Option<ClearCaptureQuestion>,
     /// What quitting does to the daemon, as configured when the window opened.
     pub on_quit: crate::config::OnQuit,
     /// Where a setting saved from this window is written.
@@ -1562,6 +1575,8 @@ impl PortMonitorState {
             rest_fields_edited: false,
             show_settings_dialog: false,
             daemon: None,
+            capture: None,
+            clear_capture: None,
             on_quit: crate::config::OnQuit::Ask,
             config_file: None,
             build_warning: None,
@@ -2009,14 +2024,7 @@ impl PortMonitorState {
             }
         }
 
-        // Cmd+F puts the cursor in the filter field. On macOS the menu item
-        // gets the key first and reports it as a request; elsewhere, and in a
-        // window the menu does not reach, the shortcut itself arrives here.
-        if platform::take_menu_request(MenuRequest::FocusFilter)
-            || ui.input(filter_shortcut_pressed)
-        {
-            self.focus_filter = true;
-        }
+        self.poll_filter_shortcut(ui);
 
         // Toolbar (top)
         egui::Panel::top(format!("toolbar_{}", self.port_name)).show(ui, |ui| {
@@ -2068,6 +2076,10 @@ impl PortMonitorState {
 
         if self.show_daemon_dialog {
             self.render_daemon_dialog(ui.ctx());
+        }
+
+        if self.clear_capture.is_some() {
+            self.render_clear_capture(ui.ctx());
         }
 
         // Compute context-aware edit state for macOS menu bar (Cut / Copy / Paste / Select All)
@@ -4080,9 +4092,28 @@ impl PortMonitorState {
                 .on_hover_text("Color only changes capture text, not stored data or exports");
             ui.separator();
 
-            if ui.button("Clear").on_hover_text("Clear display").clicked() {
-                self.lines.clear();
-                self.filtered_indices.clear();
+            let mut clear_capture_asked = false;
+            ui.menu_button("Clear ▾", |ui| {
+                if ui
+                    .button("Clear display")
+                    .on_hover_text("Empty the view. The capture on disk is untouched.")
+                    .clicked()
+                {
+                    self.lines.clear();
+                    self.filtered_indices.clear();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(self.capture.is_some(), egui::Button::new("Clear capture…"))
+                    .on_hover_text("Delete what is stored for this port, after asking")
+                    .clicked()
+                {
+                    clear_capture_asked = true;
+                    ui.close();
+                }
+            });
+            if clear_capture_asked {
+                self.open_clear_capture();
             }
 
             let pause_label = if self.paused { "Resume" } else { "Pause" };
@@ -4174,7 +4205,9 @@ impl PortMonitorState {
             .stick_to_bottom(self.auto_follow);
 
         let lines_not_empty = !self.lines.is_empty();
+        let has_capture = self.capture.is_some();
         let mut clear_requested = false;
+        let mut clear_capture_requested = false;
         let mut copy_all_requested = false;
 
         let response = scroll.show_rows(ui, row_height, total_rows, |ui, row_range| {
@@ -4250,6 +4283,13 @@ impl PortMonitorState {
                             clear_requested = true;
                             ui.close();
                         }
+                        if ui
+                            .add_enabled(has_capture, egui::Button::new("Clear Capture…"))
+                            .clicked()
+                        {
+                            clear_capture_requested = true;
+                            ui.close();
+                        }
                     });
                 });
             }
@@ -4258,6 +4298,9 @@ impl PortMonitorState {
         if clear_requested {
             self.lines.clear();
             self.filtered_indices.clear();
+        }
+        if clear_capture_requested {
+            self.open_clear_capture();
         }
 
         if copy_all_requested && !self.lines.is_empty() {
@@ -4675,6 +4718,153 @@ impl PortMonitorState {
         // A macro drives DTR and RTS itself, so what this window set before
         // no longer says what the lines are.
         self.forget_signal_lines();
+    }
+
+    /// Ask what the capture holds and open the question before it is emptied.
+    fn open_clear_capture(&mut self) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest};
+        let Some(control) = self.capture.clone() else {
+            self.settings_status = Some((
+                "No daemon behind this window, so the capture cannot be cleared from here."
+                    .to_string(),
+                true,
+            ));
+            return;
+        };
+        let summary = match control(CaptureRequest::Summary) {
+            Ok(CaptureAnswer::Summary { lines, bytes }) => Ok((lines, bytes)),
+            Ok(CaptureAnswer::Cleared { .. }) => {
+                Err("unexpected answer from the daemon".to_string())
+            }
+            Err(e) => Err(e),
+        };
+        self.clear_capture = Some(ClearCaptureQuestion {
+            summary,
+            archive: true,
+        });
+    }
+
+    /// Cmd+F puts the cursor in the filter field. On macOS the menu item gets
+    /// the key first and reports it as a request; elsewhere, and in a window
+    /// the menu does not reach, the shortcut itself arrives here.
+    fn poll_filter_shortcut(&mut self, ui: &egui::Ui) {
+        if platform::take_menu_request(MenuRequest::FocusFilter)
+            || ui.input(filter_shortcut_pressed)
+        {
+            self.focus_filter = true;
+        }
+    }
+
+    /// Close the question without deleting anything.
+    fn cancel_clear_capture(&mut self) {
+        self.clear_capture = None;
+    }
+
+    /// Empty the capture, and show what happened. The question is closed
+    /// either way; a failure is reported in the status line.
+    fn confirm_clear_capture(&mut self) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest};
+        let Some(question) = self.clear_capture.take() else {
+            return;
+        };
+        let Some(control) = self.capture.clone() else {
+            return;
+        };
+        match control(CaptureRequest::Clear {
+            archive: question.archive,
+        }) {
+            Ok(CaptureAnswer::Cleared { lines, archive }) => {
+                self.lines.clear();
+                self.filtered_indices.clear();
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {path}"));
+                self.note(&format!("━━━ CAPTURE CLEARED ({lines} lines{copy}) ━━━"));
+                self.settings_status = Some((format!("Cleared {lines} lines{copy}"), false));
+            }
+            Ok(CaptureAnswer::Summary { .. }) => {
+                self.settings_status =
+                    Some(("unexpected answer from the daemon".to_string(), true));
+            }
+            Err(e) => {
+                self.settings_status = Some((format!("Clearing the capture failed: {e}"), true));
+            }
+        }
+    }
+
+    /// The question before the capture is emptied. Cancel has the focus, so
+    /// Enter does not delete anything; deleting takes a click on its button.
+    fn render_clear_capture(&mut self, ctx: &egui::Context) {
+        let Some(question) = self.clear_capture.as_mut() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let deletable = matches!(question.summary, Ok((lines, _)) if lines > 0);
+        egui::Window::new(format!("Clear capture — {}", self.port_name))
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH);
+                match &question.summary {
+                    Ok((0, _)) => {
+                        ui.label("The capture of this port is empty.");
+                    }
+                    Ok((lines, bytes)) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Delete all {lines} lines ({} KiB) from the capture of {}?",
+                                bytes.div_ceil(1024),
+                                self.port_name
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            "The capture is the record of what the device sent. Once \
+                             deleted it can only come back from the copy.",
+                        );
+                    }
+                    Err(e) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 120, 100),
+                            format!("The capture could not be read: {e}"),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.add_enabled(
+                    deletable,
+                    egui::Checkbox::new(
+                        &mut question.archive,
+                        "Copy it to the archive folder first (recommended)",
+                    ),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel_button = ui.button("Cancel");
+                    if !ui.memory(|m| m.focused().is_some()) {
+                        cancel_button.request_focus();
+                    }
+                    if cancel_button.clicked() {
+                        cancel = true;
+                    }
+                    let delete = egui::Button::new(
+                        egui::RichText::new("Clear capture").color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(180, 50, 50));
+                    if ui.add_enabled(deletable, delete).clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        if cancel {
+            self.cancel_clear_capture();
+        } else if confirm {
+            self.confirm_clear_capture();
+        }
     }
 
     /// The lines are no longer known to be what this window set: a macro ran,
@@ -5518,6 +5708,125 @@ mod signal_tests {
                 clicked = signal_control(ui, "DTR", state);
             });
             assert!(!clicked, "nothing was clicked in {state:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod clear_capture_tests {
+    use super::*;
+    use crate::standalone::{CaptureRequest, fake_capture_control};
+
+    fn window(
+        lines: u64,
+        fail: bool,
+    ) -> (PortMonitorState, Arc<std::sync::Mutex<Vec<CaptureRequest>>>) {
+        let (control, asked) = fake_capture_control(lines, fail);
+        let mut monitor = PortMonitorState::new(
+            "/dev/ttyTEST".to_string(),
+            "115200 8N1".to_string(),
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+            Vec::new(),
+            None,
+        );
+        monitor.capture = Some(control);
+        monitor.push_display_line(DisplayLine {
+            timestamp: "12:00:00.000".to_string(),
+            timestamp_ns: 1,
+            payload: "kept?".to_string(),
+            is_sent: false,
+        });
+        (monitor, asked)
+    }
+
+    #[test]
+    fn the_question_reads_the_capture_and_proposes_a_copy() {
+        let (mut monitor, asked) = window(42, false);
+        monitor.open_clear_capture();
+        let question = monitor.clear_capture.as_ref().expect("a question");
+        assert!(matches!(question.summary, Ok((42, _))));
+        assert!(
+            question.archive,
+            "the copy is on unless the user turns it off"
+        );
+        assert_eq!(*asked.lock().unwrap(), vec![CaptureRequest::Summary]);
+
+        // Cancelling deletes nothing and keeps the display.
+        monitor.cancel_clear_capture();
+        assert!(monitor.clear_capture.is_none());
+        assert_eq!(*asked.lock().unwrap(), vec![CaptureRequest::Summary]);
+        assert_eq!(monitor.lines.len(), 1);
+    }
+
+    #[test]
+    fn confirming_asks_for_the_copy_the_box_says() {
+        for archive in [true, false] {
+            let (mut monitor, asked) = window(42, false);
+            monitor.open_clear_capture();
+            monitor.clear_capture.as_mut().unwrap().archive = archive;
+            monitor.confirm_clear_capture();
+            assert_eq!(
+                *asked.lock().unwrap(),
+                vec![CaptureRequest::Summary, CaptureRequest::Clear { archive }]
+            );
+            assert!(monitor.clear_capture.is_none());
+            assert!(monitor.lines.is_empty(), "the display is emptied too");
+            let status = monitor.settings_status.clone().expect("a status");
+            assert!(
+                !status.1 && status.0.starts_with("Cleared 42 lines"),
+                "{status:?}"
+            );
+            // One marker in the capture says what happened.
+            let stored = monitor.storage.read_lines(1, 10).expect("lines");
+            assert_eq!(stored.len(), 1, "{stored:?}");
+            assert!(stored[0].payload.contains("CAPTURE CLEARED (42 lines"));
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_display_stays() {
+        let (mut monitor, _) = window(42, true);
+        monitor.open_clear_capture();
+        monitor.confirm_clear_capture();
+        let status = monitor.settings_status.clone().expect("a status");
+        assert!(status.1 && status.0.contains("failed"), "{status:?}");
+        assert_eq!(
+            monitor.lines.len(),
+            1,
+            "a failed clear must not empty the view"
+        );
+        assert_eq!(monitor.storage.read_lines(1, 10).expect("lines").len(), 0);
+    }
+
+    #[test]
+    fn without_a_daemon_no_question_opens() {
+        let (mut monitor, asked) = window(42, false);
+        monitor.capture = None;
+        monitor.open_clear_capture();
+        assert!(monitor.clear_capture.is_none());
+        assert!(monitor.settings_status.as_ref().is_some_and(|s| s.1));
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    /// Every state of the question draws, and drawing does not decide anything.
+    #[test]
+    fn the_question_draws_for_a_full_an_empty_and_an_unreadable_capture() {
+        for summary in [Ok((42, 1680)), Ok((0, 0)), Err("no answer".to_string())] {
+            let (mut monitor, asked) = window(42, false);
+            monitor.clear_capture = Some(ClearCaptureQuestion {
+                summary,
+                archive: true,
+            });
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                monitor.render_clear_capture(ui.ctx());
+            });
+            output.textures_delta.clear();
+            assert!(
+                monitor.clear_capture.is_some(),
+                "drawing closed the question"
+            );
+            assert!(asked.lock().unwrap().is_empty(), "drawing asked the daemon");
         }
     }
 }

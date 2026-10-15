@@ -463,6 +463,113 @@ pub fn daemon_control(
     })
 }
 
+/// What a surface asks of the capture of the port it shows.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureRequest {
+    /// How much the capture holds.
+    Summary,
+    /// Empty it, after a copy in the archive directory when `archive` is set.
+    Clear { archive: bool },
+}
+
+/// What the daemon answered about the capture.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureAnswer {
+    /// The capture as it is.
+    Summary { lines: u64, bytes: u64 },
+    /// The capture is empty; this is what it held, and where the copy went.
+    Cleared { lines: u64, archive: Option<String> },
+}
+
+/// Looks at the capture of a port, and empties it.
+///
+/// The daemon owns the database, so a window or a terminal asks it instead of
+/// opening the file for writing: every other surface then sees the same.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+pub type CaptureControlFn =
+    Arc<dyn Fn(CaptureRequest) -> Result<CaptureAnswer, String> + Send + Sync>;
+
+/// A capture control that answers from a fixed capture and records what it
+/// was asked, for tests of the surfaces. It never deletes anything.
+///
+/// # Panics
+/// Panics when the log of requests was poisoned by a failed test.
+#[cfg(all(test, any(feature = "monitor", feature = "tui")))]
+#[must_use]
+pub fn fake_capture_control(
+    lines: u64,
+    fail: bool,
+) -> (CaptureControlFn, Arc<Mutex<Vec<CaptureRequest>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let control: CaptureControlFn = Arc::new(move |request| {
+        log.lock().unwrap().push(request.clone());
+        if fail && request != CaptureRequest::Summary {
+            return Err("the daemon refused".to_string());
+        }
+        Ok(match request {
+            CaptureRequest::Summary => CaptureAnswer::Summary {
+                lines,
+                bytes: lines * 40,
+            },
+            CaptureRequest::Clear { archive } => CaptureAnswer::Cleared {
+                lines,
+                archive: archive.then(|| "/archive/port_2026.db".to_string()),
+            },
+        })
+    });
+    (control, asked)
+}
+
+/// Ask the daemon about the capture of `port`, and empty it on request.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[must_use]
+pub fn capture_control(
+    port: &str,
+    client: &Arc<IpcClient>,
+    runtime: &tokio::runtime::Handle,
+) -> CaptureControlFn {
+    let port = port.to_string();
+    let client = Arc::clone(client);
+    let runtime = runtime.clone();
+    Arc::new(move |request| match request {
+        CaptureRequest::Summary => {
+            match ask(
+                &runtime,
+                &client,
+                RequestPayload::GetStats { port: port.clone() },
+            )? {
+                ResponsePayload::Stats(stats) => Ok(CaptureAnswer::Summary {
+                    lines: stats.total_lines,
+                    bytes: stats.total_bytes,
+                }),
+                _ => Err("unexpected answer from the daemon".to_string()),
+            }
+        }
+        CaptureRequest::Clear { archive } => {
+            match ask(
+                &runtime,
+                &client,
+                RequestPayload::Clear {
+                    port: port.clone(),
+                    archive_current: Some(archive),
+                },
+            )? {
+                ResponsePayload::ClearSuccess {
+                    lines_cleared,
+                    archive_path,
+                } => Ok(CaptureAnswer::Cleared {
+                    lines: lines_cleared,
+                    archive: archive_path,
+                }),
+                _ => Err("unexpected answer from the daemon".to_string()),
+            }
+        }
+    })
+}
+
 /// Something a surface asks the hardware to do.
 ///
 /// Its own vocabulary rather than the window's wire type: `gui_ipc` exists to
@@ -863,6 +970,7 @@ fn session_monitor(
     {
         monitor.rest = Some(daemon_rest(client, runtime));
     }
+    monitor.capture = Some(capture_control(port, client, runtime));
     monitor.daemon = Some(daemon_control(client, runtime));
     monitor.on_quit = crate::config::load_config(config_path)
         .map(|loaded| loaded.daemon.on_quit)
@@ -998,6 +1106,7 @@ fn run_tui_attached(
         transfer: Some(daemon_transfer(port, &parts.client, runtime.clone())),
         #[cfg(feature = "rest")]
         rest: Some(daemon_rest(&parts.client, runtime)),
+        capture: Some(capture_control(port, &parts.client, runtime)),
         daemon: Some(daemon_control(&parts.client, runtime)),
         on_quit: crate::config::load_config(config_path)
             .map(|loaded| loaded.daemon.on_quit)
@@ -1230,6 +1339,68 @@ mod tests {
                 .contains(&FakeDaemon::PORT.to_string()),
             "Disconnect left the port on the daemon"
         );
+    }
+
+    /// The capture control reaches the real daemon: it reports what the
+    /// capture holds, and clearing it leaves a copy in the archive folder
+    /// and an empty capture, without anything else of the daemon changing.
+    #[cfg(all(unix, feature = "testutil", feature = "monitor"))]
+    #[test]
+    fn a_window_can_clear_the_capture_through_the_daemon() {
+        let daemon = FakeDaemon::start();
+        let parts = attach_session(
+            FakeDaemon::PORT,
+            &PortConfig::default(),
+            &daemon.data_dir,
+            Some(daemon.socket.clone()),
+            None,
+            LeaseKind::Gui,
+        )
+        .expect("attaching");
+        let runtime = parts.keepalive.handle().expect("runtime");
+        let storage = SqliteStorage::open(&crate::paths::port_db_path(
+            &daemon.data_dir,
+            FakeDaemon::PORT,
+        ))
+        .expect("storage");
+        storage
+            .insert_lines(&[(1, "one"), (2, "two"), (3, "three")])
+            .expect("lines");
+        let control = capture_control(FakeDaemon::PORT, &parts.client, &runtime);
+
+        let CaptureAnswer::Summary { lines, .. } =
+            control(CaptureRequest::Summary).expect("a summary")
+        else {
+            panic!("not a summary");
+        };
+        assert_eq!(lines, 3);
+
+        let CaptureAnswer::Cleared { lines, archive } =
+            control(CaptureRequest::Clear { archive: true }).expect("cleared")
+        else {
+            panic!("not a clear");
+        };
+        assert_eq!(lines, 3);
+        let archive = archive.expect("a copy was asked for");
+        assert!(
+            std::path::Path::new(&archive).exists(),
+            "the copy is not at {archive}"
+        );
+        let CaptureAnswer::Summary { lines, .. } =
+            control(CaptureRequest::Summary).expect("a summary")
+        else {
+            panic!("not a summary");
+        };
+        assert_eq!(lines, 0, "the capture was not emptied");
+
+        // Counter-probe: without a copy there is no archive file.
+        storage.insert_lines(&[(4, "four")]).expect("lines");
+        let CaptureAnswer::Cleared { archive, .. } =
+            control(CaptureRequest::Clear { archive: false }).expect("cleared")
+        else {
+            panic!("not a clear");
+        };
+        assert!(archive.is_none());
     }
 
     /// #114: an attached window holds a lease on the daemon for as long as

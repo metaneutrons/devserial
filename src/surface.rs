@@ -66,6 +66,9 @@ pub enum Capability {
     Filter,
     /// Discard the buffer.
     ClearBuffer,
+    /// Delete the stored capture of the port, after asking, with a copy first
+    /// unless the user declines it.
+    ClearCapture,
     /// Write the buffer out in a chosen format.
     ///
     /// The window additionally offers the clipboard. That is a convenience of
@@ -116,6 +119,7 @@ impl Capability {
         Self::ScrollBack,
         Self::Filter,
         Self::ClearBuffer,
+        Self::ClearCapture,
         Self::Export,
         Self::FileTransfer,
         Self::TransferProtocol,
@@ -154,7 +158,8 @@ pub const GUI: &[(Capability, &str)] = &[
     ),
     (Capability::ScrollBack, "\"Auto-follow\""),
     (Capability::Filter, "\"Filter:\""),
-    (Capability::ClearBuffer, "\"Clear\""),
+    (Capability::ClearBuffer, "\"Clear display\""),
+    (Capability::ClearCapture, "fn render_clear_capture"),
     (Capability::Export, "\"Export ▾\""),
     (Capability::FileTransfer, "\"Transfer ▾\""),
     (Capability::TransferProtocol, "FileTransferProtocol::ALL"),
@@ -182,6 +187,7 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::FileTransfer, "InputMode::SendFile"),
     (Capability::About, "InputMode::About"),
     (Capability::ClearBuffer, "\"Display cleared\""),
+    (Capability::ClearCapture, "InputMode::ClearCapture"),
     (Capability::Filter, "InputMode::Filter"),
     (Capability::ControlLines, "enum ControlLine"),
     (Capability::Macros, "fn handle_macros_key"),

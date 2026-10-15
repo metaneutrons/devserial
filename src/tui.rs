@@ -97,6 +97,8 @@ pub struct TuiContext {
     pub rest: Option<crate::standalone::RestControlFn>,
     /// Shows and changes when the daemon stops by itself, and stops it (#114).
     pub daemon: Option<crate::standalone::DaemonControlFn>,
+    /// Looks at the capture of this port and empties it.
+    pub capture: Option<crate::standalone::CaptureControlFn>,
     /// What quitting does to the daemon.
     pub on_quit: crate::config::OnQuit,
     /// Where a setting saved from here is written.
@@ -151,6 +153,8 @@ enum InputMode {
     QuitDaemon,
     /// Offering the agent skill to AI tools found on this computer (#124).
     SkillOffer,
+    /// Asking before the stored capture of the port is emptied.
+    ClearCapture,
 }
 
 // DTR and RTS join the view toggles here. They are separate switches with
@@ -239,6 +243,10 @@ struct AppState {
     config_file: Option<std::path::PathBuf>,
     /// What the daemon last said about itself.
     daemon_view: Option<crate::standalone::DaemonView>,
+    /// Looks at the capture of this port and empties it.
+    capture: Option<crate::standalone::CaptureControlFn>,
+    /// What the capture holds, as the question before emptying it shows.
+    capture_summary: Option<Result<(u64, u64), String>>,
     /// The agent skill offered at start, until it is answered.
     skill_offer: Option<crate::agent_skill::Offer>,
     /// Set when the daemon is another build than this TUI (#115).
@@ -415,6 +423,60 @@ impl AppState {
         }
     }
 
+    /// Ask what the capture holds and show the question before it is emptied.
+    fn begin_clear_capture(&mut self) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest};
+        let Some(control) = self.capture.clone() else {
+            self.set_status("No daemon behind this screen, so the capture cannot be cleared here");
+            return;
+        };
+        self.capture_summary = Some(match control(CaptureRequest::Summary) {
+            Ok(CaptureAnswer::Summary { lines, bytes }) => Ok((lines, bytes)),
+            Ok(CaptureAnswer::Cleared { .. }) => Err("unexpected answer from the daemon".into()),
+            Err(e) => Err(e),
+        });
+        self.input_mode = InputMode::ClearCapture;
+    }
+
+    /// Leave the question without deleting anything.
+    fn cancel_clear_capture(&mut self) {
+        self.capture_summary = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Empty the capture, with or without a copy first, and say what happened.
+    fn answer_clear_capture(
+        &mut self,
+        storage: &Arc<std::sync::Mutex<SqliteStorage>>,
+        archive: bool,
+    ) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest};
+        let deletable = matches!(self.capture_summary, Some(Ok((lines, _))) if lines > 0);
+        let Some(control) = self.capture.clone().filter(|_| deletable) else {
+            return;
+        };
+        self.cancel_clear_capture();
+        match control(CaptureRequest::Clear { archive }) {
+            Ok(CaptureAnswer::Cleared { lines, archive }) => {
+                self.lines.clear();
+                self.scroll_offset = 0;
+                self.auto_follow = true;
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {path}"));
+                self.note(
+                    storage,
+                    &format!("━━━ CAPTURE CLEARED ({lines} lines{copy}) ━━━"),
+                );
+                self.set_status(format!("Cleared {lines} lines{copy}"));
+            }
+            Ok(CaptureAnswer::Summary { .. }) => {
+                self.set_status("Clearing the capture: unexpected answer from the daemon");
+            }
+            Err(e) => self.set_status(format!("Clearing the capture failed: {e}")),
+        }
+    }
+
     /// The user asked to quit. Returns whether to leave now, or `false` when
     /// the question about the daemon is shown first (#114).
     fn request_quit(&mut self) -> bool {
@@ -553,6 +615,8 @@ impl AppState {
             on_quit: crate::config::OnQuit::Ask,
             config_file: None,
             daemon_view: None,
+            capture: None,
+            capture_summary: None,
             skill_offer: None,
             build_warning: None,
         }
@@ -723,6 +787,7 @@ fn run_app(
         state.rest = context.rest;
     }
     state.daemon = context.daemon;
+    state.capture = context.capture;
     state.on_quit = context.on_quit;
     state.config_file = context.config_file;
     if let Some(warning) = context.build_warning {
@@ -830,6 +895,10 @@ fn run_app(
                     } else {
                         "Timestamps off"
                     });
+                    continue;
+                }
+                KeyCode::Char('x') if state.input_mode == InputMode::Normal => {
+                    state.begin_clear_capture();
                     continue;
                 }
                 KeyCode::Char('l') => {
@@ -986,6 +1055,18 @@ fn run_app(
             };
             if quit {
                 break;
+            }
+            continue;
+        }
+
+        if state.input_mode == InputMode::ClearCapture {
+            // Deleting takes a letter of its own: Enter does nothing here, and
+            // so does any other key.
+            match key.code {
+                KeyCode::Char('a') => state.answer_clear_capture(storage, true),
+                KeyCode::Char('d') => state.answer_clear_capture(storage, false),
+                KeyCode::Esc => state.cancel_clear_capture(),
+                _ => {}
             }
             continue;
         }
@@ -1557,6 +1638,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Rest => ("", rest_title(state)),
         InputMode::Daemon => ("Idle period: ", daemon_title(state)),
         InputMode::QuitDaemon => ("", " Quit ".to_string()),
+        InputMode::ClearCapture => ("", " Clear capture ".to_string()),
         InputMode::SkillOffer => ("", " AI tools ".to_string()),
         #[cfg(feature = "esp")]
         InputMode::Flash => ("Firmware: ", flash_title(state)),
@@ -1989,6 +2071,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         #[cfg(feature = "esp")]
         InputMode::Flash => render_flash_popup(frame, state),
         InputMode::QuitDaemon => render_quit_daemon_popup(frame, state),
+        InputMode::ClearCapture => render_clear_capture_popup(frame, state),
         InputMode::SkillOffer => render_skill_offer_popup(frame, state),
         _ => {}
     }
@@ -2018,6 +2101,47 @@ fn render_quit_daemon_popup(frame: &mut Frame, state: &AppState) {
     ]);
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Quit ")),
+        area,
+    );
+}
+
+/// The question before the capture is emptied, and the letters that answer it.
+fn render_clear_capture_popup(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(66, 45, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let mut lines = Vec::new();
+    match &state.capture_summary {
+        Some(Ok((0, _))) => lines.push(Line::from("The capture of this port is empty.")),
+        Some(Ok((count, bytes))) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Delete all {count} lines ({} KiB) from the capture of {}?",
+                    bytes.div_ceil(1024),
+                    state.port_name
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("It is the record of what the device sent. Once"));
+            lines.push(Line::from("deleted it can only come back from the copy."));
+        }
+        Some(Err(e)) => lines.push(Line::from(format!("The capture could not be read: {e}"))),
+        None => {}
+    }
+    lines.push(Line::from(""));
+    if matches!(state.capture_summary, Some(Ok((count, _))) if count > 0) {
+        lines.push(Line::from(
+            "a  copy it to the archive folder, then clear it",
+        ));
+        lines.push(Line::from("d  clear it without a copy"));
+    }
+    lines.push(Line::from("Esc  keep it"));
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Clear capture "),
+        ),
         area,
     );
 }
@@ -3021,5 +3145,94 @@ mod tests {
             drawn.contains("0.0.0.0") && drawn.contains("9600"),
             "{drawn}"
         );
+    }
+}
+
+#[cfg(test)]
+mod clear_capture_tests {
+    use super::*;
+    use crate::standalone::{CaptureRequest, fake_capture_control};
+
+    type Asked = Arc<std::sync::Mutex<Vec<CaptureRequest>>>;
+    type Storage = Arc<std::sync::Mutex<SqliteStorage>>;
+
+    fn with_capture(lines: u64, fail: bool) -> (AppState, Asked, Storage) {
+        let (control, asked) = fake_capture_control(lines, fail);
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.capture = Some(control);
+        state.push_line("12:00:00.000".to_string(), "kept?".to_string());
+        let storage = Arc::new(std::sync::Mutex::new(
+            SqliteStorage::open_memory().expect("storage"),
+        ));
+        (state, asked, storage)
+    }
+
+    #[test]
+    fn the_question_asks_what_the_capture_holds_and_deletes_nothing() {
+        let (mut state, asked, _) = with_capture(42, false);
+        state.begin_clear_capture();
+        assert!(state.input_mode == InputMode::ClearCapture);
+        assert!(matches!(state.capture_summary, Some(Ok((42, _)))));
+        assert_eq!(*asked.lock().unwrap(), vec![CaptureRequest::Summary]);
+
+        // Leaving it deletes nothing and keeps the display.
+        state.cancel_clear_capture();
+        assert!(state.input_mode == InputMode::Normal);
+        assert_eq!(*asked.lock().unwrap(), vec![CaptureRequest::Summary]);
+        assert_eq!(state.lines.len(), 1);
+    }
+
+    #[test]
+    fn answering_with_a_copy_or_without_asks_for_exactly_that() {
+        for archive in [true, false] {
+            let (mut state, asked, storage) = with_capture(42, false);
+            state.begin_clear_capture();
+            state.answer_clear_capture(&storage, archive);
+            assert_eq!(
+                *asked.lock().unwrap(),
+                vec![CaptureRequest::Summary, CaptureRequest::Clear { archive }]
+            );
+            assert!(state.input_mode == InputMode::Normal);
+            // The display was emptied, and one marker says what happened.
+            let marker = storage.lock().unwrap().read_lines(1, 10).expect("lines");
+            assert_eq!(marker.len(), 1, "{marker:?}");
+            assert!(marker[0].payload.contains("CAPTURE CLEARED (42 lines"));
+            assert_eq!(marker[0].payload.contains("copy in"), archive);
+            assert_eq!(state.lines.len(), 1, "only the marker is on screen");
+        }
+    }
+
+    #[test]
+    fn an_empty_capture_has_nothing_to_delete() {
+        let (mut state, asked, storage) = with_capture(0, false);
+        state.begin_clear_capture();
+        state.answer_clear_capture(&storage, true);
+        assert_eq!(*asked.lock().unwrap(), vec![CaptureRequest::Summary]);
+        assert!(state.input_mode == InputMode::ClearCapture);
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_display_stays() {
+        let (mut state, _, storage) = with_capture(42, true);
+        state.begin_clear_capture();
+        state.answer_clear_capture(&storage, true);
+        assert!(state.input_mode == InputMode::Normal);
+        assert_eq!(
+            state.lines.len(),
+            1,
+            "a failed clear must not empty the view"
+        );
+        let (status, _) = state.status_msg.clone().expect("a status");
+        assert!(status.contains("failed"), "{status}");
+        let stored = storage.lock().unwrap().read_lines(1, 10).expect("lines");
+        assert_eq!(stored.len(), 0);
+    }
+
+    #[test]
+    fn without_a_daemon_the_question_does_not_open() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.begin_clear_capture();
+        assert!(state.input_mode == InputMode::Normal);
+        assert!(state.status_msg.is_some());
     }
 }
