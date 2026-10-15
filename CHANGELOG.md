@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.15](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.14...devserial-v0.2.15) (2026-10-15)
+
+
+### Bug Fixes
+
+* **tui:** show a control line as unknown after a macro, as the window does ([#152](https://github.com/metaneutrons/devserial/issues/152)) ([d01fe84](https://github.com/metaneutrons/devserial/commit/d01fe8419f862d5fe3d5babeebef436ff568f193))
+
 ## [0.2.14](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.13...devserial-v0.2.14) (2026-10-15)
 
 
