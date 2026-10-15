@@ -75,33 +75,6 @@ fn focus_text_field(ctx: &egui::Context, id: egui::Id, text: &str) {
     }
 }
 
-/// What the window knows about a control line (DTR or RTS).
-///
-/// Only the window's own writes are known. The level of an output line cannot
-/// be read back, and a macro or a freshly opened port sets it without the
-/// window's say, so the state is unknown until the window sets it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SignalLine {
-    /// Not set by this window since the port was opened or a macro ran.
-    #[default]
-    Unknown,
-    /// Last set low (released) by this window.
-    Low,
-    /// Last set high (asserted) by this window.
-    High,
-}
-
-impl SignalLine {
-    /// The state a click asks for: a line that is not known to be high is
-    /// asserted, one that is high is released.
-    const fn after_click(self) -> Self {
-        match self {
-            Self::High => Self::Low,
-            Self::Low | Self::Unknown => Self::High,
-        }
-    }
-}
-
 /// What the hover text says about a control line and what a click does.
 fn signal_hint(name: &str, state: SignalLine) -> String {
     let (known, click) = match state {
@@ -396,6 +369,7 @@ fn failure_summary(text: &str) -> String {
 /// Defined with the session rather than here, because the terminal takes the
 /// same closure.
 pub use crate::standalone::ReconfigureFn;
+use crate::standalone::SignalLine;
 
 // --- Public API (spawn/handle) ---
 

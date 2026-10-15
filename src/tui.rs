@@ -205,8 +205,8 @@ struct AppState {
     ///
     /// The hardware cannot be asked, so this records what was set rather than
     /// claiming to read the lines back.
-    dtr_state: bool,
-    rts_state: bool,
+    dtr_state: crate::standalone::SignalLine,
+    rts_state: crate::standalone::SignalLine,
     /// Macros offered in the picker, in the order they are numbered.
     macro_names: Vec<String>,
     /// Carries out hardware actions on the port.
@@ -584,8 +584,8 @@ impl AppState {
             history_draft: String::new(),
             connected: true,
             toggle: None,
-            dtr_state: false,
-            rts_state: false,
+            dtr_state: crate::standalone::SignalLine::Unknown,
+            rts_state: crate::standalone::SignalLine::Unknown,
             macro_names: Vec::new(),
             action: None,
             write: None,
@@ -722,6 +722,8 @@ impl AppState {
         match toggle(wanted, config) {
             Ok(()) => {
                 self.connected = wanted;
+                // A port taken back is opened as the system sets its lines.
+                self.forget_signal_lines();
                 self.set_status(if wanted {
                     "Port reconnected"
                 } else {
@@ -731,6 +733,13 @@ impl AppState {
             // The flag is not moved on failure: the port did not change hands.
             Err(e) => self.set_status(format!("Failed: {e}")),
         }
+    }
+
+    /// The lines are no longer known to be what this screen set: a macro ran,
+    /// or the port was taken back, which sets them as the system does.
+    const fn forget_signal_lines(&mut self) {
+        self.dtr_state = crate::standalone::SignalLine::Unknown;
+        self.rts_state = crate::standalone::SignalLine::Unknown;
     }
 
     /// Carry out a hardware action, or say why it cannot happen here.
@@ -1251,7 +1260,7 @@ fn handle_signals_key(state: &mut AppState, key: KeyCode) {
         _ => return,
     };
 
-    let level = !line.level(state);
+    let level = line.level(state).after_click() == crate::standalone::SignalLine::High;
     let event = line.event(level);
     match state.act(&event) {
         Ok(()) => {
@@ -1389,7 +1398,7 @@ impl ControlLine {
         }
     }
 
-    const fn level(self, state: &AppState) -> bool {
+    const fn level(self, state: &AppState) -> crate::standalone::SignalLine {
         match self {
             Self::Dtr => state.dtr_state,
             Self::Rts => state.rts_state,
@@ -1397,6 +1406,7 @@ impl ControlLine {
     }
 
     const fn record(self, state: &mut AppState, level: bool) {
+        let level = crate::standalone::SignalLine::set(level);
         match self {
             Self::Dtr => state.dtr_state = level,
             Self::Rts => state.rts_state = level,
@@ -1431,6 +1441,9 @@ fn handle_macros_key(state: &mut AppState, key: KeyCode) {
     let event = crate::standalone::PortAction::Macro { name: name.clone() };
     match state.act(&event) {
         Ok(()) => {
+            // A macro drives DTR and RTS itself, so what was set from here no
+            // longer says what the lines are.
+            state.forget_signal_lines();
             state.set_status(format!("Ran '{name}'"));
             state.input_mode = InputMode::Normal;
         }
@@ -2247,9 +2260,13 @@ fn render_signals_popup(frame: &mut Frame, state: &AppState) {
     let area = centered_rect(50, 35, frame.area());
     frame.render_widget(ratatui::widgets::Clear, area);
 
-    let row = |label: &str, level: bool, key: char| {
-        let text = if level { "HIGH" } else { "LOW" };
-        let colour = if level { Color::Green } else { Color::DarkGray };
+    let row = |label: &str, level: crate::standalone::SignalLine, key: char| {
+        use crate::standalone::SignalLine;
+        let (text, colour) = match level {
+            SignalLine::High => ("HIGH", Color::Green),
+            SignalLine::Low => ("LOW", Color::DarkGray),
+            SignalLine::Unknown => ("unknown", Color::Yellow),
+        };
         Line::from(vec![
             Span::styled(format!("  {key}  "), Style::default().fg(Color::Cyan)),
             Span::styled(
@@ -2272,11 +2289,11 @@ fn render_signals_popup(frame: &mut Frame, state: &AppState) {
         row("RTS", state.rts_state, 'r'),
         Line::from(""),
         Line::from(Span::styled(
-            "The levels shown are the ones last set from here.",
+            "The levels shown are the ones last set from here; after a macro, or when",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "The hardware cannot be read back.",
+            "the port was taken back, a line is unknown. The hardware cannot be read back.",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -2642,12 +2659,15 @@ mod tests {
 
     #[test]
     fn a_control_line_toggles_and_reports_its_level() {
+        use crate::standalone::SignalLine;
         let mut state = AppState::new("/dev/x", &PortConfig::default());
-        assert!(!ControlLine::Dtr.level(&state));
+        assert_eq!(ControlLine::Dtr.level(&state), SignalLine::Unknown);
         ControlLine::Dtr.record(&mut state, true);
-        assert!(ControlLine::Dtr.level(&state));
+        assert_eq!(ControlLine::Dtr.level(&state), SignalLine::High);
+        ControlLine::Dtr.record(&mut state, false);
+        assert_eq!(ControlLine::Dtr.level(&state), SignalLine::Low);
         // The two lines are independent.
-        assert!(!ControlLine::Rts.level(&state));
+        assert_eq!(ControlLine::Rts.level(&state), SignalLine::Unknown);
     }
 
     #[test]
@@ -2674,7 +2694,77 @@ mod tests {
         // the hardware never took.
         let mut state = AppState::new("/dev/x", &PortConfig::default());
         handle_signals_key(&mut state, KeyCode::Char('d'));
-        assert!(!state.dtr_state, "a refused action must not be recorded");
+        assert_eq!(
+            state.dtr_state,
+            crate::standalone::SignalLine::Unknown,
+            "a refused action must not be recorded"
+        );
+    }
+
+    /// A macro drives DTR and RTS itself, so the screen stops claiming a level
+    /// after one that ran. A macro that failed changed nothing, so it keeps
+    /// what was known.
+    #[test]
+    fn a_macro_makes_the_lines_unknown_and_a_failed_one_does_not() {
+        use crate::standalone::SignalLine;
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.macro_names = vec!["reset".to_string()];
+        state.action = Some(Arc::new(|_| Ok(())));
+        ControlLine::Dtr.record(&mut state, true);
+        ControlLine::Rts.record(&mut state, false);
+        handle_macros_key(&mut state, KeyCode::Char('1'));
+        assert_eq!(state.dtr_state, SignalLine::Unknown);
+        assert_eq!(state.rts_state, SignalLine::Unknown);
+
+        // Counter-probe: a macro the daemon refused leaves the lines as known.
+        state.action = Some(Arc::new(|_| Err("refused".to_string())));
+        ControlLine::Dtr.record(&mut state, true);
+        handle_macros_key(&mut state, KeyCode::Char('1'));
+        assert_eq!(state.dtr_state, SignalLine::High);
+    }
+
+    /// A port taken back is opened as the system sets its lines.
+    #[test]
+    fn taking_the_port_back_makes_the_lines_unknown() {
+        use crate::standalone::SignalLine;
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.toggle = Some(Arc::new(|_, _| Ok(())));
+        ControlLine::Dtr.record(&mut state, true);
+        state.toggle_connection(&PortConfig::default());
+        assert_eq!(state.dtr_state, SignalLine::Unknown);
+
+        // Counter-probe: a switch that failed did not change hands.
+        state.toggle = Some(Arc::new(|_, _| Err("busy".to_string())));
+        ControlLine::Dtr.record(&mut state, true);
+        state.toggle_connection(&PortConfig::default());
+        assert_eq!(state.dtr_state, SignalLine::High);
+    }
+
+    /// The screen says what it does not know.
+    #[test]
+    fn the_signals_screen_says_unknown_until_a_line_is_set() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        let draw = |state: &AppState| {
+            let backend = ratatui::backend::TestBackend::new(110, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_signals_popup(frame, state))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+        let text = draw(&state);
+        assert!(text.contains("DTR  unknown"), "{text}");
+        assert!(text.contains("RTS  unknown"), "{text}");
+        ControlLine::Dtr.record(&mut state, true);
+        let text = draw(&state);
+        assert!(text.contains("DTR  HIGH"), "{text}");
+        assert!(text.contains("RTS  unknown"), "{text}");
     }
 
     #[test]
