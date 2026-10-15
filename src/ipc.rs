@@ -703,7 +703,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, IpcError::Remote(_)));
-        assert!(err.to_string().contains("not found"));
+        assert!(err.to_string().contains("is not open"));
         let _ = h.shutdown.send(());
     }
 
