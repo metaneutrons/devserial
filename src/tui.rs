@@ -155,6 +155,32 @@ enum InputMode {
     SkillOffer,
     /// Asking before the stored capture of the port is emptied.
     ClearCapture,
+    /// A line is marked, so the lines above or below it can be deleted.
+    Lines,
+    /// Asking before the lines on one side of the marked line are deleted.
+    DeleteLines,
+}
+
+/// A line on screen, with its place in the capture when it has one.
+///
+/// A line the terminal wrote itself, such as a marker, has no id until the
+/// capture is read again, and cannot be marked.
+#[derive(Debug)]
+struct TuiLine {
+    id: Option<i64>,
+    timestamp: String,
+    payload: String,
+}
+
+/// The question before the lines on one side of a line are deleted.
+struct DeleteQuestion {
+    side: crate::standalone::LineSide,
+    /// The last id this screen had seen, which ends a deletion below the line.
+    through: i64,
+    /// The text of the line pointed at, so the question can show it.
+    line: String,
+    /// How many lines would go, or why that could not be told.
+    count: Result<u64, String>,
 }
 
 // DTR and RTS join the view toggles here. They are separate switches with
@@ -162,8 +188,12 @@ enum InputMode {
 // simplify.
 #[allow(clippy::struct_excessive_bools)]
 struct AppState {
-    lines: std::collections::VecDeque<(String, String)>,
+    lines: std::collections::VecDeque<TuiLine>,
     last_id: i64,
+    /// The capture id of the marked line while lines are being picked.
+    mark: Option<i64>,
+    /// What is asked before lines are deleted around the marked one.
+    delete_question: Option<DeleteQuestion>,
     scroll_offset: usize,
     auto_follow: bool,
     input: String,
@@ -477,6 +507,187 @@ impl AppState {
         }
     }
 
+    /// Start picking a line. The mark begins on the last line of the view that
+    /// is in the capture, and the view stops following the end.
+    fn begin_lines(&mut self, visible: usize) {
+        if self.capture.is_none() {
+            self.set_status("No daemon behind this screen, so lines cannot be deleted here");
+            return;
+        }
+        let Some(last) = self.shown().iter().rev().find_map(|line| line.id) else {
+            self.set_status("No line of the capture is on screen to point at");
+            return;
+        };
+        self.mark = Some(last);
+        self.auto_follow = false;
+        self.input_mode = InputMode::Lines;
+        self.keep_mark_in_view(visible);
+        self.set_status("Up/Down moves the mark, a deletes above it, b below it, Esc leaves");
+    }
+
+    /// Stop picking a line.
+    fn end_lines(&mut self) {
+        self.mark = None;
+        self.delete_question = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Where the marked line is among the lines shown, as an index into them.
+    fn mark_position(&self, shown: &[&TuiLine]) -> Option<usize> {
+        let mark = self.mark?;
+        shown
+            .iter()
+            .position(|line| line.id == Some(mark))
+            .or_else(|| {
+                // A filter can hide the marked line. The nearest line that is
+                // shown stands in for it, so the keys still lead somewhere.
+                shown
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| Some((index, line.id?)))
+                    .min_by_key(|(_, id)| id.abs_diff(mark))
+                    .map(|(index, _)| index)
+            })
+    }
+
+    /// Move the mark over the lines that are shown and have an id. `steps` is
+    /// how many such lines to move by, negative towards older lines.
+    fn move_mark(&mut self, steps: isize, visible: usize) {
+        let shown = self.shown();
+        let stored: Vec<(usize, i64)> = shown
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| Some((index, line.id?)))
+            .collect();
+        let Some(current) = self.mark_position(&shown) else {
+            return;
+        };
+        let at = stored
+            .iter()
+            .position(|(index, _)| *index == current)
+            .unwrap_or(0);
+        let target = at
+            .saturating_add_signed(steps)
+            .min(stored.len().saturating_sub(1));
+        let Some((_, id)) = stored.get(target).copied() else {
+            return;
+        };
+        drop(shown);
+        self.mark = Some(id);
+        self.keep_mark_in_view(visible);
+    }
+
+    /// Scroll just far enough that the marked line is on screen.
+    fn keep_mark_in_view(&mut self, visible: usize) {
+        let shown = self.shown();
+        let Some(position) = self.mark_position(&shown) else {
+            return;
+        };
+        let height = shown.len();
+        drop(shown);
+        if position < self.scroll_offset {
+            self.scroll_offset = position;
+        } else if position >= self.scroll_offset + visible.max(1) {
+            self.scroll_offset = position + 1 - visible.max(1);
+        }
+        self.scroll_offset = self.scroll_offset.min(height.saturating_sub(1));
+    }
+
+    /// Count the lines on one side of the marked line and show the question.
+    fn begin_delete_lines(&mut self, above: bool) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest, LineSide};
+        let (Some(control), Some(mark)) = (self.capture.clone(), self.mark) else {
+            return;
+        };
+        let side = if above {
+            LineSide::Above(mark)
+        } else {
+            LineSide::Below(mark)
+        };
+        // A deletion below the line stops at the last line seen now, so lines
+        // that arrive while the question is open are not taken.
+        let through = self.last_id;
+        let count = match control(CaptureRequest::Delete {
+            side,
+            through: (!above).then_some(through),
+            archive: false,
+            dry_run: true,
+        }) {
+            Ok(CaptureAnswer::Deleted { lines, .. }) => Ok(lines),
+            Ok(_) => Err("unexpected answer from the daemon".to_string()),
+            Err(e) => Err(e),
+        };
+        let line = self
+            .lines
+            .iter()
+            .find(|line| line.id == Some(mark))
+            .map(|line| line.payload.clone())
+            .unwrap_or_default();
+        self.delete_question = Some(DeleteQuestion {
+            side,
+            through,
+            line,
+            count,
+        });
+        self.input_mode = InputMode::DeleteLines;
+    }
+
+    /// Leave the question without deleting anything. The mark stays.
+    fn cancel_delete_lines(&mut self) {
+        self.delete_question = None;
+        self.input_mode = InputMode::Lines;
+    }
+
+    /// Delete the lines, with or without a copy first, and say what happened.
+    fn answer_delete_lines(&mut self, archive: bool) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest, LineSide};
+        let deletable = matches!(
+            self.delete_question,
+            Some(DeleteQuestion { count: Ok(lines), .. }) if lines > 0
+        );
+        let Some(control) = self.capture.clone().filter(|_| deletable) else {
+            return;
+        };
+        let Some(question) = self.delete_question.take() else {
+            return;
+        };
+        let below = matches!(question.side, LineSide::Below(_));
+        match control(CaptureRequest::Delete {
+            side: question.side,
+            through: below.then_some(question.through),
+            archive,
+            dry_run: false,
+        }) {
+            Ok(CaptureAnswer::Deleted {
+                lines: deleted,
+                archive: copy,
+                ..
+            }) => {
+                match question.side {
+                    LineSide::Above(id) => self
+                        .lines
+                        .retain(|line| line.id.is_none_or(|own| own >= id)),
+                    LineSide::Below(id) => self.lines.retain(|line| {
+                        line.id
+                            .is_none_or(|own| own <= id || own > question.through)
+                    }),
+                }
+                self.scroll_offset = self.scroll_offset.min(self.shown().len().saturating_sub(1));
+                let copy = copy.map_or_else(String::new, |path| format!(", copy in {path}"));
+                self.end_lines();
+                self.set_status(format!("Deleted {deleted} lines{copy}"));
+            }
+            Ok(_) => {
+                self.input_mode = InputMode::Lines;
+                self.set_status("Deleting lines: unexpected answer from the daemon");
+            }
+            Err(e) => {
+                self.input_mode = InputMode::Lines;
+                self.set_status(format!("Deleting lines failed: {e}"));
+            }
+        }
+    }
+
     /// The user asked to quit. Returns whether to leave now, or `false` when
     /// the question about the daemon is shown first (#114).
     fn request_quit(&mut self) -> bool {
@@ -600,6 +811,8 @@ impl AppState {
             link: None,
             lines: std::collections::VecDeque::new(),
             last_id: 0,
+            mark: None,
+            delete_question: None,
             scroll_offset: 0,
             auto_follow: true,
             input: String::new(),
@@ -626,13 +839,13 @@ impl AppState {
     ///
     /// The buffer itself is never filtered. A filter narrows what is on screen
     /// and is taken back by clearing it, so nothing captured is lost.
-    fn shown(&self) -> Vec<&(String, String)> {
+    fn shown(&self) -> Vec<&TuiLine> {
         if self.filter.is_empty() {
             return self.lines.iter().collect();
         }
         self.lines
             .iter()
-            .filter(|(_, payload)| payload.contains(&self.filter))
+            .filter(|line| line.payload.contains(&self.filter))
             .collect()
     }
 
@@ -755,7 +968,15 @@ impl AppState {
     }
 
     fn push_line(&mut self, timestamp: String, payload: String) {
-        self.lines.push_back((timestamp, payload));
+        self.push_stored(None, timestamp, payload);
+    }
+
+    fn push_stored(&mut self, id: Option<i64>, timestamp: String, payload: String) {
+        self.lines.push_back(TuiLine {
+            id,
+            timestamp,
+            payload,
+        });
         while self.lines.len() > MAX_VISIBLE_LINES {
             self.lines.pop_front();
             self.scroll_offset = self.scroll_offset.saturating_sub(1);
@@ -816,7 +1037,7 @@ fn run_app(
         for line in fetched.into_iter().flatten() {
             let ts = crate::export::format_time_of_day(line.timestamp_ns);
             state.last_id = line.id;
-            state.push_line(ts, line.payload);
+            state.push_stored(Some(line.id), ts, line.payload);
         }
 
         if state.auto_follow && !state.shown().is_empty() {
@@ -908,6 +1129,15 @@ fn run_app(
                 }
                 KeyCode::Char('x') if state.input_mode == InputMode::Normal => {
                     state.begin_clear_capture();
+                    continue;
+                }
+                KeyCode::Char('g') if state.input_mode == InputMode::Normal => {
+                    let visible = terminal.size()?.height.saturating_sub(6) as usize;
+                    state.begin_lines(visible);
+                    continue;
+                }
+                KeyCode::Char('g') if state.input_mode == InputMode::Lines => {
+                    state.end_lines();
                     continue;
                 }
                 KeyCode::Char('l') => {
@@ -1075,6 +1305,36 @@ fn run_app(
                 KeyCode::Char('a') => state.answer_clear_capture(storage, true),
                 KeyCode::Char('d') => state.answer_clear_capture(storage, false),
                 KeyCode::Esc => state.cancel_clear_capture(),
+                _ => {}
+            }
+            continue;
+        }
+
+        if state.input_mode == InputMode::DeleteLines {
+            // As with the whole capture: deleting takes a letter of its own,
+            // Enter and every other key do nothing.
+            match key.code {
+                KeyCode::Char('a') => state.answer_delete_lines(true),
+                KeyCode::Char('d') => state.answer_delete_lines(false),
+                KeyCode::Esc => state.cancel_delete_lines(),
+                _ => {}
+            }
+            continue;
+        }
+
+        if state.input_mode == InputMode::Lines {
+            let visible = terminal.size()?.height.saturating_sub(6) as usize;
+            let page = isize::try_from(visible.max(2) - 1).unwrap_or(1);
+            match key.code {
+                KeyCode::Up => state.move_mark(-1, visible),
+                KeyCode::Down => state.move_mark(1, visible),
+                KeyCode::PageUp => state.move_mark(-page, visible),
+                KeyCode::PageDown => state.move_mark(page, visible),
+                KeyCode::Home => state.move_mark(isize::MIN / 2, visible),
+                KeyCode::End => state.move_mark(isize::MAX / 2, visible),
+                KeyCode::Char('a') => state.begin_delete_lines(true),
+                KeyCode::Char('b') => state.begin_delete_lines(false),
+                KeyCode::Esc => state.end_lines(),
                 _ => {}
             }
             continue;
@@ -1623,7 +1883,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Normal => (
             "> ",
             format!(
-                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | F8 color | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F9 daemon | F1 about | Ctrl+C quit ",
+                " Enter send | Ctrl+P/N history | F2 config | F3 signals | F5 macros | F6 flash | F8 color | Ctrl+F filter | Ctrl+E export | Ctrl+L clear | Ctrl+G lines | Ctrl+K connect | Ctrl+B break | Ctrl+S/R file | Ctrl+T time ({}) | Ctrl+H hex | F7 rest | F9 daemon | F1 about | Ctrl+C quit ",
                 crate::export::DISPLAY_ZONE_NOTE
             ),
         ),
@@ -1652,6 +1912,12 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::Daemon => ("Idle period: ", daemon_title(state)),
         InputMode::QuitDaemon => ("", " Quit ".to_string()),
         InputMode::ClearCapture => ("", " Clear capture ".to_string()),
+        InputMode::Lines => (
+            "",
+            " Up/Down/PgUp/PgDn/Home/End move the mark | a delete the lines above | b delete the lines below | Esc leave "
+                .to_string(),
+        ),
+        InputMode::DeleteLines => ("", " Delete lines ".to_string()),
         InputMode::SkillOffer => ("", " AI tools ".to_string()),
         #[cfg(feature = "esp")]
         InputMode::Flash => ("Firmware: ", flash_title(state)),
@@ -1920,10 +2186,10 @@ fn gather_export_lines(
             .shown()
             .iter()
             .enumerate()
-            .map(|(index, (_, payload))| crate::storage::StoredLine {
+            .map(|(index, line)| crate::storage::StoredLine {
                 id: i64::try_from(index + 1).unwrap_or(i64::MAX),
                 timestamp_ns: 0,
-                payload: payload.clone(),
+                payload: line.payload.clone(),
             })
             .collect());
     }
@@ -2032,7 +2298,8 @@ fn render(frame: &mut Frame, state: &AppState) {
         .iter()
         .skip(state.scroll_offset)
         .take(end.saturating_sub(state.scroll_offset))
-        .map(|(timestamp, payload)| {
+        .map(|line| {
+            let (timestamp, payload) = (&line.timestamp, &line.payload);
             let body = payload_text(payload, state.hex_view);
             let tone = if state.hex_view {
                 Tone::Plain
@@ -2056,6 +2323,14 @@ fn render(frame: &mut Frame, state: &AppState) {
                 Style::default()
             };
             spans.push(Span::styled(body, style));
+            let marked =
+                state.input_mode != InputMode::Normal && line.id.is_some() && line.id == state.mark;
+            if marked {
+                // The arrow is for a terminal without colour, which would show
+                // no difference between this line and the others.
+                spans.insert(0, Span::raw("▶ "));
+                return Line::from(spans).style(Style::default().add_modifier(Modifier::REVERSED));
+            }
             Line::from(spans)
         })
         .collect();
@@ -2085,6 +2360,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         InputMode::Flash => render_flash_popup(frame, state),
         InputMode::QuitDaemon => render_quit_daemon_popup(frame, state),
         InputMode::ClearCapture => render_clear_capture_popup(frame, state),
+        InputMode::DeleteLines => render_delete_lines_popup(frame, state),
         InputMode::SkillOffer => render_skill_offer_popup(frame, state),
         _ => {}
     }
@@ -2119,6 +2395,60 @@ fn render_quit_daemon_popup(frame: &mut Frame, state: &AppState) {
 }
 
 /// The question before the capture is emptied, and the letters that answer it.
+/// The question before the lines on one side of a line are deleted: how many
+/// go, which line is pointed at, and the three answers.
+fn render_delete_lines_popup(frame: &mut Frame, state: &AppState) {
+    use crate::standalone::LineSide;
+    let area = centered_rect(66, 50, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let mut lines = Vec::new();
+    let mut deletable = false;
+    if let Some(question) = &state.delete_question {
+        let (word, id) = match question.side {
+            LineSide::Above(id) => ("above", id),
+            LineSide::Below(id) => ("below", id),
+        };
+        match &question.count {
+            Ok(0) => lines.push(Line::from(format!("There is no line {word} this one."))),
+            Ok(count) => {
+                deletable = true;
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "Delete the {count} lines {word} line {id} of {}?",
+                        state.port_name
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from("It is the record of what the device sent. Once"));
+                lines.push(Line::from("deleted it can only come back from the copy."));
+            }
+            Err(e) => lines.push(Line::from(format!("The lines could not be counted: {e}"))),
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "The line itself stays: {}",
+            question.line
+        )));
+    }
+    lines.push(Line::from(""));
+    if deletable {
+        lines.push(Line::from(
+            "a  copy the capture to the archive folder, then delete",
+        ));
+        lines.push(Line::from("d  delete without a copy"));
+    }
+    lines.push(Line::from("Esc  keep them"));
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Delete lines "),
+        ),
+        area,
+    );
+}
+
 fn render_clear_capture_popup(frame: &mut Frame, state: &AppState) {
     let area = centered_rect(66, 45, frame.area());
     frame.render_widget(ratatui::widgets::Clear, area);
@@ -2528,7 +2858,7 @@ mod tests {
         }
         assert_eq!(state.lines.len(), MAX_VISIBLE_LINES);
         assert_eq!(
-            state.lines.back().unwrap().1,
+            state.lines.back().unwrap().payload,
             format!("line {}", MAX_VISIBLE_LINES + 99)
         );
     }
@@ -2621,7 +2951,11 @@ mod tests {
     fn a_filter_narrows_the_view_without_touching_the_buffer() {
         let mut state = with_lines(&["boot", "ready", "error 7", "error 9"]);
         state.filter = "error".to_string();
-        let shown: Vec<&str> = state.shown().iter().map(|(_, p)| p.as_str()).collect();
+        let shown: Vec<&str> = state
+            .shown()
+            .iter()
+            .map(|line| line.payload.as_str())
+            .collect();
         assert_eq!(shown, ["error 7", "error 9"]);
         // The record is untouched, so clearing the filter brings it all back.
         assert_eq!(state.lines.len(), 4);
@@ -2900,6 +3234,7 @@ mod tests {
             "F5 macros",
             "Ctrl+F filter",
             "Ctrl+L clear",
+            "Ctrl+G lines",
             "Ctrl+K connect",
             "Ctrl+B break",
             "Ctrl+T time",
@@ -3324,5 +3659,351 @@ mod clear_capture_tests {
         state.begin_clear_capture();
         assert!(state.input_mode == InputMode::Normal);
         assert!(state.status_msg.is_some());
+    }
+}
+
+#[cfg(test)]
+mod delete_lines_tests {
+    use super::*;
+    use crate::standalone::{CaptureAnswer, CaptureRequest, LineSide, fake_capture_control};
+
+    type Asked = Arc<std::sync::Mutex<Vec<CaptureRequest>>>;
+
+    /// A screen showing ids 1 to `count`, as if read from the capture, with a
+    /// daemon that would delete `lines` lines (halved by the fake).
+    fn with_stored(count: i64, lines: u64, fail: bool) -> (AppState, Asked) {
+        let (control, asked) = fake_capture_control(lines, fail);
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.capture = Some(control);
+        for id in 1..=count {
+            state.last_id = id;
+            state.push_stored(Some(id), format!("12:00:{id:02}"), format!("line {id}"));
+        }
+        (state, asked)
+    }
+
+    fn marked(state: &AppState) -> Option<i64> {
+        state.mark
+    }
+
+    #[test]
+    fn the_mark_starts_on_the_last_stored_line_and_stops_the_follow() {
+        let (mut state, _) = with_stored(5, 10, false);
+        state.push_line("12:00:09".into(), "a marker with no id".into());
+        state.begin_lines(10);
+        assert!(state.input_mode == InputMode::Lines);
+        assert_eq!(
+            marked(&state),
+            Some(5),
+            "a line without an id cannot be marked"
+        );
+        assert!(!state.auto_follow);
+    }
+
+    #[test]
+    fn the_arrows_move_the_mark_over_stored_lines_and_stop_at_the_ends() {
+        let (mut state, _) = with_stored(5, 10, false);
+        state.push_line("12:00:09".into(), "no id".into());
+        state.begin_lines(10);
+        state.move_mark(-1, 10);
+        assert_eq!(marked(&state), Some(4));
+        state.move_mark(-100, 10);
+        assert_eq!(marked(&state), Some(1));
+        state.move_mark(1, 10);
+        assert_eq!(marked(&state), Some(2));
+        state.move_mark(100, 10);
+        assert_eq!(
+            marked(&state),
+            Some(5),
+            "the line with no id is passed over"
+        );
+    }
+
+    #[test]
+    fn the_view_follows_the_mark() {
+        let (mut state, _) = with_stored(30, 10, false);
+        state.begin_lines(5);
+        assert_eq!(
+            state.scroll_offset, 25,
+            "the last line is the bottom of the view"
+        );
+        state.move_mark(-10, 5);
+        assert_eq!(marked(&state), Some(20));
+        assert_eq!(state.scroll_offset, 19);
+    }
+
+    #[test]
+    fn the_mark_is_the_id_of_the_capture_not_the_place_in_the_filtered_view() {
+        let (mut state, asked) = with_stored(6, 10, false);
+        state.filter = "line 2".to_string();
+        // Only line 2 is shown now, at place 0, but it is id 2.
+        state.begin_lines(10);
+        assert_eq!(marked(&state), Some(2));
+        state.begin_delete_lines(true);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![CaptureRequest::Delete {
+                side: LineSide::Above(2),
+                through: None,
+                archive: false,
+                dry_run: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_hidden_mark_is_stood_in_for_by_the_nearest_shown_line() {
+        let (mut state, _) = with_stored(6, 10, false);
+        state.begin_lines(10);
+        state.move_mark(-1, 10);
+        assert_eq!(marked(&state), Some(5));
+        state.filter = "line 2".to_string();
+        state.move_mark(1, 10);
+        assert_eq!(marked(&state), Some(2), "line 2 is the only one shown");
+    }
+
+    #[test]
+    fn the_question_counts_first_and_deletes_nothing() {
+        let (mut state, asked) = with_stored(8, 10, false);
+        state.begin_lines(10);
+        state.move_mark(-3, 10);
+        state.begin_delete_lines(true);
+        assert!(state.input_mode == InputMode::DeleteLines);
+        let question = state.delete_question.as_ref().expect("a question");
+        assert_eq!(question.count, Ok(5));
+        assert_eq!(question.line, "line 5");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![CaptureRequest::Delete {
+                side: LineSide::Above(5),
+                through: None,
+                archive: false,
+                dry_run: true,
+            }]
+        );
+
+        // Leaving it deletes nothing, keeps the screen and the mark.
+        state.cancel_delete_lines();
+        assert!(state.input_mode == InputMode::Lines);
+        assert_eq!(marked(&state), Some(5));
+        assert_eq!(state.lines.len(), 8);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_deletion_below_the_line_stops_at_the_last_line_seen() {
+        let (mut state, asked) = with_stored(8, 10, false);
+        state.begin_lines(10);
+        state.move_mark(-3, 10);
+        state.begin_delete_lines(false);
+        // The capture goes on while the question is open.
+        state.last_id = 9;
+        state.push_stored(Some(9), "12:00:09".into(), "line 9".into());
+        state.answer_delete_lines(true);
+
+        let asked = asked.lock().unwrap();
+        assert_eq!(
+            asked[0],
+            CaptureRequest::Delete {
+                side: LineSide::Below(5),
+                through: Some(8),
+                archive: false,
+                dry_run: true,
+            }
+        );
+        assert_eq!(
+            asked[1],
+            CaptureRequest::Delete {
+                side: LineSide::Below(5),
+                through: Some(8),
+                archive: true,
+                dry_run: false,
+            },
+            "the deletion ends at line 8 although line 9 has arrived"
+        );
+        let kept: Vec<Option<i64>> = state.lines.iter().map(|line| line.id).collect();
+        assert_eq!(
+            kept,
+            [Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)],
+            "lines 6 to 8 leave the screen, the marked line and the later one stay"
+        );
+        assert!(state.input_mode == InputMode::Normal);
+        assert_eq!(marked(&state), None);
+    }
+
+    #[test]
+    fn a_deletion_above_the_line_asks_for_exactly_the_copy_or_none() {
+        for archive in [true, false] {
+            let (mut state, asked) = with_stored(8, 10, false);
+            state.begin_lines(10);
+            state.move_mark(-3, 10);
+            state.begin_delete_lines(true);
+            state.answer_delete_lines(archive);
+            assert_eq!(
+                asked.lock().unwrap()[1],
+                CaptureRequest::Delete {
+                    side: LineSide::Above(5),
+                    through: None,
+                    archive,
+                    dry_run: false,
+                }
+            );
+            let kept: Vec<Option<i64>> = state.lines.iter().map(|line| line.id).collect();
+            assert_eq!(
+                kept,
+                [Some(5), Some(6), Some(7), Some(8)],
+                "line 5 itself stays"
+            );
+            let (status, _) = state.status_msg.clone().expect("a status");
+            assert_eq!(status.contains("copy in"), archive, "{status}");
+        }
+    }
+
+    #[test]
+    fn a_line_without_an_id_stays_on_screen() {
+        let (mut state, _) = with_stored(4, 10, false);
+        state.push_line("12:00:09".into(), "no id".into());
+        state.begin_lines(10);
+        state.begin_delete_lines(true);
+        state.answer_delete_lines(false);
+        assert!(state.lines.iter().any(|line| line.id.is_none()));
+    }
+
+    #[test]
+    fn nothing_to_delete_offers_nothing() {
+        let (mut state, asked) = with_stored(4, 0, false);
+        state.begin_lines(10);
+        state.begin_delete_lines(true);
+        state.answer_delete_lines(true);
+        assert_eq!(asked.lock().unwrap().len(), 1, "only the count was asked");
+        assert!(state.input_mode == InputMode::DeleteLines);
+        assert_eq!(state.lines.len(), 4);
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_screen_stays() {
+        let (mut state, _) = with_stored(8, 10, true);
+        state.begin_lines(10);
+        state.begin_delete_lines(true);
+        assert!(matches!(
+            state.delete_question,
+            Some(DeleteQuestion { count: Err(_), .. })
+        ));
+        // A count that failed leaves nothing to confirm.
+        state.answer_delete_lines(true);
+        assert_eq!(state.lines.len(), 8);
+    }
+
+    #[test]
+    fn a_failed_deletion_does_not_trim_the_screen() {
+        let (mut state, _) = with_stored(8, 10, false);
+        state.begin_lines(10);
+        state.begin_delete_lines(true);
+        // The daemon refuses from now on, after having counted.
+        let (control, _) = fake_capture_control(10, true);
+        state.capture = Some(control);
+        state.answer_delete_lines(true);
+        assert_eq!(
+            state.lines.len(),
+            8,
+            "a failed deletion must not empty the view"
+        );
+        assert!(state.input_mode == InputMode::Lines);
+        let (status, _) = state.status_msg.clone().expect("a status");
+        assert!(status.contains("failed"), "{status}");
+    }
+
+    #[test]
+    fn without_a_daemon_or_a_stored_line_no_mark_is_set() {
+        let mut state = AppState::new("/dev/x", &PortConfig::default());
+        state.push_stored(Some(1), "12:00:00".into(), "line".into());
+        state.begin_lines(10);
+        assert!(state.input_mode == InputMode::Normal, "no daemon behind it");
+
+        let (control, _) = fake_capture_control(1, false);
+        state.capture = Some(control);
+        state.lines.clear();
+        state.push_line("12:00:01".into(), "no id".into());
+        state.begin_lines(10);
+        assert!(state.input_mode == InputMode::Normal, "nothing to point at");
+        assert!(state.status_msg.is_some());
+    }
+
+    /// What a frame of the screen shows, row by row.
+    fn drawn(state: &AppState) -> String {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(110, 24)).expect("terminal");
+        terminal.draw(|frame| render(frame, state)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_marked_line_is_drawn_with_an_arrow_and_the_question_with_its_count() {
+        let (mut state, _) = with_stored(8, 10, false);
+        state.begin_lines(18);
+        state.move_mark(-3, 18);
+        let screen = drawn(&state);
+        let marked: Vec<&str> = screen.lines().filter(|row| row.contains("▶")).collect();
+        assert_eq!(marked.len(), 1, "{screen}");
+        assert!(marked[0].contains("line 5"), "{}", marked[0]);
+        assert!(screen.contains("Ctrl+G") || screen.contains("a delete the lines above"));
+
+        state.begin_delete_lines(true);
+        let screen = drawn(&state);
+        assert!(
+            screen.contains("Delete the 5 lines above line 5"),
+            "{screen}"
+        );
+        assert!(screen.contains("The line itself stays: line 5"), "{screen}");
+        assert!(screen.contains("a  copy the capture"), "{screen}");
+
+        // Nothing to delete: no letter to delete with is offered.
+        let (mut empty, _) = with_stored(4, 0, false);
+        empty.begin_lines(18);
+        empty.begin_delete_lines(false);
+        let screen = drawn(&empty);
+        assert!(
+            screen.contains("There is no line below this one"),
+            "{screen}"
+        );
+        assert!(!screen.contains("d  delete without a copy"), "{screen}");
+    }
+
+    #[test]
+    fn leaving_takes_the_mark_away() {
+        let (mut state, _) = with_stored(3, 4, false);
+        state.begin_lines(10);
+        state.end_lines();
+        assert!(state.input_mode == InputMode::Normal);
+        assert_eq!(marked(&state), None);
+    }
+
+    #[test]
+    fn the_answer_type_is_what_the_fake_gives_back_for_a_count() {
+        // Pins the fake the tests above rely on: a dry run answers with a
+        // count and no copy.
+        let (control, _) = fake_capture_control(10, false);
+        let answer = control(CaptureRequest::Delete {
+            side: LineSide::Above(3),
+            through: None,
+            archive: true,
+            dry_run: true,
+        });
+        assert!(matches!(
+            answer,
+            Ok(CaptureAnswer::Deleted {
+                lines: 5,
+                archive: None,
+                dry_run: true
+            })
+        ));
     }
 }
