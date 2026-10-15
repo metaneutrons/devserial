@@ -463,6 +463,42 @@ pub fn daemon_control(
     })
 }
 
+/// What a surface knows about a control line (DTR or RTS).
+///
+/// Only its own writes are known. The level of an output line cannot be read
+/// back, and a macro or a freshly opened port sets it without the surface's
+/// say, so the state is unknown until the surface sets it.
+#[cfg(any(feature = "monitor", feature = "tui"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignalLine {
+    /// Not set by this surface since the port was opened or a macro ran.
+    #[default]
+    Unknown,
+    /// Last set low (released) by this surface.
+    Low,
+    /// Last set high (asserted) by this surface.
+    High,
+}
+
+#[cfg(any(feature = "monitor", feature = "tui"))]
+impl SignalLine {
+    /// The state a press asks for: a line that is not known to be high is
+    /// asserted, one that is high is released.
+    #[must_use]
+    pub const fn after_click(self) -> Self {
+        match self {
+            Self::High => Self::Low,
+            Self::Low | Self::Unknown => Self::High,
+        }
+    }
+
+    /// The state after this surface set the line to `high`.
+    #[must_use]
+    pub const fn set(high: bool) -> Self {
+        if high { Self::High } else { Self::Low }
+    }
+}
+
 /// What a surface asks of the capture of the port it shows.
 #[cfg(any(feature = "monitor", feature = "tui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
