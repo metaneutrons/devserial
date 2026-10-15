@@ -4,6 +4,19 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.12...devserial-v0.2.13) (2026-10-15)
+
+
+### Features
+
+* **esp:** flash with the espflash library instead of the tool ([#141](https://github.com/metaneutrons/devserial/issues/141)) ([3f4783b](https://github.com/metaneutrons/devserial/commit/3f4783b053f4f33fb6915bccd8392537d42ac393))
+
+
+### Bug Fixes
+
+* **daemon:** do not warn about a daemon of the same build without git ([#138](https://github.com/metaneutrons/devserial/issues/138)) ([696e57f](https://github.com/metaneutrons/devserial/commit/696e57fb362c71b243946f28c895a15d2642348e))
+* **gui:** show DTR and RTS as buttons with a state indicator ([#142](https://github.com/metaneutrons/devserial/issues/142)) ([e6ababd](https://github.com/metaneutrons/devserial/commit/e6ababd355dade29fb7f77fc1ad5d141bd20b0a1))
+
 ## [0.2.12](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.11...devserial-v0.2.12) (2026-10-13)
 
 
