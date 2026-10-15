@@ -4,6 +4,21 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.14](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.13...devserial-v0.2.14) (2026-10-15)
+
+
+### Features
+
+* **daemon:** delete the lines above or below one line, with a copy first ([#147](https://github.com/metaneutrons/devserial/issues/147)) ([67dd8c1](https://github.com/metaneutrons/devserial/commit/67dd8c16d5d0203eabaf11deea3af550ccf174d7))
+* **gui:** ask before the stored capture is cleared, in the window and the terminal ([#146](https://github.com/metaneutrons/devserial/issues/146)) ([50db1ef](https://github.com/metaneutrons/devserial/commit/50db1ef101ed1bcda5c06983c0fab1a3f5205e4f))
+* **gui:** Cmd+F puts the cursor in the filter field ([#144](https://github.com/metaneutrons/devserial/issues/144)) ([7b2d975](https://github.com/metaneutrons/devserial/commit/7b2d9754e0017dbf345e32520a253d89bdc28384))
+* **gui:** delete the lines above or below a line from its context menu ([#148](https://github.com/metaneutrons/devserial/issues/148)) ([0c9de53](https://github.com/metaneutrons/devserial/commit/0c9de532648bb4302c12d0f5f1af1b7e7be2cbba))
+
+
+### Bug Fixes
+
+* **gui:** centre the DTR and RTS indicators on their buttons ([#143](https://github.com/metaneutrons/devserial/issues/143)) ([392d6c1](https://github.com/metaneutrons/devserial/commit/392d6c18456f90349f788b62934e979795dc19e0))
+
 ## [0.2.13](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.12...devserial-v0.2.13) (2026-10-15)
 
 
