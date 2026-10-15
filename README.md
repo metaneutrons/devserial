@@ -283,6 +283,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `Ctrl+F` | Filter the view, `Esc` clears the filter |
 | `Ctrl+L` | Clear the view; the capture on disk is untouched |
 | `Ctrl+X` | Clear the stored capture, after asking: `a` copies it to the archive folder first and clears it, `d` clears it without a copy, `Esc` keeps it. `Enter` does nothing there |
+| `Ctrl+G` | Mark a line of the capture (`↑` `↓` `PgUp` `PgDn` `Home` `End` move the mark, `Esc` or `Ctrl+G` leaves) and delete the lines above it (`a`) or below it (`b`). It asks first, with the count and the line that stays: `a` copies the capture to the archive folder first and deletes, `d` deletes without a copy, `Esc` keeps them, `Enter` does nothing there. A deletion below the line stops at the last line the screen had seen, so lines that arrived meanwhile are not taken. The mark is the line's place in the capture, so it holds under a filter |
 | `Ctrl+E` | Export the capture, format chosen with `↑` `↓` |
 | `Ctrl+S` / `Ctrl+R` | Send or receive a file, protocol chosen with `↑` `↓` |
 | `Ctrl+T` | Show or hide timestamps |

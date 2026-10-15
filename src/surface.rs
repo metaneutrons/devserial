@@ -200,6 +200,7 @@ pub const TUI: &[(Capability, &str)] = &[
     (Capability::LineEnding, "state.line_ending.suffix()"),
     (Capability::ToggleConnection, "fn toggle_connection"),
     (Capability::TransferProtocol, "fn transfer_title"),
+    (Capability::DeleteLines, "fn render_delete_lines_popup"),
     (Capability::Export, "fn run_export"),
     (Capability::FlashFirmware, "fn start_flash"),
     #[cfg(feature = "rest")]
@@ -220,12 +221,12 @@ pub const TUI: &[(Capability, &str)] = &[
 /// therefore fails the test until it is either built for the terminal too or
 /// written down here on purpose.
 ///
-/// **The list held ten entries on 6 September 2026 and was worked off the same
-/// day.** One entry has been added since, on purpose: deleting the lines around
-/// a line (15 October 2026), which needs a line to point at, and the terminal
-/// has no cursor on a line. Anything added here is debt and should carry a
-/// reason worth reading, because the alternative is building it for both
-/// surfaces.
+/// **The list is empty.** It held ten entries on 6 September 2026 and was
+/// worked off the same day. One entry was added on 15 October 2026, on purpose:
+/// deleting the lines around a line, for which the terminal had no cursor on a
+/// line. It was removed again when the terminal got one (`Ctrl+G`). Anything
+/// added here from now on is debt and should carry a reason worth reading,
+/// because the alternative is building it for both surfaces.
 ///
 /// One limit of the mechanism, so nobody mistakes it for more than it is: the
 /// anchors are searched in the source text and cannot see `cfg` attributes.
@@ -233,10 +234,7 @@ pub const TUI: &[(Capability, &str)] = &[
 /// `esp` feature in both surfaces, and a build without it has the capability
 /// in neither.
 #[cfg(all(feature = "monitor", feature = "tui"))]
-pub const KNOWN_GAPS: &[(Capability, &str)] = &[(
-    Capability::DeleteLines,
-    "the terminal has no line cursor: nothing there points at one line, and a deletion around a line needs one. The capture can be emptied there, and `devserial delete` does the rest from the command line.",
-)];
+pub const KNOWN_GAPS: &[(Capability, &str)] = &[];
 
 #[cfg(all(test, feature = "monitor", feature = "tui"))]
 mod tests {
@@ -308,6 +306,21 @@ mod tests {
         assert!(
             closed.is_empty(),
             "the terminal has {closed:?} now, so remove those from KNOWN_GAPS."
+        );
+    }
+
+    #[test]
+    fn the_terminal_does_everything_the_window_does() {
+        // The plain statement, so a reader of this file does not have to
+        // derive it from an empty ledger.
+        assert_eq!(
+            named(GUI),
+            named(TUI),
+            "the two surfaces have drifted apart again"
+        );
+        assert!(
+            KNOWN_GAPS.is_empty(),
+            "the ledger has entries but the surfaces agree, so remove them"
         );
     }
 
