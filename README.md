@@ -272,7 +272,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 |-----|--------|
 | `F1` | About |
 | `F2` | Port settings: baud, data bits, parity, stop bits, flow control, line ending |
-| `F3` | Set DTR and RTS |
+| `F3` | Set DTR and RTS; a line shows `unknown` until it is set from here, and again after a macro or when the port is taken back |
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
 | `F5` | Run a configured macro |
 | `F6` | Flash firmware to an ESP device |
