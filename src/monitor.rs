@@ -262,6 +262,20 @@ struct ClearCaptureQuestion {
     archive: bool,
 }
 
+/// The question before the lines on one side of a line are deleted.
+struct DeleteLinesQuestion {
+    side: crate::standalone::LineSide,
+    /// The last line this window had seen, so that a deletion below a line
+    /// does not take lines that arrived while the question was open.
+    through: Option<i64>,
+    /// The line the deletion is taken around, as the person pointed at it.
+    anchor: String,
+    /// How many lines would go, or why that could not be counted.
+    count: Result<u64, String>,
+    /// Copy the capture to the archive folder first. On unless turned off.
+    archive: bool,
+}
+
 /// Everything the firmware dialog needs to keep between frames.
 ///
 /// One struct rather than a dozen fields on the window, so the whole feature
@@ -871,6 +885,10 @@ struct DisplayLine {
     timestamp_ns: i64,
     payload: String,
     is_sent: bool,
+    /// The line's id in the capture. `None` for what only exists on screen: a
+    /// line sent from here that is not in the capture, or a marker that could
+    /// not be stored.
+    id: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1452,6 +1470,8 @@ pub struct PortMonitorState {
     pub capture: Option<crate::standalone::CaptureControlFn>,
     /// The question before the capture is emptied, while it is open.
     clear_capture: Option<ClearCaptureQuestion>,
+    /// The question before the lines on one side of a line are deleted.
+    delete_lines: Option<DeleteLinesQuestion>,
     /// What quitting does to the daemon, as configured when the window opened.
     pub on_quit: crate::config::OnQuit,
     /// Where a setting saved from this window is written.
@@ -1577,6 +1597,7 @@ impl PortMonitorState {
             daemon: None,
             capture: None,
             clear_capture: None,
+            delete_lines: None,
             on_quit: crate::config::OnQuit::Ask,
             config_file: None,
             build_warning: None,
@@ -1946,6 +1967,7 @@ impl PortMonitorState {
                 timestamp_ns,
                 payload: text.to_string(),
                 is_sent: false,
+                id: None,
             });
         }
     }
@@ -1983,6 +2005,7 @@ impl PortMonitorState {
                         timestamp_ns: line.timestamp_ns,
                         payload: line.payload.clone(),
                         is_sent: false,
+                        id: Some(line.id),
                     });
                 }
                 if !new_lines.is_empty() {
@@ -2078,9 +2101,7 @@ impl PortMonitorState {
             self.render_daemon_dialog(ui.ctx());
         }
 
-        if self.clear_capture.is_some() {
-            self.render_clear_capture(ui.ctx());
-        }
+        self.render_capture_questions(ui.ctx());
 
         // Compute context-aware edit state for macOS menu bar (Cut / Copy / Paste / Select All)
         let focused_id = ui.ctx().memory(egui::Memory::focused);
@@ -4208,6 +4229,7 @@ impl PortMonitorState {
         let has_capture = self.capture.is_some();
         let mut clear_requested = false;
         let mut clear_capture_requested = false;
+        let mut delete_requested: Option<(crate::standalone::LineSide, String)> = None;
         let mut copy_all_requested = false;
 
         let response = scroll.show_rows(ui, row_height, total_rows, |ui, row_range| {
@@ -4290,6 +4312,27 @@ impl PortMonitorState {
                             clear_capture_requested = true;
                             ui.close();
                         }
+                        // Only a line that is in the capture has an id to take
+                        // the lines around.
+                        if let Some(id) = line.id {
+                            let anchor = format!("{} {}", line.timestamp, line.payload);
+                            if ui
+                                .add_enabled(has_capture, egui::Button::new("Delete Lines Above…"))
+                                .clicked()
+                            {
+                                delete_requested =
+                                    Some((crate::standalone::LineSide::Above(id), anchor.clone()));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(has_capture, egui::Button::new("Delete Lines Below…"))
+                                .clicked()
+                            {
+                                delete_requested =
+                                    Some((crate::standalone::LineSide::Below(id), anchor));
+                                ui.close();
+                            }
+                        }
                     });
                 });
             }
@@ -4301,6 +4344,9 @@ impl PortMonitorState {
         }
         if clear_capture_requested {
             self.open_clear_capture();
+        }
+        if let Some((side, anchor)) = delete_requested {
+            self.open_delete_lines(side, anchor);
         }
 
         if copy_all_requested && !self.lines.is_empty() {
@@ -4733,9 +4779,7 @@ impl PortMonitorState {
         };
         let summary = match control(CaptureRequest::Summary) {
             Ok(CaptureAnswer::Summary { lines, bytes }) => Ok((lines, bytes)),
-            Ok(CaptureAnswer::Cleared { .. }) => {
-                Err("unexpected answer from the daemon".to_string())
-            }
+            Ok(_) => Err("unexpected answer from the daemon".to_string()),
             Err(e) => Err(e),
         };
         self.clear_capture = Some(ClearCaptureQuestion {
@@ -4752,6 +4796,179 @@ impl PortMonitorState {
             || ui.input(filter_shortcut_pressed)
         {
             self.focus_filter = true;
+        }
+    }
+
+    /// The questions asked before the capture, or lines of it, are deleted.
+    fn render_capture_questions(&mut self, ctx: &egui::Context) {
+        if self.clear_capture.is_some() {
+            self.render_clear_capture(ctx);
+        }
+        if self.delete_lines.is_some() {
+            self.render_delete_lines(ctx);
+        }
+    }
+
+    /// Count what a deletion around a line would take and open the question.
+    fn open_delete_lines(&mut self, side: crate::standalone::LineSide, anchor: String) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest, LineSide};
+        let Some(control) = self.capture.clone() else {
+            self.settings_status = Some((
+                "No daemon behind this window, so lines cannot be deleted from here.".to_string(),
+                true,
+            ));
+            return;
+        };
+        let through = match side {
+            LineSide::Below(_) if self.last_id != i64::MAX => Some(self.last_id),
+            _ => None,
+        };
+        let count = match control(CaptureRequest::Delete {
+            side,
+            through,
+            archive: false,
+            dry_run: true,
+        }) {
+            Ok(CaptureAnswer::Deleted { lines, .. }) => Ok(lines),
+            Ok(_) => Err("unexpected answer from the daemon".to_string()),
+            Err(e) => Err(e),
+        };
+        self.delete_lines = Some(DeleteLinesQuestion {
+            side,
+            through,
+            anchor,
+            count,
+            archive: true,
+        });
+    }
+
+    /// Close the question without deleting anything.
+    fn cancel_delete_lines(&mut self) {
+        self.delete_lines = None;
+    }
+
+    /// Delete the lines, take them off the screen, and say what happened. A
+    /// failure is reported and the display is left alone.
+    fn confirm_delete_lines(&mut self) {
+        use crate::standalone::{CaptureAnswer, CaptureRequest, LineSide};
+        let Some(question) = self.delete_lines.take() else {
+            return;
+        };
+        let Some(control) = self.capture.clone() else {
+            return;
+        };
+        match control(CaptureRequest::Delete {
+            side: question.side,
+            through: question.through,
+            archive: question.archive,
+            dry_run: false,
+        }) {
+            Ok(CaptureAnswer::Deleted { lines, archive, .. }) => {
+                let (side, through) = (question.side, question.through);
+                self.lines.retain(|line| {
+                    line.id.is_none_or(|id| match side {
+                        LineSide::Above(line_id) => id >= line_id,
+                        LineSide::Below(line_id) => {
+                            id <= line_id || through.is_some_and(|last| id > last)
+                        }
+                    })
+                });
+                self.rebuild_filter();
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {path}"));
+                self.settings_status = Some((format!("Deleted {lines} lines{copy}"), false));
+            }
+            Ok(_) => {
+                self.settings_status =
+                    Some(("unexpected answer from the daemon".to_string(), true));
+            }
+            Err(e) => {
+                self.settings_status = Some((format!("Deleting the lines failed: {e}"), true));
+            }
+        }
+    }
+
+    /// The question before lines are deleted. Cancel has the focus, so Enter
+    /// deletes nothing.
+    fn render_delete_lines(&mut self, ctx: &egui::Context) {
+        let Some(question) = self.delete_lines.as_mut() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let deletable = matches!(question.count, Ok(count) if count > 0);
+        let (side_word, other) = match question.side {
+            crate::standalone::LineSide::Above(_) => ("above", "below"),
+            crate::standalone::LineSide::Below(_) => ("below", "above"),
+        };
+        egui::Window::new(format!("Delete lines — {}", self.port_name))
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(FORM_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_max_width(FORM_WIDTH);
+                match &question.count {
+                    Ok(0) => {
+                        ui.label(format!("There are no lines {side_word} this one."));
+                    }
+                    Ok(count) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Delete the {count} lines {side_word} this one?"
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&question.anchor)
+                                .monospace()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(format!(
+                            "That line and the lines {other} it stay. Once deleted, the \
+                             lines can only come back from the copy."
+                        ));
+                    }
+                    Err(e) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 120, 100),
+                            format!("The lines could not be counted: {e}"),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.add_enabled(
+                    deletable,
+                    egui::Checkbox::new(
+                        &mut question.archive,
+                        "Copy the capture to the archive folder first (recommended)",
+                    ),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel_button = ui.button("Cancel");
+                    if !ui.memory(|m| m.focused().is_some()) {
+                        cancel_button.request_focus();
+                    }
+                    if cancel_button.clicked() {
+                        cancel = true;
+                    }
+                    let delete = egui::Button::new(
+                        egui::RichText::new("Delete lines").color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(180, 50, 50));
+                    if ui.add_enabled(deletable, delete).clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        if cancel {
+            self.cancel_delete_lines();
+        } else if confirm {
+            self.confirm_delete_lines();
         }
     }
 
@@ -4782,7 +4999,7 @@ impl PortMonitorState {
                 self.note(&format!("━━━ CAPTURE CLEARED ({lines} lines{copy}) ━━━"));
                 self.settings_status = Some((format!("Cleared {lines} lines{copy}"), false));
             }
-            Ok(CaptureAnswer::Summary { .. }) => {
+            Ok(_) => {
                 self.settings_status =
                     Some(("unexpected answer from the daemon".to_string(), true));
             }
@@ -4949,6 +5166,7 @@ impl PortMonitorState {
             timestamp_ns,
             payload: input,
             is_sent: true,
+            id: None,
         });
         if self.filter_active {
             self.rebuild_filter();
@@ -5735,6 +5953,7 @@ mod clear_capture_tests {
             timestamp_ns: 1,
             payload: "kept?".to_string(),
             is_sent: false,
+            id: None,
         });
         (monitor, asked)
     }
@@ -5903,5 +6122,176 @@ mod find_tests {
             egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(7)),
             "the text should be selected from start to end"
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_lines_tests {
+    use super::*;
+    use crate::standalone::{CaptureRequest, LineSide, fake_capture_control};
+
+    type Asked = Arc<std::sync::Mutex<Vec<CaptureRequest>>>;
+
+    /// A window showing lines 1 to 6 of a capture, the last seen being 6.
+    fn window(fail: bool) -> (PortMonitorState, Asked) {
+        let (control, asked) = fake_capture_control(10, fail);
+        let mut monitor = PortMonitorState::new(
+            "/dev/ttyTEST".to_string(),
+            "115200 8N1".to_string(),
+            crate::storage::SqliteStorage::open_memory().expect("storage"),
+            Vec::new(),
+            None,
+        );
+        monitor.capture = Some(control);
+        for id in 1..=6 {
+            monitor.push_display_line(DisplayLine {
+                timestamp: "12:00:00.000".to_string(),
+                timestamp_ns: id,
+                payload: format!("line {id}"),
+                is_sent: false,
+                id: Some(id),
+            });
+        }
+        monitor.last_id = 6;
+        (monitor, asked)
+    }
+
+    fn ids(monitor: &PortMonitorState) -> Vec<Option<i64>> {
+        monitor.lines.iter().map(|line| line.id).collect()
+    }
+
+    #[test]
+    fn the_question_counts_first_and_proposes_a_copy() {
+        let (mut monitor, asked) = window(false);
+        monitor.open_delete_lines(LineSide::Above(4), "12:00:00.000 line 4".to_string());
+        let question = monitor.delete_lines.as_ref().expect("a question");
+        assert!(matches!(question.count, Ok(5)), "{:?}", question.count);
+        assert!(
+            question.archive,
+            "the copy is on unless the user turns it off"
+        );
+        // Only a count was asked, and nothing was deleted or copied.
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![CaptureRequest::Delete {
+                side: LineSide::Above(4),
+                through: None,
+                archive: false,
+                dry_run: true,
+            }]
+        );
+        monitor.cancel_delete_lines();
+        assert!(monitor.delete_lines.is_none());
+        assert_eq!(monitor.lines.len(), 6);
+    }
+
+    /// Below a line the deletion ends at the last line this window had seen.
+    #[test]
+    fn below_a_line_ends_at_the_last_line_seen() {
+        let (mut monitor, asked) = window(false);
+        monitor.open_delete_lines(LineSide::Below(2), "x".to_string());
+        assert_eq!(
+            asked.lock().unwrap()[0],
+            CaptureRequest::Delete {
+                side: LineSide::Below(2),
+                through: Some(6),
+                archive: false,
+                dry_run: true,
+            }
+        );
+        // A line that arrived after the question opened is not taken: the
+        // display keeps it even though its id is below the bound's side.
+        monitor.push_display_line(DisplayLine {
+            timestamp: "12:00:01.000".to_string(),
+            timestamp_ns: 7,
+            payload: "arrived later".to_string(),
+            is_sent: false,
+            id: Some(7),
+        });
+        monitor.confirm_delete_lines();
+        assert_eq!(ids(&monitor), vec![Some(1), Some(2), Some(7)]);
+    }
+
+    #[test]
+    fn confirming_deletes_with_the_copy_the_box_says_and_trims_the_display() {
+        for archive in [true, false] {
+            let (mut monitor, asked) = window(false);
+            // A line that is only on screen has no id and stays.
+            monitor.push_display_line(DisplayLine {
+                timestamp: "12:00:00.500".to_string(),
+                timestamp_ns: 0,
+                payload: ">> sent".to_string(),
+                is_sent: true,
+                id: None,
+            });
+            monitor.open_delete_lines(LineSide::Above(4), "x".to_string());
+            monitor.delete_lines.as_mut().unwrap().archive = archive;
+            monitor.confirm_delete_lines();
+            assert_eq!(
+                asked.lock().unwrap().last().cloned(),
+                Some(CaptureRequest::Delete {
+                    side: LineSide::Above(4),
+                    through: None,
+                    archive,
+                    dry_run: false,
+                })
+            );
+            assert!(monitor.delete_lines.is_none());
+            // Lines 4, 5 and 6 stay, and so does the line with no id.
+            assert_eq!(ids(&monitor), vec![Some(4), Some(5), Some(6), None]);
+            let status = monitor.settings_status.clone().expect("a status");
+            assert!(
+                !status.1 && status.0.starts_with("Deleted 5 lines"),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_display_stays() {
+        let (mut monitor, _) = window(true);
+        monitor.open_delete_lines(LineSide::Above(4), "x".to_string());
+        monitor.confirm_delete_lines();
+        let status = monitor.settings_status.clone().expect("a status");
+        assert!(status.1 && status.0.contains("failed"), "{status:?}");
+        assert_eq!(
+            monitor.lines.len(),
+            6,
+            "a failed deletion must not trim the view"
+        );
+    }
+
+    #[test]
+    fn without_a_daemon_no_question_opens() {
+        let (mut monitor, asked) = window(false);
+        monitor.capture = None;
+        monitor.open_delete_lines(LineSide::Above(4), "x".to_string());
+        assert!(monitor.delete_lines.is_none());
+        assert!(monitor.settings_status.as_ref().is_some_and(|s| s.1));
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_question_draws_for_a_count_none_and_an_error() {
+        for count in [Ok(5), Ok(0), Err("no answer".to_string())] {
+            let (mut monitor, asked) = window(false);
+            monitor.delete_lines = Some(DeleteLinesQuestion {
+                side: LineSide::Below(2),
+                through: Some(6),
+                anchor: "12:00:00.000 line 2".to_string(),
+                count,
+                archive: true,
+            });
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                monitor.render_delete_lines(ui.ctx());
+            });
+            output.textures_delta.clear();
+            assert!(
+                monitor.delete_lines.is_some(),
+                "drawing closed the question"
+            );
+            assert!(asked.lock().unwrap().is_empty(), "drawing asked the daemon");
+        }
     }
 }

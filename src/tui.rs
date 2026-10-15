@@ -432,7 +432,7 @@ impl AppState {
         };
         self.capture_summary = Some(match control(CaptureRequest::Summary) {
             Ok(CaptureAnswer::Summary { lines, bytes }) => Ok((lines, bytes)),
-            Ok(CaptureAnswer::Cleared { .. }) => Err("unexpected answer from the daemon".into()),
+            Ok(_) => Err("unexpected answer from the daemon".into()),
             Err(e) => Err(e),
         });
         self.input_mode = InputMode::ClearCapture;
@@ -470,7 +470,7 @@ impl AppState {
                 );
                 self.set_status(format!("Cleared {lines} lines{copy}"));
             }
-            Ok(CaptureAnswer::Summary { .. }) => {
+            Ok(_) => {
                 self.set_status("Clearing the capture: unexpected answer from the daemon");
             }
             Err(e) => self.set_status(format!("Clearing the capture failed: {e}")),

@@ -342,6 +342,7 @@ pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<()
                 port: port.clone(),
                 above,
                 below,
+                through: None,
                 archive_current: Some(!no_archive),
                 dry_run: Some(dry_run),
             })?;

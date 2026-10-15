@@ -683,6 +683,7 @@ impl CommandEngine {
             port,
             above,
             below,
+            through,
             archive_current,
             dry_run,
         } = payload
@@ -695,6 +696,7 @@ impl CommandEngine {
         self.delete_lines(
             &port,
             bound,
+            through,
             archive_current.unwrap_or(true),
             dry_run.unwrap_or(false),
         )
@@ -710,12 +712,13 @@ impl CommandEngine {
         &self,
         port: &str,
         bound: crate::storage::LineBound,
+        through: Option<i64>,
         archive: bool,
         dry_run: bool,
     ) -> Result<ResponsePayload, EngineError> {
         if dry_run {
             let lines = self
-                .with_storage(port, move |storage| storage.count_around(bound))
+                .with_storage(port, move |storage| storage.count_around(bound, through))
                 .await?;
             return Ok(ResponsePayload::LinesDeleted {
                 lines,
@@ -728,7 +731,7 @@ impl CommandEngine {
         let target = archive_path.clone();
         let lines = self
             .with_storage(port, move |storage| {
-                storage.delete_around(bound, target.as_deref())
+                storage.delete_around(bound, through, target.as_deref())
             })
             .await?;
         if lines > 0 {
@@ -1852,6 +1855,7 @@ mod tests {
             port: "p".into(),
             above,
             below,
+            through: None,
             archive_current: archive,
             dry_run,
         };
@@ -1927,6 +1931,43 @@ mod tests {
         );
     }
 
+    /// A deletion below a line stops at `through`, so lines that arrived after
+    /// the caller looked are not taken.
+    #[tokio::test]
+    async fn a_deletion_below_a_line_stops_at_the_last_line_seen() {
+        let (engine, _dir) = make_test_engine();
+        let ctrl = open_mock(&engine, "p").await;
+        ctrl.feed_lines(&["a", "b", "c", "d", "e", "f"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let ResponsePayload::LinesDeleted { lines, .. } = engine
+            .execute(RequestPayload::DeleteLines {
+                port: "p".into(),
+                above: None,
+                below: Some(2),
+                through: Some(4),
+                archive_current: Some(false),
+                dry_run: Some(false),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("not a deletion")
+        };
+        assert_eq!(lines, 2, "ids 3 and 4 only");
+        let storage = engine.storage("p").await.unwrap();
+        let ids: Vec<i64> = storage
+            .lock()
+            .unwrap()
+            .read_lines(1, 100)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .filter(|id| *id <= 6)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 5, 6], "5 and 6 arrived after the look");
+    }
+
     #[tokio::test]
     async fn deleting_needs_exactly_one_side() {
         let (engine, _dir) = make_test_engine();
@@ -1937,6 +1978,7 @@ mod tests {
                     port: "p".into(),
                     above,
                     below,
+                    through: None,
                     archive_current: None,
                     dry_run: Some(true),
                 })

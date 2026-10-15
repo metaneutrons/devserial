@@ -69,6 +69,9 @@ pub enum Capability {
     /// Delete the stored capture of the port, after asking, with a copy first
     /// unless the user declines it.
     ClearCapture,
+    /// Delete the lines on one side of a line, after asking, with a copy first
+    /// unless the user declines it.
+    DeleteLines,
     /// Write the buffer out in a chosen format.
     ///
     /// The window additionally offers the clipboard. That is a convenience of
@@ -120,6 +123,7 @@ impl Capability {
         Self::Filter,
         Self::ClearBuffer,
         Self::ClearCapture,
+        Self::DeleteLines,
         Self::Export,
         Self::FileTransfer,
         Self::TransferProtocol,
@@ -160,6 +164,7 @@ pub const GUI: &[(Capability, &str)] = &[
     (Capability::Filter, "\"Filter:\""),
     (Capability::ClearBuffer, "\"Clear display\""),
     (Capability::ClearCapture, "fn render_clear_capture"),
+    (Capability::DeleteLines, "fn render_delete_lines"),
     (Capability::Export, "\"Export ▾\""),
     (Capability::FileTransfer, "\"Transfer ▾\""),
     (Capability::TransferProtocol, "FileTransferProtocol::ALL"),
@@ -215,10 +220,12 @@ pub const TUI: &[(Capability, &str)] = &[
 /// therefore fails the test until it is either built for the terminal too or
 /// written down here on purpose.
 ///
-/// **The list is empty.** It held ten entries on 6 September 2026 and was
-/// worked off the same day. Anything added here from now on is debt and should
-/// carry a reason worth reading, because the alternative is building it for
-/// both surfaces.
+/// **The list held ten entries on 6 September 2026 and was worked off the same
+/// day.** One entry has been added since, on purpose: deleting the lines around
+/// a line (15 October 2026), which needs a line to point at, and the terminal
+/// has no cursor on a line. Anything added here is debt and should carry a
+/// reason worth reading, because the alternative is building it for both
+/// surfaces.
 ///
 /// One limit of the mechanism, so nobody mistakes it for more than it is: the
 /// anchors are searched in the source text and cannot see `cfg` attributes.
@@ -226,7 +233,10 @@ pub const TUI: &[(Capability, &str)] = &[
 /// `esp` feature in both surfaces, and a build without it has the capability
 /// in neither.
 #[cfg(all(feature = "monitor", feature = "tui"))]
-pub const KNOWN_GAPS: &[(Capability, &str)] = &[];
+pub const KNOWN_GAPS: &[(Capability, &str)] = &[(
+    Capability::DeleteLines,
+    "the terminal has no line cursor: nothing there points at one line, and a deletion around a line needs one. The capture can be emptied there, and `devserial delete` does the rest from the command line.",
+)];
 
 #[cfg(all(test, feature = "monitor", feature = "tui"))]
 mod tests {
@@ -302,18 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_does_everything_the_window_does() {
-        // The plain statement, so a reader of this file does not have to
-        // derive it from an empty ledger.
-        assert_eq!(
-            named(GUI),
-            named(TUI),
-            "the two surfaces have drifted apart again"
-        );
-        assert!(
-            KNOWN_GAPS.is_empty(),
-            "the ledger has entries but the surfaces agree, so remove them"
-        );
+    fn every_gap_has_a_reason_worth_reading() {
+        // Not a measure of the reason, only a floor under it: a gap recorded
+        // with a word or two is a gap nobody explained.
+        for (capability, reason) in KNOWN_GAPS {
+            assert!(
+                reason.len() >= 60,
+                "{capability:?} is recorded as missing with too little said: {reason:?}"
+            );
+        }
     }
 
     #[test]
