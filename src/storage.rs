@@ -29,6 +29,34 @@ pub struct BufferStats {
     pub db_size_bytes: u64,
 }
 
+/// One side of a line, by id: the lines before it or the lines after it. The
+/// line itself is on neither side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineBound {
+    /// Lines with a smaller id.
+    Above(i64),
+    /// Lines with a larger id.
+    Below(i64),
+}
+
+impl LineBound {
+    /// The line the bound is taken around.
+    #[must_use]
+    pub const fn id(self) -> i64 {
+        match self {
+            Self::Above(id) | Self::Below(id) => id,
+        }
+    }
+
+    /// The SQL condition on `id` with one parameter.
+    const fn condition(self) -> &'static str {
+        match self {
+            Self::Above(_) => "id < ?1",
+            Self::Below(_) => "id > ?1",
+        }
+    }
+}
+
 /// Optional time range for queries.
 #[derive(Debug, Clone, Copy)]
 pub struct TimeRange {
@@ -394,24 +422,88 @@ impl SqliteStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(archive) = archive_path {
-            if let Some(parent) = archive.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            if archive.exists() {
-                return Err(StorageError::ArchiveExists(archive.to_path_buf()));
-            }
-            // `VACUUM INTO` writes a consistent snapshot including everything
-            // still sitting in the write-ahead log. A plain file copy would
-            // silently drop the newest lines.
-            let target = archive.to_string_lossy().replace('\'', "''");
-            conn.execute_batch(&format!("VACUUM INTO '{target}';"))?;
+            Self::archive_to(&conn, archive)?;
         }
 
         conn.execute_batch("DELETE FROM lines; VACUUM;")?;
         drop(conn);
         Ok(())
+    }
+
+    /// Write a consistent copy of the database to `archive`.
+    fn archive_to(conn: &rusqlite::Connection, archive: &Path) -> Result<(), StorageError> {
+        if let Some(parent) = archive.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        if archive.exists() {
+            return Err(StorageError::ArchiveExists(archive.to_path_buf()));
+        }
+        // `VACUUM INTO` writes a consistent snapshot including everything
+        // still sitting in the write-ahead log. A plain file copy would
+        // silently drop the newest lines.
+        let target = archive.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{target}';"))?;
+        Ok(())
+    }
+
+    /// How many lines lie on one side of a line, not counting that line.
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` failure.
+    pub fn count_around(&self, bound: LineBound) -> Result<u64, StorageError> {
+        let conn = self
+            .read_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = conn.query_row(
+            &format!("SELECT COUNT(*) FROM lines WHERE {}", bound.condition()),
+            [bound.id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        drop(conn);
+        count_as_u64(count)
+    }
+
+    /// Delete the lines on one side of a line; that line and the other side
+    /// stay. If `archive_path` is provided, the whole database is copied
+    /// there first.
+    ///
+    /// The file is compacted afterwards and the write-ahead log emptied, so
+    /// what was deleted does not stay readable in the free pages of the file
+    /// or in the log. That is the reason for deleting lines, more often than
+    /// the space.
+    ///
+    /// Returns how many lines were deleted.
+    ///
+    /// # Errors
+    /// Returns error on `SQLite` or IO failure. Nothing is deleted when the
+    /// copy fails.
+    pub fn delete_around(
+        &self,
+        bound: LineBound,
+        archive_path: Option<&Path>,
+    ) -> Result<u64, StorageError> {
+        let conn = self
+            .write_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(archive) = archive_path {
+            Self::archive_to(&conn, archive)?;
+        }
+
+        let deleted = conn.execute(
+            &format!("DELETE FROM lines WHERE {}", bound.condition()),
+            [bound.id()],
+        )?;
+        conn.execute_batch("VACUUM;")?;
+        // The checkpoint can be refused while a reader is busy; the deletion
+        // has happened either way, so that is not an error of this call.
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        drop(conn);
+        count_as_u64(i64::try_from(deleted).unwrap_or(i64::MAX))
     }
 
     /// Scan lines from `start_id` upwards, keeping those the predicate accepts.
@@ -900,5 +992,72 @@ mod tests {
 
         let final_stats = storage.get_stats().unwrap();
         assert_eq!(final_stats.total_lines, 500);
+    }
+
+    #[test]
+    fn deleting_around_a_line_keeps_that_line_and_the_other_side() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        let lines: Vec<(i64, String)> = (1..=10).map(|i| (i, format!("line {i}"))).collect();
+        let refs: Vec<(i64, &str)> = lines.iter().map(|(t, p)| (*t, p.as_str())).collect();
+        storage.insert_lines(&refs).expect("insert");
+
+        // Counting does not delete, and the line itself is on neither side.
+        assert_eq!(storage.count_around(LineBound::Above(4)).unwrap(), 3);
+        assert_eq!(storage.count_around(LineBound::Below(4)).unwrap(), 6);
+        assert_eq!(storage.line_count().unwrap(), 10);
+
+        assert_eq!(storage.delete_around(LineBound::Above(4), None).unwrap(), 3);
+        let left: Vec<i64> = storage
+            .read_lines(1, 100)
+            .unwrap()
+            .iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(left, vec![4, 5, 6, 7, 8, 9, 10]);
+
+        assert_eq!(storage.delete_around(LineBound::Below(7), None).unwrap(), 3);
+        let left: Vec<i64> = storage
+            .read_lines(1, 100)
+            .unwrap()
+            .iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(left, vec![4, 5, 6, 7]);
+
+        // A bound with nothing on its side deletes nothing.
+        assert_eq!(storage.delete_around(LineBound::Above(4), None).unwrap(), 0);
+        assert_eq!(storage.delete_around(LineBound::Below(7), None).unwrap(), 0);
+        assert_eq!(storage.line_count().unwrap(), 4);
+
+        // Ids go on counting past a deleted tail, so no cursor is reused.
+        storage.insert_lines(&[(11, "after")]).unwrap();
+        assert_eq!(storage.last_id().unwrap(), 11);
+    }
+
+    #[test]
+    fn a_copy_comes_first_and_a_failed_copy_deletes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .insert_lines(&[(1, "one"), (2, "two"), (3, "three")])
+            .unwrap();
+        let archive = directory.path().join("copy.db");
+
+        assert_eq!(
+            storage
+                .delete_around(LineBound::Above(3), Some(&archive))
+                .unwrap(),
+            2
+        );
+        // The copy holds what was there before.
+        let copy = SqliteStorage::open(&archive).expect("the copy opens");
+        assert_eq!(copy.line_count().unwrap(), 3);
+        assert_eq!(storage.line_count().unwrap(), 1);
+
+        // Counter-probe: a copy that already exists is refused, and then
+        // nothing is deleted.
+        let again = storage.delete_around(LineBound::Below(0), Some(&archive));
+        assert!(matches!(again, Err(StorageError::ArchiveExists(_))));
+        assert_eq!(storage.line_count().unwrap(), 1);
     }
 }

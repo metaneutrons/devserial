@@ -46,6 +46,8 @@ fresh answer.
 - Flashing or erasing a chip (`devserial flash`, the `serial_esp_*` tools)
   replaces its firmware.
 - `devserial clear PORT` deletes the captured history; `--archive` keeps a copy.
+- `devserial delete PORT --above ID` or `--below ID` deletes the lines on one side of a line;
+  a copy is kept unless `--no-archive` is given, and `--dry-run` only counts. Only when asked.
 - `devserial close PORT` releases the port, and a monitor the user has open
   stops receiving.
 - Do not stop the daemon (`devserial daemon --stop`). It stops by itself once
