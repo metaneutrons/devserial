@@ -2236,6 +2236,12 @@ mod tests {
                 "GET /v1/ports/{port}/lines/stream",
             ]),
             R::Clear { .. } => Ok(&["DELETE /v1/ports/{port}/lines"]),
+            // Deleting around a line is decided by a person looking at the
+            // capture, in the window or with the command line. Nothing over
+            // HTTP, or offered to an agent, asks for it yet.
+            R::DeleteLines { .. } => Err(
+                "deleting the lines around a line is a person's decision, made in the window or on the command line",
+            ),
             R::Search { .. } => Ok(&["GET /v1/ports/{port}/search"]),
             R::Export { .. } => Ok(&["POST /v1/ports/{port}/export"]),
 
@@ -2354,6 +2360,13 @@ mod tests {
             R::Clear {
                 port: port(),
                 archive_current: None,
+            },
+            R::DeleteLines {
+                port: port(),
+                above: Some(1),
+                below: None,
+                archive_current: None,
+                dry_run: None,
             },
             R::GetStats { port: port() },
             R::RestStatus,

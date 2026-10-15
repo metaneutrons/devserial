@@ -318,6 +318,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `search` | Query the capture |
 | `export` | Write the capture to a file |
 | `clear` | Empty the buffer, optionally archiving it first |
+| `delete` | Delete the lines above or below one line, which stays. A copy of the buffer comes first unless `--no-archive` is given; `--dry-run` only counts |
 | `stats` | Connection state and buffer statistics |
 | `flash` | Flash an ESP device with the built-in `espflash` library |
 | `rest` | Show or change the HTTP interface of the daemon |
@@ -395,6 +396,8 @@ devserial export /dev/ttyUSB0 dump.jsonl --format jsonl
 
 devserial stats /dev/ttyUSB0
 devserial clear /dev/ttyUSB0 --archive
+devserial delete /dev/ttyUSB0 --above 1200     # drop the first 1199 lines, after a copy
+devserial delete /dev/ttyUSB0 --below 5000 --dry-run   # only count
 ```
 
 A filtering search reports when it stopped before the end of the buffer, so an empty result never silently means "did not look far enough".

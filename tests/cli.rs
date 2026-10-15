@@ -343,6 +343,33 @@ fn signal_and_macro_help_are_present() {
         .stdout(predicate::str::contains("name"));
 }
 
+/// `delete` needs exactly one side, before anything is sent to a daemon, and
+/// says that a copy is made unless it is declined.
+#[test]
+fn delete_needs_exactly_one_side_and_says_it_keeps_a_copy() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .command()
+        .args(["delete", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-archive"))
+        .stdout(predicate::str::contains("--dry-run"));
+    // Neither side, and both sides, are refused without reaching a daemon.
+    sandbox
+        .command()
+        .args(["delete", "/dev/x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--above"));
+    sandbox
+        .command()
+        .args(["delete", "/dev/x", "--above", "1", "--below", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
 #[test]
 fn read_help_documents_the_incremental_options() {
     Sandbox::new()

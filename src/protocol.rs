@@ -339,6 +339,18 @@ pub enum RequestPayload {
         port: String,
         archive_current: Option<bool>,
     },
+    /// Delete the lines before or after one line, which stays. Exactly one of
+    /// `above` and `below` is given. A copy of the buffer is made first unless
+    /// `archive_current` is `false`, and `dry_run` only counts.
+    DeleteLines {
+        port: String,
+        /// Delete the lines with a smaller id than this.
+        above: Option<i64>,
+        /// Delete the lines with a larger id than this.
+        below: Option<i64>,
+        archive_current: Option<bool>,
+        dry_run: Option<bool>,
+    },
     /// Get buffer statistics for a port.
     GetStats { port: String },
     /// Flash firmware via espflash.
@@ -411,6 +423,7 @@ impl RequestPayload {
             | Self::Search { port, .. }
             | Self::Export { port, .. }
             | Self::Clear { port, .. }
+            | Self::DeleteLines { port, .. }
             | Self::GetStats { port } => Some(port),
             #[cfg(feature = "esp")]
             Self::EspFlash { port, .. }
@@ -489,6 +502,15 @@ pub enum ResponsePayload {
     ClearSuccess {
         lines_cleared: u64,
         archive_path: Option<String>,
+    },
+    /// Lines deleted around one line, or counted when it was a dry run.
+    LinesDeleted {
+        /// How many lines were deleted, or would be.
+        lines: u64,
+        /// Where the copy of the buffer went, when one was made.
+        archive_path: Option<String>,
+        /// Whether this only counted.
+        dry_run: bool,
     },
     /// Buffer statistics.
     Stats(BufferStats),
