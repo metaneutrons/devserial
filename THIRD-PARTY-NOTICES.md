@@ -6,7 +6,9 @@ every copy of it. Their licences require their notices to be distributed
 alongside them, which is what this file and the `licenses/` directory do.
 
 Ordinary Rust dependencies are not listed here. They are linked rather than
-embedded as data, and their licences are declared in `Cargo.lock`.
+embedded as data, and their licences are declared in `Cargo.lock`. The one
+exception is the crate below, whose licence asks for a statement of where its
+source is.
 
 ## Font software
 
@@ -54,3 +56,22 @@ The macOS application bundle includes Sparkle 2.10.0. Its complete licence,
 including notices for bundled components, is in
 `devserial.app/Contents/Resources/Sparkle-LICENSE`. The standalone CLI
 archives do not include Sparkle.
+
+## Software under the Mozilla Public License
+
+The binary is built with `serialport` 4.10.1, which `espflash` uses to open the
+serial port when it flashes an ESP device (`--features esp`, on by default).
+It is under the Mozilla Public License 2.0, a licence that applies to its own
+files and not to the program they are part of.
+
+- The crate is used **unmodified**, as published on crates.io.
+- Its Source Code Form is at <https://github.com/serialport/serialport-rs>
+  and on crates.io as `serialport` 4.10.1. The licence text is at
+  <https://mozilla.org/MPL/2.0/>.
+- devserial is a Larger Work in the sense of section 3.3 of that licence and is
+  distributed under GPL-3.0-or-later. The licence names the GPL among the
+  licences a combination may be distributed under (section 1.12, which counts
+  later versions of GPL-2.0), and the crate's files carry no notice that they
+  are incompatible with them (section 1.5). Whoever receives the binary may
+  therefore use the crate under either licence.
+
