@@ -35,6 +35,64 @@ pub fn already_running(endpoint: &Path) -> io::Error {
     )
 }
 
+/// Bytes in `sockaddr_un.sun_path`, the room a Unix socket path has, with its
+/// terminating NUL.
+#[cfg(unix)]
+const SUN_PATH_CAPACITY: usize = if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)) {
+    104
+} else {
+    108
+};
+
+/// Check that the system can address the endpoint at all.
+///
+/// A Unix socket path has to fit `sun_path`, a little over a hundred bytes. A
+/// longer one makes `bind` and `connect` fail with `path must be shorter than
+/// SUN_LEN`, which names neither the path nor the way out. The default path
+/// follows the home directory, so a long one is plausible, as in a temporary
+/// directory made for a test.
+///
+/// # Errors
+/// Returns `InvalidInput` naming the path, its length, the limit and the two
+/// ways to choose another path.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "only Unix socket paths have a length limit; elsewhere there is nothing to check"
+    )
+)]
+pub fn check_endpoint(endpoint: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let length = endpoint.as_os_str().as_bytes().len();
+        if length >= SUN_PATH_CAPACITY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the socket path is {length} bytes and this system allows at most {} ({}). \
+                     Give the daemon a shorter one with --socket or {}",
+                    SUN_PATH_CAPACITY - 1,
+                    endpoint.display(),
+                    crate::paths::ENV_SOCKET,
+                ),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = endpoint;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- unix
 
 #[cfg(unix)]
@@ -69,6 +127,8 @@ mod unix {
         /// socket cannot be created.
         pub async fn bind(endpoint: &Path) -> io::Result<Self> {
             use std::os::unix::fs::MetadataExt;
+
+            super::check_endpoint(endpoint)?;
 
             if let Some(parent) = endpoint.parent()
                 && !parent.as_os_str().is_empty()
@@ -128,6 +188,7 @@ mod unix {
     /// # Errors
     /// Returns an error if no daemon is listening.
     pub async fn connect(endpoint: &Path) -> io::Result<ClientStream> {
+        super::check_endpoint(endpoint)?;
         UnixStream::connect(endpoint).await
     }
 
@@ -432,6 +493,36 @@ mod unsupported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_that_does_not_fit_is_named_and_explained() {
+        let fits = std::path::PathBuf::from("/".repeat(SUN_PATH_CAPACITY - 1));
+        assert!(check_endpoint(&fits).is_ok());
+
+        let too_long = std::path::PathBuf::from("/".repeat(SUN_PATH_CAPACITY));
+        let error = check_endpoint(&too_long).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("{SUN_PATH_CAPACITY} bytes")),
+            "{text}"
+        );
+        assert!(text.contains("--socket"), "{text}");
+        assert!(text.contains(crate::paths::ENV_SOCKET), "{text}");
+        assert!(!text.contains("SUN_LEN"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_and_connect_refuse_a_path_that_does_not_fit_with_that_explanation() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("x".repeat(SUN_PATH_CAPACITY));
+        let bind = Listener::bind(&endpoint).await.err().expect("bind refuses");
+        assert!(bind.to_string().contains("--socket"), "{bind}");
+        let connect = connect(&endpoint).await.expect_err("connect refuses");
+        assert!(connect.to_string().contains("--socket"), "{connect}");
+    }
 
     #[tokio::test]
     async fn connect_to_missing_endpoint_fails() {
