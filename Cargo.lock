@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "devserial"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "agent-skill-installer",
  "assert_cmd",
