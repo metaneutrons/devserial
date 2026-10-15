@@ -4,6 +4,19 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.16](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.15...devserial-v0.2.16) (2026-10-15)
+
+
+### Features
+
+* **tui:** delete the lines above or below a marked line, as the window does ([#156](https://github.com/metaneutrons/devserial/issues/156)) ([5c69cc1](https://github.com/metaneutrons/devserial/commit/5c69cc1fcaf40d386b4336e3070ba41d259af170))
+
+
+### Bug Fixes
+
+* **ipc:** say that a port is not open and how to open it, instead of 'not found' ([#158](https://github.com/metaneutrons/devserial/issues/158)) ([2de0d81](https://github.com/metaneutrons/devserial/commit/2de0d812dcb3e24f5946ffb1e49a3da8f6b440d5))
+* **ipc:** say that a socket path is too long, and how to choose another one ([#155](https://github.com/metaneutrons/devserial/issues/155)) ([07380f1](https://github.com/metaneutrons/devserial/commit/07380f1f3127a3cf5b5ed2b3488943faf1cedd7d))
+
 ## [0.2.15](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.14...devserial-v0.2.15) (2026-10-15)
 
 
