@@ -181,6 +181,43 @@ fn daemon_status_reports_a_stopped_daemon() {
         .stdout(predicate::str::contains("STOPPED"));
 }
 
+/// A socket path longer than the system can address is explained, by the
+/// command that needs the daemon and by the daemon itself, instead of failing
+/// with `path must be shorter than SUN_LEN`.
+#[cfg(unix)]
+#[test]
+fn a_socket_path_that_does_not_fit_is_explained() {
+    let sandbox = Sandbox::new();
+    let long = sandbox
+        .dir
+        .path()
+        .join("s".repeat(120))
+        .join("devserial.sock");
+
+    let client = sandbox
+        .command()
+        .env("DEVSERIAL_SOCKET", &long)
+        .args(["read", "/dev/ttyUSB0", "--tail", "1"])
+        .output()
+        .expect("run devserial read");
+    assert_eq!(client.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&client.stderr);
+    assert!(text.contains("socket path is"), "{text}");
+    assert!(text.contains("--socket"), "{text}");
+    assert!(!text.contains("did not become reachable"), "{text}");
+
+    let daemon = sandbox
+        .command()
+        .env("DEVSERIAL_SOCKET", &long)
+        .arg("daemon")
+        .output()
+        .expect("run devserial daemon");
+    assert_eq!(daemon.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&daemon.stderr);
+    assert!(text.contains("socket path is"), "{text}");
+    assert!(!text.contains("SUN_LEN"), "{text}");
+}
+
 #[test]
 fn stopping_an_absent_daemon_is_not_an_error() {
     Sandbox::new()

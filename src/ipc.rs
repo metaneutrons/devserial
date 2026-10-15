@@ -533,6 +533,8 @@ impl IpcClient {
             return Ok(());
         }
 
+        transport::check_endpoint(&self.endpoint).map_err(|e| IpcError::Spawn(e.to_string()))?;
+
         let exe = std::env::current_exe()
             .map_err(|e| IpcError::Spawn(format!("cannot locate the devserial binary: {e}")))?;
 
