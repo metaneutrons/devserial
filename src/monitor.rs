@@ -92,43 +92,83 @@ fn signal_hint(name: &str, state: SignalLine) -> String {
     format!("{name}: {known}. Click to {click}.")
 }
 
+/// Room kept in front of a control line's button for its indicator.
+const SIGNAL_LED_SIZE: f32 = 12.0;
+
+/// Where a control line's button and indicator were drawn.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rectangles are read by the layout test")
+)]
+struct SignalControl {
+    clicked: bool,
+    button: egui::Rect,
+    led: egui::Rect,
+}
+
 /// A button for a control line with an indicator in front of it: a filled
 /// dot when the window set it high, a ring when it set it low, a dash when it
 /// does not know. Returns whether the button was clicked.
 fn signal_control(ui: &mut egui::Ui, name: &str, state: SignalLine) -> bool {
+    signal_control_at(ui, name, state).clicked
+}
+
+/// [`signal_control`], with where its parts ended up.
+///
+/// The indicator is drawn after the button, from the button's own rectangle.
+/// Placed in a row of its own it was centred in the row's minimum height,
+/// which is less than the button's, and sat above the middle of the button.
+fn signal_control_at(ui: &mut egui::Ui, name: &str, state: SignalLine) -> SignalControl {
     let hint = signal_hint(name, state);
-    let mut clicked = false;
+    let mut control = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let (rect, led) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-        let center = rect.center();
-        let weak = ui.visuals().weak_text_color();
-        let painter = ui.painter();
-        match state {
-            SignalLine::High => {
-                painter.circle_filled(center, 5.0, egui::Color32::from_rgb(70, 200, 110));
-            }
-            SignalLine::Low => {
-                painter.circle_stroke(
-                    center,
-                    4.5,
-                    egui::Stroke::new(1.5, ui.visuals().text_color()),
-                );
-            }
-            SignalLine::Unknown => {
-                painter.line_segment(
-                    [center - egui::vec2(4.0, 0.0), center + egui::vec2(4.0, 0.0)],
-                    egui::Stroke::new(1.5, weak),
-                );
-            }
-        }
-        led.on_hover_text(hint.clone());
-        clicked = ui
-            .add(egui::Button::new(name).selected(state == SignalLine::High))
-            .on_hover_text(hint)
-            .clicked();
+        // Keep the room; the dot is painted into it below.
+        ui.add_space(SIGNAL_LED_SIZE);
+        let response = ui.add(egui::Button::new(name).selected(state == SignalLine::High));
+        let button = response.rect;
+        let led = egui::Rect::from_center_size(
+            egui::pos2(
+                button.left() - ui.spacing().item_spacing.x - SIGNAL_LED_SIZE / 2.0,
+                button.center().y,
+            ),
+            egui::vec2(SIGNAL_LED_SIZE, SIGNAL_LED_SIZE),
+        );
+        paint_signal_led(ui, led.center(), state);
+        ui.interact(led, response.id.with("led"), egui::Sense::hover())
+            .on_hover_text(hint.clone());
+        let clicked = response.on_hover_text(hint).clicked();
+        control = Some(SignalControl {
+            clicked,
+            button,
+            led,
+        });
     });
-    clicked
+    control.expect("the closure ran")
+}
+
+/// Draw the indicator of a control line.
+fn paint_signal_led(ui: &egui::Ui, center: egui::Pos2, state: SignalLine) {
+    let painter = ui.painter();
+    match state {
+        SignalLine::High => {
+            painter.circle_filled(center, 5.0, egui::Color32::from_rgb(70, 200, 110));
+        }
+        SignalLine::Low => {
+            painter.circle_stroke(
+                center,
+                4.5,
+                egui::Stroke::new(1.5, ui.visuals().text_color()),
+            );
+        }
+        SignalLine::Unknown => {
+            painter.line_segment(
+                [center - egui::vec2(4.0, 0.0), center + egui::vec2(4.0, 0.0)],
+                egui::Stroke::new(1.5, ui.visuals().weak_text_color()),
+            );
+        }
+    }
 }
 
 /// The time of day in front of a row.
@@ -5385,6 +5425,48 @@ mod signal_tests {
         monitor.run_macro("reset");
         assert_eq!(monitor.dtr_state, SignalLine::Unknown);
         assert_eq!(monitor.rts_state, SignalLine::Unknown);
+    }
+
+    /// Padding that makes a button taller than a row, as the window's is
+    /// (`configure_style` gives 8 by 4 and the text adds to it). The test
+    /// harness lays text out with no size, so the padding alone has to do it.
+    /// With the default padding a button is as high as a row, and the fault
+    /// does not show.
+    fn app_button_padding(ui: &mut egui::Ui) {
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 12.0);
+    }
+
+    /// The indicator is level with the middle of the button, and in front of
+    /// it, in every state. The counter-probe is the layout it had before: a
+    /// square of its own in a row of the minimum height, which is not.
+    #[test]
+    fn the_indicator_is_centred_on_the_button() {
+        for state in [SignalLine::Unknown, SignalLine::Low, SignalLine::High] {
+            let mut placed = None;
+            egui::__run_test_ui(|ui| {
+                app_button_padding(ui);
+                placed = Some(signal_control_at(ui, "DTR", state));
+            });
+            let placed = placed.unwrap();
+            let off = (placed.led.center().y - placed.button.center().y).abs();
+            assert!(off < 0.5, "{state:?}: {off} points off the button's middle");
+            assert!(placed.led.right() <= placed.button.left(), "{state:?}");
+        }
+
+        let mut old = None;
+        egui::__run_test_ui(|ui| {
+            app_button_padding(ui);
+            ui.horizontal(|ui| {
+                let (led, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                let button = ui.button("DTR").rect;
+                old = Some((led, button));
+            });
+        });
+        let (led, button) = old.unwrap();
+        assert!(
+            (led.center().y - button.center().y).abs() > 0.5,
+            "the old layout was already centred here, so this test shows nothing: {led:?} {button:?}"
+        );
     }
 
     /// The control draws a button and an indicator, in every state, and a
