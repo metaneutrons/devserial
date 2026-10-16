@@ -42,7 +42,8 @@ License: OFL-1.1
 
 License: MPL-2.0
  The binary is built with the serialport crate, version 4.10.1 (Mozilla Public
- License 2.0, by the authors of serialport-rs), which espflash uses to open the
+ License 2.0; authors named in the crate: Bryant Mairs and Jesse Braham, with
+ the other contributors to serialport-rs), which espflash uses to open the
  serial port when it flashes an ESP device. The crate is used unmodified. It
  is not part of this source package; its Source Code Form is at
  https://github.com/serialport/serialport-rs and on crates.io. The licence
