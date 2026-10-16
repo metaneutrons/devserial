@@ -39,3 +39,15 @@ License: OFL-1.1
  2014 John Slegers) by way of the epaint_default_fonts crate. Their notices
  and licence texts are in /usr/share/doc/devserial/THIRD-PARTY-NOTICES.md and
  /usr/share/doc/devserial/licenses/.
+
+License: MPL-2.0
+ The binary is built with the serialport crate, version 4.10.1 (Mozilla Public
+ License 2.0; authors named in the crate: Bryant Mairs and Jesse Braham, with
+ the other contributors to serialport-rs), which espflash uses to open the
+ serial port when it flashes an ESP device. The crate is used unmodified. It
+ is not part of this source package; its Source Code Form is at
+ https://github.com/serialport/serialport-rs and on crates.io. The licence
+ applies to the crate's own files, and devserial as a whole is distributed
+ under GPL-3.0-or-later (see THIRD-PARTY-NOTICES.md). On Debian systems, the
+ complete text of the Mozilla Public License 2.0 can be found in
+ "/usr/share/common-licenses/MPL-2.0".
