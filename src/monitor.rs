@@ -2087,9 +2087,10 @@ impl PortMonitorState {
                     .cursor
                     .char_range()
                     .is_some_and(|r| r.primary != r.secondary);
-                let not_empty = if fid == egui::Id::new(format!("input_text_{}", self.port_name)) {
+                let not_empty = if fid == egui::Id::unique(format!("input_text_{}", self.port_name))
+                {
                     !self.input.is_empty()
-                } else if fid == egui::Id::new(format!("filter_text_{}", self.port_name)) {
+                } else if fid == egui::Id::unique(format!("filter_text_{}", self.port_name)) {
                     !self.filter.is_empty()
                 } else {
                     true
@@ -4151,7 +4152,7 @@ impl PortMonitorState {
 
             // Group 7: Instant Filter
             ui.label("Filter:");
-            let filter_id = egui::Id::new(format!("filter_text_{}", self.port_name));
+            let filter_id = egui::Id::unique(format!("filter_text_{}", self.port_name));
             if std::mem::take(&mut self.focus_filter) {
                 focus_text_field(ui.ctx(), filter_id, &self.filter);
             }
@@ -4338,7 +4339,7 @@ impl PortMonitorState {
         let content_height = total_rows as f32 * row_height;
         let viewport_height = response.inner_rect.height();
         let max_offset = (content_height - viewport_height).max(0.0);
-        let at_bottom = response.state.offset.y >= max_offset - row_height;
+        let at_bottom = response.state.clamped_offset().y >= max_offset - row_height;
 
         // If user is actively clicking or dragging to select text within the buffer, pause auto-follow
         let user_selecting_in_buffer = ui.input(|i| {
@@ -4396,7 +4397,7 @@ impl PortMonitorState {
 
     fn render_input(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let input_id = egui::Id::new(format!("input_text_{}", self.port_name));
+            let input_id = egui::Id::unique(format!("input_text_{}", self.port_name));
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
                     .id(input_id)
@@ -6066,8 +6067,8 @@ mod find_tests {
     /// replaces it. A field that was not asked is left alone.
     #[test]
     fn the_filter_field_takes_the_cursor_with_its_text_selected() {
-        let id = egui::Id::new("filter-under-test");
-        let other = egui::Id::new("another-field");
+        let id = egui::Id::unique("filter-under-test");
+        let other = egui::Id::unique("another-field");
         let ctx = egui::Context::default();
         let mut text = "grep me".to_string();
         let mut other_text = String::new();
