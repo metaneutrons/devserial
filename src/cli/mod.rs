@@ -265,10 +265,10 @@ pub enum Command {
     Signal {
         /// Serial port path
         port: String,
-        /// Set DTR line (true = HIGH, false = LOW)
+        /// Set DTR state (true = asserted, false = released; modem lines are active-low)
         #[arg(long)]
         dtr: Option<bool>,
-        /// Set RTS line (true = HIGH, false = LOW)
+        /// Set RTS state (true = asserted, false = released; modem lines are active-low)
         #[arg(long)]
         rts: Option<bool>,
     },
@@ -371,6 +371,9 @@ pub enum Command {
         /// Baud rate for flashing
         #[arg(short, long)]
         baud: Option<u32>,
+        /// Reset strategy before connecting to the ROM loader
+        #[arg(long, value_enum, default_value_t = crate::protocol::EspResetBefore::Auto)]
+        before: crate::protocol::EspResetBefore,
         /// Follow the serial output after flashing
         #[arg(short, long)]
         monitor: bool,

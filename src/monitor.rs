@@ -78,8 +78,8 @@ fn focus_text_field(ctx: &egui::Context, id: egui::Id, text: &str) {
 /// What the hover text says about a control line and what a click does.
 fn signal_hint(name: &str, state: SignalLine) -> String {
     let (known, click) = match state {
-        SignalLine::High => ("set high (asserted) by this window", "release it"),
-        SignalLine::Low => ("set low (released) by this window", "assert it"),
+        SignalLine::High => ("asserted by this window", "release it"),
+        SignalLine::Low => ("released by this window", "assert it"),
         SignalLine::Unknown => (
             "not set by this window since the port was opened or a macro ran; \
              the real level cannot be read back",
@@ -262,6 +262,8 @@ struct FlashDialog {
     path: String,
     /// Empty means espflash picks its own flashing baud rate.
     baud: String,
+    /// How the ROM loader is entered before synchronization.
+    reset: crate::protocol::EspResetBefore,
     /// Lines from the running tool, oldest first.
     log: Vec<String>,
     running: Option<RunningFlash>,
@@ -1657,12 +1659,13 @@ impl PortMonitorState {
         let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let port = self.port_name.clone();
+        let reset = self.flash.reset;
         let repaint = ctx.clone();
         runtime.spawn(async move {
             let result = if erase {
-                crate::esp::erase_flash_with_progress(&port, Some(&line_tx)).await
+                crate::esp::erase_flash_with_progress(&port, reset, Some(&line_tx)).await
             } else {
-                crate::esp::flash_with_progress(&port, &path, baud, Some(&line_tx)).await
+                crate::esp::flash_with_progress(&port, &path, baud, reset, Some(&line_tx)).await
             };
             let _ = done_tx.send(result);
             repaint.request_repaint();
@@ -1792,6 +1795,25 @@ impl PortMonitorState {
                                 .color(egui::Color32::from_rgb(140, 140, 150)),
                         );
                     });
+
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Reset before connect:").strong());
+                    egui::ComboBox::from_id_salt("esp-reset-before")
+                        .selected_text(self.flash.reset.to_string())
+                        .show_ui(ui, |ui| {
+                            for reset in [
+                                crate::protocol::EspResetBefore::Auto,
+                                crate::protocol::EspResetBefore::UsbReset,
+                                crate::protocol::EspResetBefore::NoReset,
+                                crate::protocol::EspResetBefore::NoResetNoSync,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.flash.reset,
+                                    reset,
+                                    reset.to_string(),
+                                );
+                            }
+                        });
                 });
 
                 if busy || !self.flash.log.is_empty() {
@@ -4030,10 +4052,17 @@ impl PortMonitorState {
             }
             if ui
                 .button("Bootloader")
-                .on_hover_text("Enter bootloader mode")
+                .on_hover_text("Enter bootloader mode through a UART bridge")
                 .clicked()
             {
                 self.run_macro("enter_bootloader");
+            }
+            if ui
+                .button("USB Bootloader")
+                .on_hover_text("Enter the ESP native USB Serial/JTAG ROM loader")
+                .clicked()
+            {
+                self.run_macro("enter_usb_bootloader");
             }
             if ui
                 .button("Break")
@@ -5820,8 +5849,8 @@ mod signal_tests {
 
     #[test]
     fn the_hover_text_says_what_the_window_knows() {
-        assert!(signal_hint("DTR", SignalLine::High).contains("set high"));
-        assert!(signal_hint("DTR", SignalLine::Low).contains("set low"));
+        assert!(signal_hint("DTR", SignalLine::High).contains("asserted"));
+        assert!(signal_hint("DTR", SignalLine::Low).contains("released"));
         let unknown = signal_hint("RTS", SignalLine::Unknown);
         assert!(unknown.contains("cannot be read back"), "{unknown}");
         assert!(unknown.starts_with("RTS:"), "{unknown}");

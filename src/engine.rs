@@ -1109,22 +1109,23 @@ impl CommandEngine {
                 port,
                 firmware_path,
                 baud,
+                reset,
             } => {
                 let log = format!("FLASH {firmware_path}");
                 self.esp_operation(&port, Some(log), |port| async move {
-                    crate::esp::flash(&port, &firmware_path, baud).await
+                    crate::esp::flash(&port, &firmware_path, baud, reset).await
                 })
                 .await
             }
-            RequestPayload::EspInfo { port } => {
+            RequestPayload::EspInfo { port, reset } => {
                 self.esp_operation(&port, None, |port| async move {
-                    crate::esp::board_info(&port).await
+                    crate::esp::board_info(&port, reset).await
                 })
                 .await
             }
-            RequestPayload::EspErase { port } => {
+            RequestPayload::EspErase { port, reset } => {
                 self.esp_operation(&port, Some("ERASE FLASH".to_string()), |port| async move {
-                    crate::esp::erase_flash(&port).await
+                    crate::esp::erase_flash(&port, reset).await
                 })
                 .await
             }
@@ -1132,10 +1133,11 @@ impl CommandEngine {
                 port,
                 file_path,
                 address,
+                reset,
             } => {
                 let log = format!("WRITE-BIN {file_path} @ {address}");
                 self.esp_operation(&port, Some(log), |port| async move {
-                    crate::esp::write_bin(&port, &file_path, &address).await
+                    crate::esp::write_bin(&port, &file_path, &address, reset).await
                 })
                 .await
             }
@@ -1164,11 +1166,13 @@ impl CommandEngine {
         port: String,
         firmware_path: String,
         baud: Option<u32>,
+        reset: crate::protocol::EspResetBefore,
         progress: crate::esp::Progress,
     ) -> Result<ResponsePayload, EngineError> {
         let log = format!("FLASH {firmware_path}");
         self.esp_operation(&port, Some(log), |port| async move {
-            crate::esp::flash_with_progress(&port, &firmware_path, baud, Some(&progress)).await
+            crate::esp::flash_with_progress(&port, &firmware_path, baud, reset, Some(&progress))
+                .await
         })
         .await
     }
@@ -1270,7 +1274,7 @@ pub fn hardware_ports() -> Vec<String> {
 }
 
 const fn level(value: bool) -> &'static str {
-    if value { "HIGH" } else { "LOW" }
+    if value { "ASSERTED" } else { "RELEASED" }
 }
 
 fn time_range(start_ns: Option<i64>, end_ns: Option<i64>) -> Option<TimeRange> {

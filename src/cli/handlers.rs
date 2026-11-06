@@ -384,8 +384,9 @@ pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<()
             port,
             firmware,
             baud,
+            before,
             monitor,
-        } => flash(session, &port, &firmware, baud, monitor, color),
+        } => flash(session, &port, &firmware, baud, before, monitor, color),
 
         // Handled before reaching this router.
         Command::Mcp | Command::Daemon { .. } | Command::About | Command::Skill { .. } => {
@@ -926,6 +927,7 @@ fn flash(
     port: &str,
     firmware: &str,
     baud: Option<u32>,
+    reset: crate::protocol::EspResetBefore,
     monitor: bool,
     color: bool,
 ) -> Result<(), CliError> {
@@ -934,6 +936,7 @@ fn flash(
         port: port.to_string(),
         firmware_path: firmware.to_string(),
         baud,
+        reset,
     })?;
     let ResponsePayload::EspSuccess(output) = response else {
         return Err(unexpected(&response));

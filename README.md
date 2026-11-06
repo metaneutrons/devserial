@@ -371,6 +371,7 @@ echo "AT+GMR" | devserial write /dev/ttyUSB0      # from standard input
 devserial break /dev/ttyUSB0 --duration-ms 250
 devserial signal /dev/ttyUSB0 --dtr true --rts false
 devserial macro /dev/ttyUSB0 reset
+devserial macro /dev/cu.usbmodem1101 enter_usb_bootloader
 
 devserial send /dev/ttyUSB0 firmware.bin --protocol zmodem
 devserial send /dev/ttyUSB0 boot.bin --protocol xmodem-1k
@@ -382,7 +383,17 @@ file never replaces an existing file or symlink, and a transfer is rejected
 once its payload exceeds 256 MiB. These limits also apply through REST and
 MCP.
 
-Built-in macros are `reset`, `enter_bootloader` and `break`. A macro of the same name in the configuration file replaces the built-in one.
+Built-in macros are `reset`, `enter_bootloader`, `enter_usb_bootloader` and
+`break`. `enter_usb_bootloader` implements Espressif's native USB
+Serial/JTAG sequence for devices such as the ESP32-P4. A macro of the same
+name in the configuration file replaces the built-in one.
+
+ESP operations expose the same reset policy on every surface. The CLI spells
+it `devserial flash PORT IMAGE --before usb-reset`; REST and MCP use the
+`reset` field. `auto` selects from the USB identity, `usb-reset` forces the
+native USB Serial/JTAG sequence, and `no-reset` consumes a ROM loader entered
+manually with BOOT plus RESET. `no-reset-no-sync` is reserved for an already
+synchronized loader session.
 
 ### Searching and exporting
 

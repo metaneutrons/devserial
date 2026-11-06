@@ -431,7 +431,7 @@ pub struct TriggerMacroParams {
     pub port_name: String,
     /// Macro name.
     #[schemars(
-        description = "Macro name (built-in: 'reset', 'enter_bootloader', 'break', or user-defined)"
+        description = "Macro name (built-in: 'reset', 'enter_bootloader', 'enter_usb_bootloader', 'break', or user-defined)"
     )]
     pub macro_name: String,
 }
@@ -466,6 +466,23 @@ pub struct EspFlashParams {
     /// Optional baud rate for flashing.
     #[schemars(description = "Flash baud rate (default: espflash default)")]
     pub baud: Option<u32>,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    #[schemars(description = "Reset strategy: auto, usb-reset, no-reset, or no-reset-no-sync")]
+    pub reset: crate::protocol::EspResetBefore,
+}
+
+/// Parameters for ESP operations that only need a port and reset strategy.
+#[cfg(feature = "esp")]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EspPortParams {
+    /// Serial port name.
+    #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
+    pub port_name: String,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    #[schemars(description = "Reset strategy: auto, usb-reset, no-reset, or no-reset-no-sync")]
+    pub reset: crate::protocol::EspResetBefore,
 }
 
 /// Parameters for `serial_esp_write_bin`.
@@ -482,6 +499,10 @@ pub struct EspWriteBinParams {
     /// Flash address.
     #[schemars(description = "Flash address in hex (e.g. 0x1000, 0x8000, 0x10000)")]
     pub address: String,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    #[schemars(description = "Reset strategy: auto, usb-reset, no-reset, or no-reset-no-sync")]
+    pub reset: crate::protocol::EspResetBefore,
 }
 
 // ------------------------------------------------------------------ tools
@@ -922,7 +943,7 @@ impl DevSerialServer {
 
     /// Run a macro sequence.
     #[tool(
-        description = "Run a macro sequence on a serial port. Built-in: 'reset', 'enter_bootloader', 'break'; user-defined macros come from the configuration file.",
+        description = "Run a macro sequence on a serial port. Built-in: 'reset', 'enter_bootloader', 'enter_usb_bootloader', 'break'; user-defined macros come from the configuration file.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1008,6 +1029,7 @@ impl DevSerialServer {
             port: params.port_name,
             firmware_path: params.firmware_path,
             baud: params.baud,
+            reset: params.reset,
         })
         .await
     }
@@ -1019,10 +1041,11 @@ impl DevSerialServer {
     )]
     async fn serial_esp_info(
         &self,
-        Parameters(params): Parameters<PortParams>,
+        Parameters(params): Parameters<EspPortParams>,
     ) -> Result<String, ToolExecutionError> {
         self.esp_output(RequestPayload::EspInfo {
             port: params.port_name,
+            reset: params.reset,
         })
         .await
     }
@@ -1038,10 +1061,11 @@ impl DevSerialServer {
     )]
     async fn serial_esp_erase(
         &self,
-        Parameters(params): Parameters<PortParams>,
+        Parameters(params): Parameters<EspPortParams>,
     ) -> Result<String, ToolExecutionError> {
         self.esp_output(RequestPayload::EspErase {
             port: params.port_name,
+            reset: params.reset,
         })
         .await
     }
@@ -1063,6 +1087,7 @@ impl DevSerialServer {
             port: params.port_name,
             file_path: params.file_path,
             address: params.address,
+            reset: params.reset,
         })
         .await
     }
@@ -1543,6 +1568,13 @@ mod tests {
 
         #[cfg(feature = "esp")]
         {
+            let flash = server.tool_router.get("serial_esp_flash").unwrap();
+            let schema = serde_json::to_value(&flash.input_schema).unwrap();
+            assert!(
+                schema.to_string().contains("usb-reset")
+                    && schema.to_string().contains("no-reset-no-sync"),
+                "the MCP flash tool hides the reset strategies: {schema}"
+            );
             assert_eq!(
                 server
                     .tool_router

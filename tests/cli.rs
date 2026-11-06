@@ -427,7 +427,10 @@ fn flash_help_is_present() {
         .args(["flash", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("firmware"));
+        .stdout(predicate::str::contains("firmware"))
+        .stdout(predicate::str::contains("--before"))
+        .stdout(predicate::str::contains("usb-reset"))
+        .stdout(predicate::str::contains("no-reset-no-sync"));
 }
 
 #[test]
