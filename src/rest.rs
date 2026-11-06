@@ -928,8 +928,18 @@ async fn transfer(
 async fn esp_info(
     axum::extract::State(engine): Engine,
     axum::extract::Path(port): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<EspResetQuery>,
 ) -> Reply {
-    esp_answer(run(&engine, crate::protocol::RequestPayload::EspInfo { port }).await?)
+    esp_answer(
+        run(
+            &engine,
+            crate::protocol::RequestPayload::EspInfo {
+                port,
+                reset: query.reset,
+            },
+        )
+        .await?,
+    )
 }
 
 /// Erase the flash.
@@ -937,8 +947,16 @@ async fn esp_info(
 async fn esp_erase(
     axum::extract::State(engine): Engine,
     axum::extract::Path(port): axum::extract::Path<String>,
+    body: Option<axum::Json<EspResetBody>>,
 ) -> Reply {
-    esp_answer(run(&engine, crate::protocol::RequestPayload::EspErase { port }).await?)
+    let reset = body.map_or_else(Default::default, |body| body.0.reset);
+    esp_answer(
+        run(
+            &engine,
+            crate::protocol::RequestPayload::EspErase { port, reset },
+        )
+        .await?,
+    )
 }
 
 /// Write a raw binary to an address in flash.
@@ -955,6 +973,7 @@ async fn esp_write_bin(
                 port,
                 file_path: body.path,
                 address: body.address,
+                reset: body.reset,
             },
         )
         .await?,
@@ -1000,7 +1019,7 @@ async fn esp_flash(
         });
 
         let outcome = engine
-            .esp_flash_reporting(port, body.firmware, body.baud, progress)
+            .esp_flash_reporting(port, body.firmware, body.baud, body.reset, progress)
             .await;
 
         // The pump ends when the call above drops its sender, so waiting for
@@ -1348,7 +1367,11 @@ fn shapes(route: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>)
         "POST /v1/ports/{port}/signals" => body(schema_of::<SignalsBody>()),
         "POST /v1/ports/{port}/transfers" => body(schema_of::<TransferBody>()),
         #[cfg(feature = "esp")]
+        "GET /v1/ports/{port}/esp" => query(schema_of::<EspResetQuery>()),
+        #[cfg(feature = "esp")]
         "POST /v1/ports/{port}/esp/flash" => body(schema_of::<EspFlashBody>()),
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/erase" => body(schema_of::<EspResetBody>()),
         #[cfg(feature = "esp")]
         "POST /v1/ports/{port}/esp/write-bin" => body(schema_of::<EspWriteBinBody>()),
         #[cfg(feature = "esp")]
@@ -1740,6 +1763,27 @@ struct EspFlashBody {
     firmware: String,
     /// Baud rate for the flash itself, not for the port afterwards.
     baud: Option<u32>,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    reset: crate::protocol::EspResetBefore,
+}
+
+/// Reset choice on an ESP information request.
+#[cfg(feature = "esp")]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct EspResetQuery {
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    reset: crate::protocol::EspResetBefore,
+}
+
+/// Body for an ESP operation with no input besides the reset choice.
+#[cfg(feature = "esp")]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct EspResetBody {
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    reset: crate::protocol::EspResetBefore,
 }
 
 /// `POST /v1/ports/{port}/esp/write-bin`
@@ -1750,6 +1794,9 @@ struct EspWriteBinBody {
     path: String,
     /// Flash address, such as `0x1000`.
     address: String,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    reset: crate::protocol::EspResetBefore,
 }
 
 /// `GET /v1/jobs/{job}/stream`
@@ -2393,13 +2440,21 @@ mod tests {
                 port: port(),
                 firmware_path: "f".into(),
                 baud: None,
+                reset: crate::protocol::EspResetBefore::Auto,
             },
-            R::EspInfo { port: port() },
-            R::EspErase { port: port() },
+            R::EspInfo {
+                port: port(),
+                reset: crate::protocol::EspResetBefore::Auto,
+            },
+            R::EspErase {
+                port: port(),
+                reset: crate::protocol::EspResetBefore::Auto,
+            },
             R::EspWriteBin {
                 port: port(),
                 file_path: "f".into(),
                 address: "0x0".into(),
+                reset: crate::protocol::EspResetBefore::Auto,
             },
         ]);
         all
@@ -3380,6 +3435,15 @@ mod tests {
         for field in ["start", "after", "tail", "since", "limit", "wait_ms"] {
             assert!(query.contains(&field), "{field} is not described: {lines}");
         }
+
+        let flash = &paths["/v1/ports/{port}/esp/flash"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"];
+        assert!(
+            flash["$defs"]["EspResetBefore"]
+                .to_string()
+                .contains("usb-reset"),
+            "the ESP reset strategy is missing from the HTTP contract: {flash}"
+        );
 
         assert_openapi_metadata(&document);
     }

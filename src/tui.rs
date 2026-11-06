@@ -215,6 +215,9 @@ struct AppState {
     /// The channels of a run that is still going.
     #[cfg(feature = "esp")]
     flash_running: Option<RunningFlash>,
+    /// How the ESP ROM loader is entered before a flash.
+    #[cfg(feature = "esp")]
+    flash_reset: crate::protocol::EspResetBefore,
     /// The format an export is written in.
     export_format: crate::export::ExportFormat,
     /// Whether an export covers the whole capture or only what is on screen.
@@ -787,6 +790,8 @@ impl AppState {
             flash_log: Vec::new(),
             #[cfg(feature = "esp")]
             flash_running: None,
+            #[cfg(feature = "esp")]
+            flash_reset: crate::protocol::EspResetBefore::Auto,
             export_format: crate::export::ExportFormat::default(),
             export_all: true,
             line_ending: crate::serial_params::LineEnding::default(),
@@ -1403,6 +1408,8 @@ fn run_app(
             if state.flash_running.is_none() {
                 match key.code {
                     KeyCode::Enter => start_flash(&mut state, runtime),
+                    KeyCode::Up => state.flash_reset = state.flash_reset.previous(),
+                    KeyCode::Down => state.flash_reset = state.flash_reset.next(),
                     KeyCode::Char(c) => state.input.push(c),
                     KeyCode::Backspace => {
                         state.input.pop();
@@ -1525,7 +1532,7 @@ fn handle_signals_key(state: &mut AppState, key: KeyCode) {
     match state.act(&event) {
         Ok(()) => {
             line.record(state, level);
-            let level = if level { "HIGH" } else { "LOW" };
+            let level = if level { "ASSERTED" } else { "RELEASED" };
             state.set_status(format!("{}={level}", line.label()));
         }
         // Nothing is recorded on failure: the line did not move.
@@ -1570,8 +1577,10 @@ fn start_flash(state: &mut AppState, runtime: &tokio::runtime::Handle) {
     let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let port = state.port_name.clone();
+    let reset = state.flash_reset;
     runtime.spawn(async move {
-        let result = crate::esp::flash_with_progress(&port, &path, None, Some(&line_tx)).await;
+        let result =
+            crate::esp::flash_with_progress(&port, &path, None, reset, Some(&line_tx)).await;
         let _ = done_tx.send(result);
     });
 
@@ -1946,7 +1955,10 @@ fn flash_title(state: &AppState) -> String {
     if state.flash_running.is_some() {
         " espflash is running \u{2014} the port comes back when it ends ".to_string()
     } else {
-        " Path to a firmware image (Enter flashes, Esc cancels) ".to_string()
+        format!(
+            " Firmware image — reset: {} (Up/Down changes, Enter flashes, Esc cancels) ",
+            state.flash_reset
+        )
     }
 }
 
@@ -1974,6 +1986,10 @@ fn render_flash_popup(frame: &mut Frame, state: &AppState) {
         )),
         Line::from(Span::styled(
             "whether it worked or not.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("Reset before connect: {}", state.flash_reset),
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -2593,8 +2609,8 @@ fn render_signals_popup(frame: &mut Frame, state: &AppState) {
     let row = |label: &str, level: crate::standalone::SignalLine, key: char| {
         use crate::standalone::SignalLine;
         let (text, colour) = match level {
-            SignalLine::High => ("HIGH", Color::Green),
-            SignalLine::Low => ("LOW", Color::DarkGray),
+            SignalLine::High => ("ASSERTED", Color::Green),
+            SignalLine::Low => ("RELEASED", Color::DarkGray),
             SignalLine::Unknown => ("unknown", Color::Yellow),
         };
         Line::from(vec![
@@ -3097,7 +3113,7 @@ mod tests {
         assert!(text.contains("RTS  unknown"), "{text}");
         ControlLine::Dtr.record(&mut state, true);
         let text = draw(&state);
-        assert!(text.contains("DTR  HIGH"), "{text}");
+        assert!(text.contains("DTR  ASSERTED"), "{text}");
         assert!(text.contains("RTS  unknown"), "{text}");
     }
 

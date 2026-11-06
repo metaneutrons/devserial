@@ -19,6 +19,75 @@ use crate::reader::ConnectionState;
 use crate::serial_params::{DataBits, FlowControl, Parity, StopBits};
 use crate::storage::{BufferStats, StoredLine};
 
+/// How an ESP operation enters the ROM loader before synchronization.
+///
+/// `Auto` lets espflash select USB Serial/JTAG for Espressif PID `0x1001`
+/// and the UART-bridge sequence otherwise. `UsbReset` forces the official
+/// USB Serial/JTAG control-line sequence. The no-reset modes consume a loader
+/// that is already running, for example after BOOT/GPIO35 plus RESET.
+#[cfg(feature = "esp")]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum EspResetBefore {
+    /// Detect the reset sequence from the USB identity.
+    #[default]
+    Auto,
+    /// Force the native USB Serial/JTAG sequence used by Espressif tools.
+    UsbReset,
+    /// Do not change DTR/RTS; synchronize with an already running ROM loader.
+    NoReset,
+    /// Neither change DTR/RTS nor send the initial synchronization command.
+    NoResetNoSync,
+}
+
+#[cfg(feature = "esp")]
+impl EspResetBefore {
+    /// The next choice shown by compact terminal and desktop selectors.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::UsbReset,
+            Self::UsbReset => Self::NoReset,
+            Self::NoReset => Self::NoResetNoSync,
+            Self::NoResetNoSync => Self::Auto,
+        }
+    }
+
+    /// The preceding choice shown by compact terminal selectors.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Auto => Self::NoResetNoSync,
+            Self::UsbReset => Self::Auto,
+            Self::NoReset => Self::UsbReset,
+            Self::NoResetNoSync => Self::NoReset,
+        }
+    }
+}
+
+#[cfg(feature = "esp")]
+impl fmt::Display for EspResetBefore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::UsbReset => "usb-reset",
+            Self::NoReset => "no-reset",
+            Self::NoResetNoSync => "no-reset-no-sync",
+        })
+    }
+}
+
 /// Unique identifier for an RPC request/response pair.
 pub type RequestId = u64;
 
@@ -363,19 +432,31 @@ pub enum RequestPayload {
         port: String,
         firmware_path: String,
         baud: Option<u32>,
+        #[serde(default)]
+        reset: EspResetBefore,
     },
     /// Query ESP board info via espflash.
     #[cfg(feature = "esp")]
-    EspInfo { port: String },
+    EspInfo {
+        port: String,
+        #[serde(default)]
+        reset: EspResetBefore,
+    },
     /// Erase ESP flash via espflash.
     #[cfg(feature = "esp")]
-    EspErase { port: String },
+    EspErase {
+        port: String,
+        #[serde(default)]
+        reset: EspResetBefore,
+    },
     /// Write a raw binary to a flash address via espflash.
     #[cfg(feature = "esp")]
     EspWriteBin {
         port: String,
         file_path: String,
         address: String,
+        #[serde(default)]
+        reset: EspResetBefore,
     },
     /// State of the HTTP interface.
     #[cfg(feature = "rest")]
@@ -431,8 +512,8 @@ impl RequestPayload {
             | Self::GetStats { port } => Some(port),
             #[cfg(feature = "esp")]
             Self::EspFlash { port, .. }
-            | Self::EspInfo { port }
-            | Self::EspErase { port }
+            | Self::EspInfo { port, .. }
+            | Self::EspErase { port, .. }
             | Self::EspWriteBin { port, .. } => Some(port),
             #[cfg(feature = "rest")]
             Self::RestStatus | Self::RestEnable { .. } | Self::RestDisable => None,
@@ -594,6 +675,32 @@ mod tests {
         assert_eq!("exact".parse::<SearchMode>().unwrap(), SearchMode::Exact);
         assert_eq!("REGEX".parse::<SearchMode>().unwrap(), SearchMode::Regex);
         assert!("fuzzy".parse::<SearchMode>().is_err());
+    }
+
+    #[cfg(feature = "esp")]
+    #[test]
+    fn esp_reset_strategy_is_stable_and_old_requests_default_to_auto() {
+        assert_eq!(
+            serde_json::to_string(&EspResetBefore::UsbReset).unwrap(),
+            "\"usb-reset\""
+        );
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "action": "EspInfo",
+            "params": { "port": "/dev/cu.usbmodem1101" }
+        }))
+        .unwrap();
+        assert_eq!(
+            request,
+            RequestPayload::EspInfo {
+                port: "/dev/cu.usbmodem1101".into(),
+                reset: EspResetBefore::Auto,
+            }
+        );
+        assert_eq!(EspResetBefore::Auto.next(), EspResetBefore::UsbReset);
+        assert_eq!(
+            EspResetBefore::Auto.previous(),
+            EspResetBefore::NoResetNoSync
+        );
     }
 
     #[test]

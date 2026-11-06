@@ -17,7 +17,8 @@ use crate::paths;
 use crate::serial_params::{DEFAULT_BAUD, DataBits, FlowControl, Parity, StopBits};
 
 /// Names of the macros devserial ships with.
-pub const BUILTIN_MACRO_NAMES: [&str; 3] = ["reset", "enter_bootloader", "break"];
+pub const BUILTIN_MACRO_NAMES: [&str; 4] =
+    ["reset", "enter_bootloader", "enter_usb_bootloader", "break"];
 
 /// Top-level configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -309,6 +310,24 @@ pub fn builtin_macro(name: &str) -> Option<Vec<MacroStep>> {
             MacroStep::Delay { ms: 50 },
             MacroStep::Dtr { value: true },
             MacroStep::Delay { ms: 50 },
+            MacroStep::Rts { value: false },
+        ]),
+        // Espressif's USBJTAGSerialReset sequence. These booleans are serial
+        // API assertion states: `true` asserts the active-low control line.
+        // The repeated RTS write deliberately makes Windows usbser.sys
+        // propagate the preceding DTR change.
+        "enter_usb_bootloader" => Some(vec![
+            MacroStep::Rts { value: false },
+            MacroStep::Dtr { value: false },
+            MacroStep::Delay { ms: 100 },
+            MacroStep::Dtr { value: true },
+            MacroStep::Rts { value: false },
+            MacroStep::Delay { ms: 100 },
+            MacroStep::Rts { value: true },
+            MacroStep::Dtr { value: false },
+            MacroStep::Rts { value: true },
+            MacroStep::Delay { ms: 100 },
+            MacroStep::Dtr { value: false },
             MacroStep::Rts { value: false },
         ]),
         "break" => Some(vec![MacroStep::Write {
@@ -661,8 +680,35 @@ steps = [
         let config = Config::default();
         assert_eq!(config.macro_steps("reset").unwrap().len(), 3);
         assert_eq!(config.macro_steps("enter_bootloader").unwrap().len(), 6);
+        assert_eq!(
+            config.macro_steps("enter_usb_bootloader").unwrap().len(),
+            12
+        );
         assert_eq!(config.macro_steps("break").unwrap().len(), 1);
         assert!(config.macro_steps("nope").is_none());
+    }
+
+    #[test]
+    fn usb_bootloader_macro_matches_espressif_control_line_sequence() {
+        use MacroStep::{Delay, Dtr, Rts};
+
+        assert_eq!(
+            builtin_macro("enter_usb_bootloader").unwrap(),
+            vec![
+                Rts { value: false },
+                Dtr { value: false },
+                Delay { ms: 100 },
+                Dtr { value: true },
+                Rts { value: false },
+                Delay { ms: 100 },
+                Rts { value: true },
+                Dtr { value: false },
+                Rts { value: true },
+                Delay { ms: 100 },
+                Dtr { value: false },
+                Rts { value: false },
+            ]
+        );
     }
 
     #[test]

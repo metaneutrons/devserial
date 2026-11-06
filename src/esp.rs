@@ -20,6 +20,8 @@ use espflash::image_format::idf::IdfBootloaderFormat;
 use espflash::target::ProgressCallbacks;
 use serialport::{FlowControl, SerialPortType, UsbPortInfo};
 
+use crate::protocol::EspResetBefore;
+
 /// The baud rate the chip's ROM bootloader starts at.
 const CONNECT_BAUD: u32 = 115_200;
 
@@ -143,7 +145,7 @@ where
 }
 
 /// Open `port` and connect to the chip behind it.
-fn connect(port: &str, baud: Option<u32>) -> Result<Flasher, String> {
+fn connect(port: &str, baud: Option<u32>, reset: EspResetBefore) -> Result<Flasher, String> {
     let serial = serialport::new(port, CONNECT_BAUD)
         .flow_control(FlowControl::None)
         .open_native()
@@ -152,7 +154,12 @@ fn connect(port: &str, baud: Option<u32>) -> Result<Flasher, String> {
         serial,
         usb_info(port),
         ResetAfterOperation::HardReset,
-        ResetBeforeOperation::DefaultReset,
+        match reset {
+            EspResetBefore::Auto => ResetBeforeOperation::DefaultReset,
+            EspResetBefore::UsbReset => ResetBeforeOperation::UsbReset,
+            EspResetBefore::NoReset => ResetBeforeOperation::NoReset,
+            EspResetBefore::NoResetNoSync => ResetBeforeOperation::NoResetNoSync,
+        },
         baud.unwrap_or(CONNECT_BAUD),
     );
     // Use the flasher stub, verify what was written, and skip regions that are
@@ -205,8 +212,13 @@ fn describe(flasher: &mut Flasher, report: &mut Report) -> Result<(), String> {
 /// # Errors
 /// Returns error if the firmware cannot be read, the chip cannot be reached
 /// or the write fails.
-pub async fn flash(port: &str, firmware_path: &str, baud: Option<u32>) -> Result<String, String> {
-    flash_with_progress(port, firmware_path, baud, None).await
+pub async fn flash(
+    port: &str,
+    firmware_path: &str,
+    baud: Option<u32>,
+    reset: EspResetBefore,
+) -> Result<String, String> {
+    flash_with_progress(port, firmware_path, baud, reset, None).await
 }
 
 /// Flash firmware to an ESP device, reporting each line as it is written.
@@ -218,6 +230,7 @@ pub async fn flash_with_progress(
     port: &str,
     firmware_path: &str,
     baud: Option<u32>,
+    reset: EspResetBefore,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
     let (port, firmware, sink) = (
@@ -225,19 +238,20 @@ pub async fn flash_with_progress(
         PathBuf::from(firmware_path),
         progress.cloned(),
     );
-    blocking(move || flash_blocking(&port, &firmware, baud, Report::new(sink))).await
+    blocking(move || flash_blocking(&port, &firmware, baud, reset, Report::new(sink))).await
 }
 
 fn flash_blocking(
     port: &str,
     firmware: &Path,
     baud: Option<u32>,
+    reset: EspResetBefore,
     mut report: Report,
 ) -> Result<String, String> {
     // Read the image first: a missing file should not cost a reset of the chip.
     let elf = std::fs::read(firmware)
         .map_err(|error| format!("could not read {}: {error}", firmware.display()))?;
-    let mut flasher = connect(port, baud)?;
+    let mut flasher = connect(port, baud, reset)?;
     describe(&mut flasher, &mut report)?;
 
     let chip = flasher.chip();
@@ -289,11 +303,11 @@ fn flash_blocking(
 ///
 /// # Errors
 /// Returns error if the chip cannot be reached.
-pub async fn board_info(port: &str) -> Result<String, String> {
+pub async fn board_info(port: &str, reset: EspResetBefore) -> Result<String, String> {
     let port = port.to_owned();
     blocking(move || {
         let mut report = Report::new(None);
-        let mut flasher = connect(&port, None)?;
+        let mut flasher = connect(&port, None, reset)?;
         describe(&mut flasher, &mut report)?;
         Ok(report.into_output())
     })
@@ -304,8 +318,8 @@ pub async fn board_info(port: &str) -> Result<String, String> {
 ///
 /// # Errors
 /// Returns error if the chip cannot be reached or the erase fails.
-pub async fn erase_flash(port: &str) -> Result<String, String> {
-    erase_flash_with_progress(port, None).await
+pub async fn erase_flash(port: &str, reset: EspResetBefore) -> Result<String, String> {
+    erase_flash_with_progress(port, reset, None).await
 }
 
 /// Erase the entire flash, reporting each line as it is written.
@@ -314,12 +328,13 @@ pub async fn erase_flash(port: &str) -> Result<String, String> {
 /// Returns error if the chip cannot be reached or the erase fails.
 pub async fn erase_flash_with_progress(
     port: &str,
+    reset: EspResetBefore,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
     let (port, sink) = (port.to_owned(), progress.cloned());
     blocking(move || {
         let mut report = Report::new(sink);
-        let mut flasher = connect(&port, None)?;
+        let mut flasher = connect(&port, None, reset)?;
         describe(&mut flasher, &mut report)?;
         report.line("Erasing the flash");
         flasher
@@ -336,14 +351,19 @@ pub async fn erase_flash_with_progress(
 /// # Errors
 /// Returns error if the address or the file is not usable, the chip cannot be
 /// reached or the write fails.
-pub async fn write_bin(port: &str, file_path: &str, address: &str) -> Result<String, String> {
+pub async fn write_bin(
+    port: &str,
+    file_path: &str,
+    address: &str,
+    reset: EspResetBefore,
+) -> Result<String, String> {
     let address = parse_address(address)?;
     let (port, file) = (port.to_owned(), PathBuf::from(file_path));
     blocking(move || {
         let data = std::fs::read(&file)
             .map_err(|error| format!("could not read {}: {error}", file.display()))?;
         let mut report = Report::new(None);
-        let mut flasher = connect(&port, None)?;
+        let mut flasher = connect(&port, None, reset)?;
         describe(&mut flasher, &mut report)?;
         flasher
             .write_bin_to_flash(address, &data, &mut LineProgress::new(&mut report))
@@ -421,6 +441,7 @@ mod tests {
             "/dev/nonexistent_port_xyz",
             "/nonexistent/firmware.elf",
             None,
+            EspResetBefore::Auto,
         )
         .await
         .unwrap_err();
@@ -429,9 +450,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_port_is_named() {
-        let error = board_info("/dev/nonexistent_port_xyz").await.unwrap_err();
+        let error = board_info("/dev/nonexistent_port_xyz", EspResetBefore::Auto)
+            .await
+            .unwrap_err();
         assert!(error.contains("/dev/nonexistent_port_xyz"), "{error}");
-        let error = erase_flash("/dev/nonexistent_port_xyz").await.unwrap_err();
+        let error = erase_flash("/dev/nonexistent_port_xyz", EspResetBefore::Auto)
+            .await
+            .unwrap_err();
         assert!(error.contains("/dev/nonexistent_port_xyz"), "{error}");
     }
 }
