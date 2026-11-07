@@ -229,13 +229,13 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Windows and sessions.** All sessions live in one process with one Dock icon. A second `devserial monitor` invocation opens a window in the running instance instead of starting a second application. Ports already shown are marked and cannot be opened twice. A port the daemon already holds keeps its line settings when a monitor attaches to it; use the settings dialog or `devserial open` to change them.
 
-**Live controls.** Reset and Bootloader macros, a BREAK pulse, DTR and RTS buttons with an indicator beside each (a filled dot when the window set the line high, a ring when it set it low, a dash when it does not know, as after a macro or when the port was opened again; the level of an output line cannot be read back), timestamp, hex and color views, pause and auto-follow, clearing the view without touching the capture (Clear > Clear display), and emptying the stored capture (Clear > Clear capture…, also in the context menu of the buffer), which asks first, shows how many lines it would delete and offers a copy in the archive folder (on by default), deleting the lines above or below a line (right-click it: Delete Lines Above… and Delete Lines Below…, with the same question, the count and the copy; the line itself stays, and a deletion below a line stops at the last line the window had seen, so lines that arrived meanwhile are not taken), and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
+**Live controls.** Reset, Bootloader and USB Bootloader macros (the last is the native USB Serial/JTAG sequence of chips such as the ESP32-P4), a BREAK pulse, DTR and RTS buttons with an indicator beside each (a filled dot when the window asserted the line, a ring when it released it, a dash when it does not know, as after a macro or when the port was opened again; the level of an output line cannot be read back), timestamp, hex and color views, pause and auto-follow, clearing the view without touching the capture (Clear > Clear display), and emptying the stored capture (Clear > Clear capture…, also in the context menu of the buffer), which asks first, shows how many lines it would delete and offers a copy in the archive folder (on by default), deleting the lines above or below a line (right-click it: Delete Lines Above… and Delete Lines Below…, with the same question, the count and the copy; the line itself stays, and a deletion below a line stops at the last line the window had seen, so lines that arrived meanwhile are not taken), and a filter bar that takes a substring or, written as `/pattern/`, a regular expression.
 
 **Runtime reconfiguration.** Baud rate, framing and flow control can be changed while the session is open, without losing the buffer. The change is recorded as a marker line in the capture.
 
 **Transfers and export.** File transfer over ZMODEM, YMODEM and XMODEM from a dialog, and export of the whole database, the visible buffer or a line range to TXT, CSV or JSONL, either to a file or to the clipboard.
 
-**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. The `espflash` library is built in, so no separate tool has to be installed. The port is released while it runs and opened again afterwards, and a port that cannot be opened again is reported in the result.
+**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. A *Reset before connect* choice in the dialog selects how the ROM loader is entered (see "Writing, signals and transfers"). The `espflash` library is built in, so no separate tool has to be installed. The port is released while it runs and opened again afterwards, and a port that cannot be opened again is reported in the result.
 
 **Interface scale.** View > Zoom In, Zoom Out and Actual Size, the same two steps and a readout at the right end of the status bar, and `Cmd+Plus`, `Cmd+Minus` and `Cmd+0` on the keyboard. The scale is remembered between runs. Off macOS there is no menu bar, so the keyboard and the status bar are the way there.
 
@@ -272,10 +272,10 @@ devserial tui /dev/ttyUSB0 --baud 115200
 |-----|--------|
 | `F1` | About |
 | `F2` | Port settings: baud, data bits, parity, stop bits, flow control, line ending |
-| `F3` | Set DTR and RTS; a line shows `unknown` until it is set from here, and again after a macro or when the port is taken back |
+| `F3` | Set DTR and RTS (a line is `ASSERTED` or `RELEASED`); a line shows `unknown` until it is set from here, and again after a macro or when the port is taken back |
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
 | `F5` | Run a configured macro |
-| `F6` | Flash firmware to an ESP device |
+| `F6` | Flash firmware to an ESP device; `Up` and `Down` in the dialog choose how the ROM loader is entered |
 | `F7` | HTTP interface: address, port and token for the next start; `Tab` moves between the fields, `Enter` starts it, `Ctrl+K` stops it |
 | `F8` | Toggle semantic colors in the capture display |
 | `F9` | Daemon: idle period, what holds it, and what quitting does; `Enter` applies, `Ctrl+D` saves as default, `Tab` changes the quit setting |
@@ -369,7 +369,7 @@ devserial write /dev/ttyUSB0 "0xAABB" --hex       # raw bytes
 echo "AT+GMR" | devserial write /dev/ttyUSB0      # from standard input
 
 devserial break /dev/ttyUSB0 --duration-ms 250
-devserial signal /dev/ttyUSB0 --dtr true --rts false
+devserial signal /dev/ttyUSB0 --dtr true --rts false   # true asserts the line, false releases it; modem lines are active-low
 devserial macro /dev/ttyUSB0 reset
 devserial macro /dev/cu.usbmodem1101 enter_usb_bootloader
 
