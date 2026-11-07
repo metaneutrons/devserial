@@ -1103,6 +1103,11 @@ jobs:
           done
 
           brew tap-new --no-git "$tap"
+          # Homebrew refuses to load anything from a tap it was not told to
+          # trust. This tap is created here, empty, moments before and holds
+          # only the candidate formula and cask, so trusting it as a whole
+          # does not extend to any other tap.
+          brew trust "$tap"
           formula="$(brew --repository "$tap")/Formula/devserial.rb"
           # Serve the very archives that will be published, from a local URL.
           # The recorded checksums are not touched, so a wrong one still fails.
