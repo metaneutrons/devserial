@@ -422,7 +422,9 @@ the bootloader has to start before it can switch.
 
 The files and the address are checked before the chip is reset, and a table
 that has no such partition, or a frequency the chip does not have, fails before
-anything is written. The output lists the choices that were made.
+anything is written. The output names the partition table and the bootloader that
+will be written, also when they are the defaults, and lists the other choices
+that were made.
 
 Every ESP operation starts its output with a line `Reset before connect:`, which
 says what the choice came to for the USB identity it met. A connection that

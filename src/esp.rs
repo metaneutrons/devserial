@@ -577,13 +577,25 @@ impl Layout {
 
     /// What was asked for, one line per choice, for the output.
     fn describe(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        if let Some(path) = &self.partition_table {
-            lines.push(format!("Partition table: {}", path.display()));
-        }
-        if let Some(path) = &self.bootloader {
-            lines.push(format!("Bootloader: {}", path.display()));
-        }
+        // The bootloader and the table are always named. Left to the default
+        // they are the ones built into `espflash`, which replace what the chip
+        // has, and a project built with ESP-IDF has its own.
+        let mut lines = vec![
+            self.partition_table.as_ref().map_or_else(
+                || {
+                    "Partition table: the default of espflash, replacing the one on the chip"
+                        .to_owned()
+                },
+                |path| format!("Partition table: {}", path.display()),
+            ),
+            self.bootloader.as_ref().map_or_else(
+                || {
+                    "Bootloader: the one built into espflash, replacing the one on the chip"
+                        .to_owned()
+                },
+                |path| format!("Bootloader: {}", path.display()),
+            ),
+        ];
         if let Some(offset) = self.partition_table_offset {
             lines.push(format!("Partition table offset: {offset:#x}"));
         }
@@ -1358,11 +1370,16 @@ storage,   data, fat,      0x1020000, 0xfe0000,
 
     #[test]
     fn a_layout_is_described_for_the_output() {
+        // Even with nothing chosen, the output says that the bootloader and
+        // the table are `espflash`'s own and replace the chip's.
         assert_eq!(
             Layout::resolve(&EspFlashLayout::default())
                 .unwrap()
                 .describe(),
-            Vec::<String>::new()
+            [
+                "Partition table: the default of espflash, replacing the one on the chip",
+                "Bootloader: the one built into espflash, replacing the one on the chip",
+            ]
         );
         let directory = tempfile::tempdir().unwrap();
         let table = table_in(&directory);
@@ -1377,6 +1394,7 @@ storage,   data, fat,      0x1020000, 0xfe0000,
             layout.describe(),
             [
                 format!("Partition table: {table}"),
+                "Bootloader: the one built into espflash, replacing the one on the chip".to_owned(),
                 "Partition table offset: 0x8000".to_owned(),
                 "Application partition: ota_0".to_owned(),
             ]
@@ -1465,8 +1483,9 @@ storage,   data, fat,      0x1020000, 0xfe0000,
     #[test]
     fn the_flash_settings_are_described_for_the_output() {
         let layout = Layout::resolve(&with_settings("16mb", "QIO", "80")).unwrap();
+        let described = layout.describe();
         assert_eq!(
-            layout.describe(),
+            described[2..],
             [
                 "Flash size: 16MB, as asked",
                 "Flash mode: qio, as asked",
