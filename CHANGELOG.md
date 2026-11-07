@@ -4,6 +4,18 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.18](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.17...devserial-v0.2.18) (2026-11-07)
+
+
+### Features
+
+* **esp:** choose the layout and the flash settings of a flash ([#176](https://github.com/metaneutrons/devserial/issues/176)) ([df216e1](https://github.com/metaneutrons/devserial/commit/df216e178f9ce77b9a0897041409bf8992f1d900)), closes [#169](https://github.com/metaneutrons/devserial/issues/169)
+
+
+### Bug Fixes
+
+* **esp:** name the reset, refuse a non-ELF before it, follow a device that moves ([#173](https://github.com/metaneutrons/devserial/issues/173)) ([15114f2](https://github.com/metaneutrons/devserial/commit/15114f2ee6dabb0ee1f35cde607c8e429d51c5e7))
+
 ## [0.2.17](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.16...devserial-v0.2.17) (2026-11-07)
 
 
