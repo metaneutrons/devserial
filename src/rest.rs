@@ -1019,7 +1019,14 @@ async fn esp_flash(
         });
 
         let outcome = engine
-            .esp_flash_reporting(port, body.firmware, body.baud, body.reset, progress)
+            .esp_flash_reporting(
+                port,
+                body.firmware,
+                body.baud,
+                body.reset,
+                body.layout,
+                progress,
+            )
             .await;
 
         // The pump ends when the call above drops its sender, so waiting for
@@ -1766,6 +1773,10 @@ struct EspFlashBody {
     /// Reset strategy before synchronization.
     #[serde(default)]
     reset: crate::protocol::EspResetBefore,
+    /// Partition table, bootloader and target partition, when the defaults do
+    /// not fit the board.
+    #[serde(flatten)]
+    layout: crate::protocol::EspFlashLayout,
 }
 
 /// Reset choice on an ESP information request.
@@ -2441,6 +2452,7 @@ mod tests {
                 firmware_path: "f".into(),
                 baud: None,
                 reset: crate::protocol::EspResetBefore::Auto,
+                layout: crate::protocol::EspFlashLayout::default(),
             },
             R::EspInfo {
                 port: port(),
@@ -3274,6 +3286,41 @@ mod tests {
         let absent = get(addr, "/v1/jobs/nosuchjob/stream", None);
         assert!(absent.starts_with("HTTP/1.1 404"), "{absent}");
         assert!(absent.contains("no-such-job"), "{absent}");
+    }
+
+    /// The layout of a flash travels from the request body to the flash, so a
+    /// table that is not there is reported rather than ignored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_flash_route_hands_its_layout_on() {
+        let (_server, addr, _engine, dir, _storage) = listening_with_lines().await;
+        // Only the first bytes of an ELF count before the port is opened.
+        let firmware = dir.path().join("app.elf");
+        std::fs::write(&firmware, b"\x7fELF-not-really").unwrap();
+        let missing = dir.path().join("gone.csv");
+
+        let started = post(
+            addr,
+            "/v1/ports/mock_rest_port/esp/flash",
+            &serde_json::json!({
+                "firmware": firmware,
+                "partition_table": missing,
+                "target_app_partition": "ota_0",
+            })
+            .to_string(),
+        );
+        assert!(started.starts_with("HTTP/1.1 202"), "{started}");
+        let job = body_of(&started)["job"].as_str().unwrap().to_owned();
+        let seen = stream_until(
+            addr,
+            &format!("/v1/jobs/{job}/stream"),
+            None,
+            "event: done",
+            1,
+        );
+        assert!(
+            seen.contains("could not read the partition table"),
+            "the layout did not reach the flash: {seen}"
+        );
     }
 
     /// Every route the interface advertises is actually mounted.

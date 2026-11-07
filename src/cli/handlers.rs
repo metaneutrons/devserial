@@ -385,8 +385,20 @@ pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<()
             firmware,
             baud,
             before,
+            layout,
             monitor,
-        } => flash(session, &port, &firmware, baud, before, monitor, color),
+        } => flash(
+            session,
+            &FlashJob {
+                port: &port,
+                firmware: &firmware,
+                baud,
+                reset: before,
+                layout,
+            },
+            monitor,
+            color,
+        ),
 
         // Handled before reaching this router.
         Command::Mcp | Command::Daemon { .. } | Command::About | Command::Skill { .. } => {
@@ -921,22 +933,31 @@ fn print_search(outcome: &SearchOutcome, json: bool, color: bool) -> Result<(), 
     Ok(())
 }
 
+/// What `devserial flash` was asked to do.
+#[cfg(feature = "esp")]
+struct FlashJob<'a> {
+    port: &'a str,
+    firmware: &'a str,
+    baud: Option<u32>,
+    reset: crate::protocol::EspResetBefore,
+    layout: crate::protocol::EspFlashLayout,
+}
+
 #[cfg(feature = "esp")]
 fn flash(
     session: &Session,
-    port: &str,
-    firmware: &str,
-    baud: Option<u32>,
-    reset: crate::protocol::EspResetBefore,
+    job: &FlashJob<'_>,
     monitor: bool,
     color: bool,
 ) -> Result<(), CliError> {
+    let (port, firmware) = (job.port, job.firmware);
     println!("Flashing firmware {firmware} to {port}...");
     let response = session.request(RequestPayload::EspFlash {
         port: port.to_string(),
         firmware_path: firmware.to_string(),
-        baud,
-        reset,
+        baud: job.baud,
+        reset: job.reset,
+        layout: job.layout.clone(),
     })?;
     let ResponsePayload::EspSuccess(output) = response else {
         return Err(unexpected(&response));

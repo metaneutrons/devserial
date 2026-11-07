@@ -1110,10 +1110,11 @@ impl CommandEngine {
                 firmware_path,
                 baud,
                 reset,
+                layout,
             } => {
                 let log = format!("FLASH {firmware_path}");
                 self.esp_operation(&port, Some(log), |port| async move {
-                    crate::esp::flash(&port, &firmware_path, baud, reset).await
+                    crate::esp::flash(&port, &firmware_path, baud, reset, &layout).await
                 })
                 .await
             }
@@ -1167,12 +1168,20 @@ impl CommandEngine {
         firmware_path: String,
         baud: Option<u32>,
         reset: crate::protocol::EspResetBefore,
+        layout: crate::protocol::EspFlashLayout,
         progress: crate::esp::Progress,
     ) -> Result<ResponsePayload, EngineError> {
         let log = format!("FLASH {firmware_path}");
         self.esp_operation(&port, Some(log), |port| async move {
-            crate::esp::flash_with_progress(&port, &firmware_path, baud, reset, Some(&progress))
-                .await
+            crate::esp::flash_with_progress(
+                &port,
+                &firmware_path,
+                baud,
+                reset,
+                &layout,
+                Some(&progress),
+            )
+            .await
         })
         .await
     }

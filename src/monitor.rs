@@ -264,6 +264,9 @@ struct FlashDialog {
     baud: String,
     /// How the ROM loader is entered before synchronization.
     reset: crate::protocol::EspResetBefore,
+    /// The layout lines, as typed, in the order of
+    /// [`crate::protocol::EspFlashLayout::FORM`]. Empty means the default.
+    layout: [String; 7],
     /// Lines from the running tool, oldest first.
     log: Vec<String>,
     running: Option<RunningFlash>,
@@ -1660,12 +1663,16 @@ impl PortMonitorState {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let port = self.port_name.clone();
         let reset = self.flash.reset;
+        let layout = crate::protocol::EspFlashLayout::from_text(&std::array::from_fn(|index| {
+            self.flash.layout[index].as_str()
+        }));
         let repaint = ctx.clone();
         runtime.spawn(async move {
             let result = if erase {
                 crate::esp::erase_flash_with_progress(&port, reset, Some(&line_tx)).await
             } else {
-                crate::esp::flash_with_progress(&port, &path, baud, reset, Some(&line_tx)).await
+                crate::esp::flash_with_progress(&port, &path, baud, reset, &layout, Some(&line_tx))
+                    .await
             };
             let _ = done_tx.send(result);
             repaint.request_repaint();
@@ -1775,7 +1782,7 @@ impl PortMonitorState {
                     let path_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.flash.path)
                             .desired_width(FORM_WIDTH + 100.0)
-                            .hint_text("/path/to/firmware.bin or .elf"),
+                            .hint_text("/path/to/firmware.elf"),
                     );
                     path_resp.context_menu(|ui| {
                         text_edit_context_menu(ui, &mut self.flash.path);
@@ -1795,6 +1802,26 @@ impl PortMonitorState {
                                 .color(egui::Color32::from_rgb(140, 140, 150)),
                         );
                     });
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Layout (empty keeps espflash's choice):").strong(),
+                    );
+                    for ((label, hint), value) in crate::protocol::EspFlashLayout::FORM
+                        .iter()
+                        .zip(self.flash.layout.iter_mut())
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{label}:"));
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut *value)
+                                    .desired_width(FORM_WIDTH)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text(*hint),
+                            );
+                            response.context_menu(|ui| text_edit_context_menu(ui, value));
+                        });
+                    }
 
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("Reset before connect:").strong());

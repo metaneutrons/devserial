@@ -41,6 +41,38 @@ The capture outlives restarts of the device and of devserial. Narrow a read to
 what is new with `--after` or `--since`, so old output is not mistaken for a
 fresh answer.
 
+## ESP chips
+
+`devserial flash PORT IMAGE` (`serial_esp_flash`) takes an ELF image only. A raw
+or merged binary is written to a flash address with `serial_esp_write_bin`; an
+image merged from bootloader, partition table and application starts at
+address 0. `serial_esp_info` and `serial_esp_erase` reset the chip afterwards,
+so it runs its application again.
+
+`flash` writes the bootloader, the partition table and the application, and by
+default they are the ones built into `espflash`, not the ones of the board's
+project. A board with a layout of its own needs it named, or the flash replaces
+its partition table and its bootloader:
+
+- `--partition-table FILE`, `--bootloader FILE`, `--partition-table-offset
+  ADDRESS` and `--target-app-partition NAME` (`ota_1`, say), or the fields
+  `partition_table`, `bootloader`, `partition_table_offset` and
+  `target_app_partition` in MCP and HTTP.
+- `--flash-size`, `--flash-mode` and `--flash-frequency`, or `flash_size`,
+  `flash_mode` and `flash_frequency`, for what is written into the image
+  headers. Left out, the size is what the chip reports.
+
+The output of an ESP operation starts with `Reset before connect:` and names
+the reset it chose from the USB identity; `--before` (`reset` in MCP and HTTP)
+changes it. A chip that does not answer is put into download mode by hand,
+usually by holding BOOT and pressing RESET, and then reached with `no-reset`.
+
+Reading a flash back is not something devserial does. Before a flash replaces
+firmware that someone wants to keep, ask what is on the board, and take the
+backup with `espflash read-flash` over the whole partition that will be
+written, right before, because a board that is also updated by other means can
+have changed since an earlier backup.
+
 ## Ask the user first
 
 - Flashing or erasing a chip (`devserial flash`, the `serial_esp_*` tools)
