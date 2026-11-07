@@ -1469,8 +1469,10 @@ mod tests {
             "firmware_path": "app.elf",
             "partition_table": "partitions.csv",
             "target_app_partition": "ota_0",
+            "flash_frequency": "80MHz",
         }))
         .unwrap();
+        assert_eq!(params.layout.flash_frequency.as_deref(), Some("80MHz"));
         assert_eq!(
             params.layout.partition_table.as_deref(),
             Some("partitions.csv")
@@ -1486,6 +1488,9 @@ mod tests {
             "bootloader",
             "partition_table_offset",
             "target_app_partition",
+            "flash_size",
+            "flash_mode",
+            "flash_frequency",
         ] {
             assert!(properties.get(field).is_some(), "{field} missing: {schema}");
         }

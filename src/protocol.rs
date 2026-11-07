@@ -88,15 +88,16 @@ impl fmt::Display for EspResetBefore {
     }
 }
 
-/// Where the pieces of a flashed ESP image go, when `espflash`'s defaults do
-/// not fit the board.
+/// Where the pieces of a flashed ESP image go, and how the flash is described
+/// to the bootloader, when `espflash`'s defaults do not fit the board.
 ///
 /// Every field is optional and left out means the default of the `espflash`
 /// command: its own bootloader and partition table, the table at the chip's
-/// usual offset, and the first application partition as the target. A board
-/// with its own layout (a 32 MiB ESP32-P4 with two OTA slots, say) names the
-/// partition table here, so the application lands in the partition the board
-/// boots from.
+/// usual offset, the first application partition as the target, the flash
+/// size the chip reports, and the mode and frequency `espflash` uses for the
+/// chip. A board with its own layout (a 32 MiB ESP32-P4 with two OTA slots,
+/// say) names the partition table here, so the application lands in the
+/// partition the board boots from.
 #[cfg(feature = "esp")]
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, clap::Args,
@@ -120,31 +121,57 @@ pub struct EspFlashLayout {
     #[serde(default)]
     #[arg(long, value_name = "NAME")]
     pub target_app_partition: Option<String>,
+    /// Flash size written into the image headers, such as `16MB`. Left out,
+    /// it is the size the chip reports.
+    #[serde(default)]
+    #[arg(long, value_name = "SIZE")]
+    pub flash_size: Option<String>,
+    /// SPI flash mode written into the image headers: `qio`, `qout`, `dio` or
+    /// `dout`.
+    #[serde(default)]
+    #[arg(long, value_name = "MODE")]
+    pub flash_mode: Option<String>,
+    /// SPI flash frequency written into the image headers, such as `80MHz`.
+    /// Which ones are possible depends on the chip.
+    #[serde(default)]
+    #[arg(long, alias = "flash-freq", value_name = "FREQUENCY")]
+    pub flash_frequency: Option<String>,
 }
 
 #[cfg(feature = "esp")]
 impl EspFlashLayout {
-    /// The layout a window or a terminal form holds as four lines of text.
+    /// The fields a window or a terminal form holds as lines of text, in the
+    /// order of [`Self::FORM`].
     ///
     /// A line that is empty or only spaces is a field left at its default.
     #[must_use]
-    pub fn from_text(
-        partition_table: &str,
-        bootloader: &str,
-        partition_table_offset: &str,
-        target_app_partition: &str,
-    ) -> Self {
-        let field = |text: &str| {
-            let text = text.trim();
+    pub fn from_text(lines: &[&str; 7]) -> Self {
+        let field = |index: usize| {
+            let text = lines[index].trim();
             (!text.is_empty()).then(|| text.to_owned())
         };
         Self {
-            partition_table: field(partition_table),
-            bootloader: field(bootloader),
-            partition_table_offset: field(partition_table_offset),
-            target_app_partition: field(target_app_partition),
+            partition_table: field(0),
+            bootloader: field(1),
+            partition_table_offset: field(2),
+            target_app_partition: field(3),
+            flash_size: field(4),
+            flash_mode: field(5),
+            flash_frequency: field(6),
         }
     }
+
+    /// The label and an example for each line of a form, in the order
+    /// [`Self::from_text`] reads them.
+    pub const FORM: [(&'static str, &'static str); 7] = [
+        ("Partition table", "/path/to/partitions.csv or .bin"),
+        ("Bootloader", "/path/to/bootloader.bin"),
+        ("Table offset", "0x8000"),
+        ("App partition", "ota_0"),
+        ("Flash size", "32MB"),
+        ("Flash mode", "dio"),
+        ("Flash frequency", "80MHz"),
+    ];
 
     /// Whether every field is at its default.
     #[must_use]
@@ -153,6 +180,9 @@ impl EspFlashLayout {
             && self.bootloader.is_none()
             && self.partition_table_offset.is_none()
             && self.target_app_partition.is_none()
+            && self.flash_size.is_none()
+            && self.flash_mode.is_none()
+            && self.flash_frequency.is_none()
     }
 }
 
@@ -712,12 +742,15 @@ mod tests {
     #[cfg(feature = "esp")]
     #[test]
     fn a_layout_typed_in_a_form_leaves_empty_lines_at_the_default() {
-        let layout = EspFlashLayout::from_text(" /tmp/p.csv ", "", "   ", "ota_1");
+        let layout =
+            EspFlashLayout::from_text(&[" /tmp/p.csv ", "", "   ", "ota_1", "", "dio", ""]);
         assert_eq!(layout.partition_table.as_deref(), Some("/tmp/p.csv"));
         assert_eq!(layout.bootloader, None);
         assert_eq!(layout.partition_table_offset, None);
         assert_eq!(layout.target_app_partition.as_deref(), Some("ota_1"));
-        assert!(EspFlashLayout::from_text("", " ", "", "\t").is_default());
+        assert_eq!(layout.flash_mode.as_deref(), Some("dio"));
+        assert_eq!(layout.flash_size, None);
+        assert!(EspFlashLayout::from_text(&["", " ", "", "\t", "", "", " "]).is_default());
     }
 
     #[test]

@@ -325,44 +325,44 @@ impl RestField {
 /// means the configured value. The token is never filled from the daemon and
 /// is cleared once a start succeeds or the screen closes.
 /// The fields of the firmware prompt. The image path itself is the prompt's
-/// own line, `AppState::input`, so the layout fields come after it.
+/// own line, `AppState::input`, so the layout lines come after it.
 #[cfg(feature = "esp")]
 #[derive(Default)]
 struct FlashForm {
+    /// 0 is the image path, the others are the layout lines.
     field: usize,
-    partition_table: String,
-    bootloader: String,
-    offset: String,
-    target: String,
+    lines: [String; 7],
 }
 
 #[cfg(feature = "esp")]
 impl FlashForm {
-    /// The prompt's lines in the order Tab visits them.
-    const LABELS: [&'static str; 5] = [
-        "Firmware: ",
-        "Partition table (empty: espflash's): ",
-        "Bootloader (empty: espflash's): ",
-        "Table offset (empty: from the table): ",
-        "App partition (empty: the first): ",
-    ];
+    /// How many lines Tab visits: the image path and the layout lines.
+    const FIELDS: usize = 1 + crate::protocol::EspFlashLayout::FORM.len();
+
+    /// The label of the line being typed.
+    fn label(&self) -> String {
+        match self.field {
+            0 => "Firmware: ".to_owned(),
+            n => format!(
+                "{} (empty: default): ",
+                crate::protocol::EspFlashLayout::FORM[n - 1].0
+            ),
+        }
+    }
 
     const fn next(&mut self) {
-        self.field = (self.field + 1) % Self::LABELS.len();
+        self.field = (self.field + 1) % Self::FIELDS;
     }
 
     const fn previous(&mut self) {
-        self.field = (self.field + Self::LABELS.len() - 1) % Self::LABELS.len();
+        self.field = (self.field + Self::FIELDS - 1) % Self::FIELDS;
     }
 
-    /// The layout the four fields describe.
+    /// The layout the lines describe.
     fn layout(&self) -> crate::protocol::EspFlashLayout {
-        crate::protocol::EspFlashLayout::from_text(
-            &self.partition_table,
-            &self.bootloader,
-            &self.offset,
-            &self.target,
-        )
+        crate::protocol::EspFlashLayout::from_text(&std::array::from_fn(|index| {
+            self.lines[index].as_str()
+        }))
     }
 }
 
@@ -404,10 +404,7 @@ impl AppState {
     const fn flash_text(&mut self) -> &mut String {
         match self.flash_form.field {
             0 => &mut self.input,
-            1 => &mut self.flash_form.partition_table,
-            2 => &mut self.flash_form.bootloader,
-            3 => &mut self.flash_form.offset,
-            _ => &mut self.flash_form.target,
+            n => &mut self.flash_form.lines[n - 1],
         }
     }
 
@@ -416,10 +413,7 @@ impl AppState {
     fn flash_shown(&self) -> &str {
         match self.flash_form.field {
             0 => &self.input,
-            1 => &self.flash_form.partition_table,
-            2 => &self.flash_form.bootloader,
-            3 => &self.flash_form.offset,
-            _ => &self.flash_form.target,
+            n => &self.flash_form.lines[n - 1],
         }
     }
 
@@ -1961,6 +1955,8 @@ const fn next_flow_control(current: FlowControl) -> FlowControl {
 
 /// The input line and the title that says what the current mode expects.
 fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+    #[cfg(feature = "esp")]
+    let flash_label = state.flash_form.label();
     // Every title is owned: two of them carry the chosen protocol.
     let (prompt, title): (&str, String) = match state.input_mode {
         InputMode::Normal => (
@@ -2003,10 +1999,7 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::DeleteLines => ("", " Delete lines ".to_string()),
         InputMode::SkillOffer => ("", " AI tools ".to_string()),
         #[cfg(feature = "esp")]
-        InputMode::Flash => (
-            FlashForm::LABELS[state.flash_form.field],
-            flash_title(state),
-        ),
+        InputMode::Flash => (flash_label.as_str(), flash_title(state)),
     };
 
     #[cfg(feature = "rest")]
@@ -2078,14 +2071,11 @@ fn render_flash_popup(frame: &mut Frame, state: &AppState) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    let form = &state.flash_form;
     let mut chosen = 0;
-    for (label, value) in [
-        ("Partition table", &form.partition_table),
-        ("Bootloader", &form.bootloader),
-        ("Table offset", &form.offset),
-        ("App partition", &form.target),
-    ] {
+    for ((label, _), value) in crate::protocol::EspFlashLayout::FORM
+        .iter()
+        .zip(&state.flash_form.lines)
+    {
         if !value.trim().is_empty() {
             chosen += 1;
             lines.push(Line::from(Span::styled(

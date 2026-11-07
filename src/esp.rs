@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use espflash::connection::{Connection, ResetAfterOperation, ResetBeforeOperation};
-use espflash::flasher::{FlashData, FlashSettings, FlashSize, Flasher};
+use espflash::flasher::{FlashData, FlashFrequency, FlashMode, FlashSettings, FlashSize, Flasher};
 use espflash::image_format::Metadata;
 use espflash::image_format::idf::IdfBootloaderFormat;
 use espflash::target::{Chip, ProgressCallbacks, XtalFrequency};
@@ -462,12 +462,59 @@ pub async fn flash_with_progress(
 }
 
 /// An [`EspFlashLayout`] that has been checked as far as it can be without the
-/// chip: the offset is a number and each file can be read.
+/// chip: the offset is a number, each file can be read and the flash settings
+/// are ones `espflash` knows. Whether the chip has them is found out when the
+/// image is built.
 struct Layout {
     partition_table: Option<PathBuf>,
     bootloader: Option<PathBuf>,
     partition_table_offset: Option<u32>,
     target_app_partition: Option<String>,
+    flash_size: Option<FlashSize>,
+    flash_mode: Option<FlashMode>,
+    flash_frequency: Option<FlashFrequency>,
+}
+
+/// A flash size as written on the command line: `16MB`, `16mb` or ` 16MB `.
+fn parse_flash_size(text: &str) -> Result<FlashSize, String> {
+    text.trim().parse().map_err(|_| {
+        format!(
+            "`{}` is not a flash size; use one of 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, \
+             32MB, 64MB, 128MB or 256MB",
+            text.trim()
+        )
+    })
+}
+
+/// A flash frequency the way it is spelled to the user: `80MHz`.
+fn frequency_name(frequency: FlashFrequency) -> String {
+    serde_json::to_value(frequency)
+        .ok()
+        .and_then(|name| name.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{frequency:?}"))
+}
+
+/// A flash mode: `qio`, `qout`, `dio` or `dout`, in any case.
+fn parse_flash_mode(text: &str) -> Result<FlashMode, String> {
+    serde_json::from_value(serde_json::Value::String(text.trim().to_lowercase())).map_err(|_| {
+        format!(
+            "`{}` is not a flash mode; use qio, qout, dio or dout",
+            text.trim()
+        )
+    })
+}
+
+/// A flash frequency: `80MHz`, `80mhz` or just `80`.
+fn parse_flash_frequency(text: &str) -> Result<FlashFrequency, String> {
+    let lowered = text.trim().to_lowercase();
+    let number = lowered.strip_suffix("mhz").unwrap_or(&lowered).trim();
+    serde_json::from_value(serde_json::Value::String(format!("{number}MHz"))).map_err(|_| {
+        format!(
+            "`{}` is not a flash frequency; use one of 12MHz, 15MHz, 16MHz, 20MHz, 24MHz, \
+             26MHz, 30MHz, 40MHz, 48MHz, 60MHz or 80MHz, as far as the chip has it",
+            text.trim()
+        )
+    })
 }
 
 impl Layout {
@@ -505,7 +552,27 @@ impl Layout {
                 .map(parse_address)
                 .transpose()?,
             target_app_partition: target,
+            flash_size: layout
+                .flash_size
+                .as_deref()
+                .map(parse_flash_size)
+                .transpose()?,
+            flash_mode: layout
+                .flash_mode
+                .as_deref()
+                .map(parse_flash_mode)
+                .transpose()?,
+            flash_frequency: layout
+                .flash_frequency
+                .as_deref()
+                .map(parse_flash_frequency)
+                .transpose()?,
         })
+    }
+
+    /// The flash size to use: the one asked for, else the one the chip has.
+    fn size_for(&self, detected: FlashSize) -> FlashSize {
+        self.flash_size.unwrap_or(detected)
     }
 
     /// What was asked for, one line per choice, for the output.
@@ -522,6 +589,19 @@ impl Layout {
         }
         if let Some(name) = &self.target_app_partition {
             lines.push(format!("Application partition: {name}"));
+        }
+        if let Some(size) = self.flash_size {
+            lines.push(format!("Flash size: {size}, as asked"));
+        }
+        if let Some(mode) = self.flash_mode {
+            let name = format!("{mode:?}").to_lowercase();
+            lines.push(format!("Flash mode: {name}, as asked"));
+        }
+        if let Some(frequency) = self.flash_frequency {
+            lines.push(format!(
+                "Flash frequency: {}, as asked",
+                frequency_name(frequency)
+            ));
         }
         lines
     }
@@ -571,7 +651,7 @@ fn flash_blocking(
         .ok()
         .flatten()
         .unwrap_or_else(FlashSize::default);
-    flasher.set_flash_size(size);
+    flasher.set_flash_size(layout.size_for(size));
     let image = build_image(&elf, chip, xtal, size, &layout)?;
 
     for line in layout.describe() {
@@ -586,16 +666,21 @@ fn flash_blocking(
 }
 
 /// The image `flash` writes: bootloader, partition table and application, each
-/// at the address the layout, or the defaults, give it.
+/// at the address the layout, or the defaults, give it, and the flash settings
+/// in the headers. `detected` is the flash size the chip reports.
 fn build_image<'a>(
     elf: &'a [u8],
     chip: Chip,
     xtal: XtalFrequency,
-    size: FlashSize,
+    detected: FlashSize,
     layout: &Layout,
 ) -> Result<IdfBootloaderFormat<'a>, String> {
     let flash_data = FlashData::new(
-        FlashSettings::new(None, Some(size), None),
+        FlashSettings::new(
+            layout.flash_mode,
+            Some(layout.size_for(detected)),
+            layout.flash_frequency,
+        ),
         0,
         None,
         chip,
@@ -1294,6 +1379,98 @@ storage,   data, fat,      0x1020000, 0xfe0000,
                 format!("Partition table: {table}"),
                 "Partition table offset: 0x8000".to_owned(),
                 "Application partition: ota_0".to_owned(),
+            ]
+        );
+    }
+
+    /// The first four bytes of the bootloader and of the application `flash`
+    /// would write: the image magic, the segment count, the flash mode, and
+    /// the size and frequency.
+    fn headers(layout: &EspFlashLayout) -> Result<([u8; 4], [u8; 4]), String> {
+        let layout = Layout::resolve(layout)?;
+        let elf = p4_elf();
+        let image = build_image(
+            &elf,
+            Chip::Esp32p4,
+            XtalFrequency::_40Mhz,
+            FlashSize::_32Mb,
+            &layout,
+        )?;
+        let segments: Vec<_> = image.flash_segments().collect();
+        let head = |at: usize| -> [u8; 4] { segments[at].data[..4].try_into().unwrap() };
+        Ok((head(0), head(2)))
+    }
+
+    fn bootloader_header(layout: &EspFlashLayout) -> Result<[u8; 4], String> {
+        headers(layout).map(|(bootloader, _)| bootloader)
+    }
+
+    fn with_settings(size: &str, mode: &str, frequency: &str) -> EspFlashLayout {
+        let some = |text: &str| (!text.is_empty()).then(|| text.to_owned());
+        EspFlashLayout {
+            flash_size: some(size),
+            flash_mode: some(mode),
+            flash_frequency: some(frequency),
+            ..EspFlashLayout::default()
+        }
+    }
+
+    #[test]
+    fn the_flash_settings_are_written_into_the_bootloader_header() {
+        // The chip's own: 32 MB, 40 MHz, and the mode the bootloader had.
+        let default = bootloader_header(&EspFlashLayout::default()).unwrap();
+        assert_eq!(default[0], 0xe9);
+        assert_eq!(default[3], 0x50, "32 MB is 5, 40 MHz is 0");
+
+        // Frequency and size each change their half of the byte.
+        let fast = bootloader_header(&with_settings("", "", "80MHz")).unwrap();
+        assert_eq!(fast[3], 0x5f);
+        let small = bootloader_header(&with_settings("16mb", "", "")).unwrap();
+        assert_eq!(small[3], 0x40);
+        let both = bootloader_header(&with_settings(" 8MB ", "", "80")).unwrap();
+        assert_eq!(both[3], 0x3f);
+
+        // The mode is the third byte, and only changes when it is asked for.
+        // `espflash` keeps the bootloader at dual I/O when quad is asked for,
+        // because the bootloader has to boot before it can switch, and puts
+        // the mode into the application's header.
+        let (qio_boot, qio_app) = headers(&with_settings("", "QIO", "")).unwrap();
+        let (dout_boot, dout_app) = headers(&with_settings("", "dout", "")).unwrap();
+        assert_eq!((qio_boot[2], qio_app[2]), (2, 0));
+        assert_eq!((dout_boot[2], dout_app[2]), (3, 3));
+        let (dio_boot, dio_app) = headers(&with_settings("", "dio", "")).unwrap();
+        assert_eq!((dio_boot[2], dio_app[2]), (2, 2));
+        assert_eq!(default[2], dio_boot[2]);
+    }
+
+    #[test]
+    fn a_frequency_the_chip_does_not_have_is_refused_before_a_write() {
+        // The P4 has 20, 26, 40 and 80 MHz; 60 MHz is a known value that
+        // belongs to another chip.
+        let error = bootloader_header(&with_settings("", "", "60MHz")).unwrap_err();
+        assert!(error.contains("Nothing was written"), "{error}");
+    }
+
+    #[test]
+    fn flash_settings_that_are_not_settings_are_refused_before_the_chip_is_touched() {
+        let refused = |layout: EspFlashLayout| Layout::resolve(&layout).err().unwrap();
+        assert!(refused(with_settings("17MB", "", "")).contains("is not a flash size"));
+        assert!(refused(with_settings("", "tri", "")).contains("is not a flash mode"));
+        assert!(refused(with_settings("", "", "fast")).contains("is not a flash frequency"));
+        assert!(refused(with_settings("", "", "81MHz")).contains("is not a flash frequency"));
+        // Counter-probe: the same fields, spelled as espflash spells them.
+        assert!(Layout::resolve(&with_settings("16MB", "dio", "80MHz")).is_ok());
+    }
+
+    #[test]
+    fn the_flash_settings_are_described_for_the_output() {
+        let layout = Layout::resolve(&with_settings("16mb", "QIO", "80")).unwrap();
+        assert_eq!(
+            layout.describe(),
+            [
+                "Flash size: 16MB, as asked",
+                "Flash mode: qio, as asked",
+                "Flash frequency: 80MHz, as asked",
             ]
         );
     }

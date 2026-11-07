@@ -264,16 +264,9 @@ struct FlashDialog {
     baud: String,
     /// How the ROM loader is entered before synchronization.
     reset: crate::protocol::EspResetBefore,
-    /// Partition table file, as typed. Empty means espflash's own.
-    partition_table: String,
-    /// Bootloader image, as typed. Empty means espflash's own.
-    bootloader: String,
-    /// Flash address of the partition table, as typed. Empty means derived
-    /// from the table.
-    table_offset: String,
-    /// Application partition that receives the image, as typed. Empty means
-    /// the first one.
-    app_partition: String,
+    /// The layout lines, as typed, in the order of
+    /// [`crate::protocol::EspFlashLayout::FORM`]. Empty means the default.
+    layout: [String; 7],
     /// Lines from the running tool, oldest first.
     log: Vec<String>,
     running: Option<RunningFlash>,
@@ -1670,12 +1663,9 @@ impl PortMonitorState {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let port = self.port_name.clone();
         let reset = self.flash.reset;
-        let layout = crate::protocol::EspFlashLayout::from_text(
-            &self.flash.partition_table,
-            &self.flash.bootloader,
-            &self.flash.table_offset,
-            &self.flash.app_partition,
-        );
+        let layout = crate::protocol::EspFlashLayout::from_text(&std::array::from_fn(|index| {
+            self.flash.layout[index].as_str()
+        }));
         let repaint = ctx.clone();
         runtime.spawn(async move {
             let result = if erase {
@@ -1817,27 +1807,17 @@ impl PortMonitorState {
                     ui.label(
                         egui::RichText::new("Layout (empty keeps espflash's choice):").strong(),
                     );
-                    for (label, value, hint) in [
-                        (
-                            "Partition table",
-                            &mut self.flash.partition_table,
-                            "/path/to/partitions.csv or .bin",
-                        ),
-                        (
-                            "Bootloader",
-                            &mut self.flash.bootloader,
-                            "/path/to/bootloader.bin",
-                        ),
-                        ("Table offset", &mut self.flash.table_offset, "0x8000"),
-                        ("App partition", &mut self.flash.app_partition, "ota_0"),
-                    ] {
+                    for ((label, hint), value) in crate::protocol::EspFlashLayout::FORM
+                        .iter()
+                        .zip(self.flash.layout.iter_mut())
+                    {
                         ui.horizontal(|ui| {
                             ui.label(format!("{label}:"));
                             let response = ui.add(
                                 egui::TextEdit::singleline(&mut *value)
                                     .desired_width(FORM_WIDTH)
                                     .font(egui::TextStyle::Monospace)
-                                    .hint_text(hint),
+                                    .hint_text(*hint),
                             );
                             response.context_menu(|ui| text_edit_context_menu(ui, value));
                         });
