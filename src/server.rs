@@ -461,7 +461,7 @@ pub struct EspFlashParams {
     #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
     pub port_name: String,
     /// Path to the firmware file.
-    #[schemars(description = "Path to the firmware file (ELF or .bin)")]
+    #[schemars(description = "Path to the firmware file (ELF)")]
     pub firmware_path: String,
     /// Optional baud rate for flashing.
     #[schemars(description = "Flash baud rate (default: espflash default)")]
@@ -470,6 +470,10 @@ pub struct EspFlashParams {
     #[serde(default)]
     #[schemars(description = "Reset strategy: auto, usb-reset, no-reset, or no-reset-no-sync")]
     pub reset: crate::protocol::EspResetBefore,
+    /// Partition table, bootloader and target partition, when the defaults do
+    /// not fit the board.
+    #[serde(flatten)]
+    pub layout: crate::protocol::EspFlashLayout,
 }
 
 /// Parameters for ESP operations that only need a port and reset strategy.
@@ -1030,6 +1034,7 @@ impl DevSerialServer {
             firmware_path: params.firmware_path,
             baud: params.baud,
             reset: params.reset,
+            layout: params.layout,
         })
         .await
     }
@@ -1456,6 +1461,36 @@ mod limit_docs {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "esp")]
+    #[test]
+    fn the_flash_tool_takes_the_layout_as_plain_fields() {
+        let params: super::EspFlashParams = serde_json::from_value(serde_json::json!({
+            "port_name": "/dev/cu.usbmodem1101",
+            "firmware_path": "app.elf",
+            "partition_table": "partitions.csv",
+            "target_app_partition": "ota_0",
+        }))
+        .unwrap();
+        assert_eq!(
+            params.layout.partition_table.as_deref(),
+            Some("partitions.csv")
+        );
+        assert_eq!(params.layout.target_app_partition.as_deref(), Some("ota_0"));
+        assert!(params.layout.bootloader.is_none());
+
+        // The schema lists them next to the others, not under a nested name.
+        let schema = serde_json::to_value(schemars::schema_for!(super::EspFlashParams)).unwrap();
+        let properties = &schema["properties"];
+        for field in [
+            "partition_table",
+            "bootloader",
+            "partition_table_offset",
+            "target_app_partition",
+        ] {
+            assert!(properties.get(field).is_some(), "{field} missing: {schema}");
+        }
+    }
+
     use super::*;
     use crate::config::PortConfig;
     use crate::port_manager::PortManagerHandle;

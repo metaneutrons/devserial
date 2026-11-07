@@ -235,7 +235,7 @@ Every device is offered once. On macOS a port exists twice in `/dev`, as a callo
 
 **Transfers and export.** File transfer over ZMODEM, YMODEM and XMODEM from a dialog, and export of the whole database, the visible buffer or a line range to TXT, CSV or JSONL, either to a file or to the clipboard.
 
-**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. A *Reset before connect* choice in the dialog selects how the ROM loader is entered (see "Writing, signals and transfers"). The `espflash` library is built in, so no separate tool has to be installed. The port is released while it runs and opened again afterwards, and a port that cannot be opened again is reported in the result.
+**Firmware.** Flashing an ESP device, reading its chip information and erasing its flash from the toolbar, with the tool's output streamed into the window while it runs. A *Reset before connect* choice in the dialog selects how the ROM loader is entered (see "Writing, signals and transfers"). Four optional fields name a partition table, a bootloader, the table's address and the application partition, for boards whose layout is not the default one. The `espflash` library is built in, so no separate tool has to be installed. The port is released while it runs and opened again afterwards, and a port that cannot be opened again is reported in the result.
 
 **Interface scale.** View > Zoom In, Zoom Out and Actual Size, the same two steps and a readout at the right end of the status bar, and `Cmd+Plus`, `Cmd+Minus` and `Cmd+0` on the keyboard. The scale is remembered between runs. Off macOS there is no menu bar, so the keyboard and the status bar are the way there.
 
@@ -275,7 +275,7 @@ devserial tui /dev/ttyUSB0 --baud 115200
 | `F3` | Set DTR and RTS (a line is `ASSERTED` or `RELEASED`); a line shows `unknown` until it is set from here, and again after a macro or when the port is taken back |
 | `F4` or `Ctrl+B` | Send a BREAK pulse |
 | `F5` | Run a configured macro |
-| `F6` | Flash firmware to an ESP device; `Up` and `Down` in the dialog choose how the ROM loader is entered |
+| `F6` | Flash firmware to an ESP device; `Tab` in the dialog moves between the image, the partition table, the bootloader, the table offset and the application partition, `Up` and `Down` choose how the ROM loader is entered |
 | `F7` | HTTP interface: address, port and token for the next start; `Tab` moves between the fields, `Enter` starts it, `Ctrl+K` stops it |
 | `F8` | Toggle semantic colors in the capture display |
 | `F9` | Daemon: idle period, what holds it, and what quitting does; `Enter` applies, `Ctrl+D` saves as default, `Tab` changes the quit setting |
@@ -394,6 +394,20 @@ it `devserial flash PORT IMAGE --before usb-reset`; REST and MCP use the
 native USB Serial/JTAG sequence, and `no-reset` consumes a ROM loader entered
 manually with BOOT plus RESET. `no-reset-no-sync` is reserved for an already
 synchronized loader session.
+
+`flash` writes the bootloader, the partition table and the application with the
+defaults of the `espflash` command: its own bootloader and partition table, and
+the first application partition as the target. A board with a layout of its own
+names it. `--partition-table FILE` takes a CSV or a binary table,
+`--bootloader FILE` a second stage bootloader, `--partition-table-offset
+ADDRESS` the address of the table, and `--target-app-partition NAME` the
+application partition that receives the image, such as `ota_1`. REST and MCP
+take the same four fields (`partition_table`, `bootloader`,
+`partition_table_offset`, `target_app_partition`), the window and the terminal
+monitor the same four lines in their flash form. Every field left out keeps
+the default. The files and the address are checked before the chip is reset,
+and a table that has no such partition fails before anything is written. The
+output lists the choices that were made.
 
 Every ESP operation starts its output with a line `Reset before connect:`, which
 says what the choice came to for the USB identity it met. A connection that

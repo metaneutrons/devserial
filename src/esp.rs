@@ -19,10 +19,10 @@ use espflash::connection::{Connection, ResetAfterOperation, ResetBeforeOperation
 use espflash::flasher::{FlashData, FlashSettings, FlashSize, Flasher};
 use espflash::image_format::Metadata;
 use espflash::image_format::idf::IdfBootloaderFormat;
-use espflash::target::ProgressCallbacks;
+use espflash::target::{Chip, ProgressCallbacks, XtalFrequency};
 use serialport::{FlowControl, SerialPortInfo, SerialPortType, UsbPortInfo};
 
-use crate::protocol::EspResetBefore;
+use crate::protocol::{EspFlashLayout, EspResetBefore};
 
 /// The baud rate the chip's ROM bootloader starts at.
 const CONNECT_BAUD: u32 = 115_200;
@@ -433,8 +433,9 @@ pub async fn flash(
     firmware_path: &str,
     baud: Option<u32>,
     reset: EspResetBefore,
+    layout: &EspFlashLayout,
 ) -> Result<String, String> {
-    flash_with_progress(port, firmware_path, baud, reset, None).await
+    flash_with_progress(port, firmware_path, baud, reset, layout, None).await
 }
 
 /// Flash firmware to an ESP device, reporting each line as it is written.
@@ -447,14 +448,83 @@ pub async fn flash_with_progress(
     firmware_path: &str,
     baud: Option<u32>,
     reset: EspResetBefore,
+    layout: &EspFlashLayout,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
-    let (port, firmware, sink) = (
+    let (port, firmware, layout, sink) = (
         port.to_owned(),
         PathBuf::from(firmware_path),
+        layout.clone(),
         progress.cloned(),
     );
-    blocking(move || flash_blocking(&port, &firmware, baud, reset, Report::new(sink))).await
+    blocking(move || flash_blocking(&port, &firmware, baud, reset, &layout, Report::new(sink)))
+        .await
+}
+
+/// An [`EspFlashLayout`] that has been checked as far as it can be without the
+/// chip: the offset is a number and each file can be read.
+struct Layout {
+    partition_table: Option<PathBuf>,
+    bootloader: Option<PathBuf>,
+    partition_table_offset: Option<u32>,
+    target_app_partition: Option<String>,
+}
+
+impl Layout {
+    /// Check `layout` before the chip is touched, so a typo costs no reset.
+    fn resolve(layout: &EspFlashLayout) -> Result<Self, String> {
+        let readable = |what: &str, path: Option<&String>| -> Result<Option<PathBuf>, String> {
+            path.map(|path| {
+                let path = PathBuf::from(path);
+                std::fs::File::open(&path)
+                    .map(|_| path.clone())
+                    .map_err(|error| {
+                        format!("could not read the {what} {}: {error}", path.display())
+                    })
+            })
+            .transpose()
+        };
+        let target = layout
+            .target_app_partition
+            .as_deref()
+            .map(str::trim)
+            .map(|name| {
+                if name.is_empty() {
+                    Err("the target application partition has no name".to_owned())
+                } else {
+                    Ok(name.to_owned())
+                }
+            })
+            .transpose()?;
+        Ok(Self {
+            partition_table: readable("partition table", layout.partition_table.as_ref())?,
+            bootloader: readable("bootloader", layout.bootloader.as_ref())?,
+            partition_table_offset: layout
+                .partition_table_offset
+                .as_deref()
+                .map(parse_address)
+                .transpose()?,
+            target_app_partition: target,
+        })
+    }
+
+    /// What was asked for, one line per choice, for the output.
+    fn describe(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(path) = &self.partition_table {
+            lines.push(format!("Partition table: {}", path.display()));
+        }
+        if let Some(path) = &self.bootloader {
+            lines.push(format!("Bootloader: {}", path.display()));
+        }
+        if let Some(offset) = self.partition_table_offset {
+            lines.push(format!("Partition table offset: {offset:#x}"));
+        }
+        if let Some(name) = &self.target_app_partition {
+            lines.push(format!("Application partition: {name}"));
+        }
+        lines
+    }
 }
 
 fn flash_blocking(
@@ -462,13 +532,16 @@ fn flash_blocking(
     firmware: &Path,
     baud: Option<u32>,
     reset: EspResetBefore,
+    layout: &EspFlashLayout,
     mut report: Report,
 ) -> Result<String, String> {
     // Read and check the image first: a missing file, or one that is not an
-    // ELF, should not cost a reset of the chip.
+    // ELF, should not cost a reset of the chip. The same goes for a layout
+    // that names a file that is not there or an address that is not one.
     let elf = std::fs::read(firmware)
         .map_err(|error| format!("could not read {}: {error}", firmware.display()))?;
     ensure_elf(firmware, &elf)?;
+    let layout = Layout::resolve(layout)?;
     let mut flasher = connect(port, baud, reset, &mut report)?;
     describe(&mut flasher, &mut report)?;
 
@@ -499,6 +572,28 @@ fn flash_blocking(
         .flatten()
         .unwrap_or_else(FlashSize::default);
     flasher.set_flash_size(size);
+    let image = build_image(&elf, chip, xtal, size, &layout)?;
+
+    for line in layout.describe() {
+        report.line(line);
+    }
+    report.line(format!("Flashing {}", firmware.display()));
+    flasher
+        .load_image_to_flash(&mut LineProgress::new(&mut report), image.into())
+        .map_err(|error| format!("flashing failed: {error}"))?;
+    report.line("Flashing has completed");
+    Ok(report.into_output())
+}
+
+/// The image `flash` writes: bootloader, partition table and application, each
+/// at the address the layout, or the defaults, give it.
+fn build_image<'a>(
+    elf: &'a [u8],
+    chip: Chip,
+    xtal: XtalFrequency,
+    size: FlashSize,
+    layout: &Layout,
+) -> Result<IdfBootloaderFormat<'a>, String> {
     let flash_data = FlashData::new(
         FlashSettings::new(None, Some(size), None),
         0,
@@ -506,15 +601,15 @@ fn flash_blocking(
         chip,
         xtal,
     );
-    let image = IdfBootloaderFormat::new(&elf, &flash_data, None, None, None, None)
-        .map_err(|error| format!("could not build the flash image: {error}"))?;
-
-    report.line(format!("Flashing {}", firmware.display()));
-    flasher
-        .load_image_to_flash(&mut LineProgress::new(&mut report), image.into())
-        .map_err(|error| format!("flashing failed: {error}"))?;
-    report.line("Flashing has completed");
-    Ok(report.into_output())
+    IdfBootloaderFormat::new(
+        elf,
+        &flash_data,
+        layout.partition_table.as_deref(),
+        layout.bootloader.as_deref(),
+        layout.partition_table_offset,
+        layout.target_app_partition.as_deref(),
+    )
+    .map_err(|error| format!("could not build the flash image: {error}. Nothing was written."))
 }
 
 /// Let the chip leave the loader and run its application again.
@@ -680,6 +775,7 @@ mod tests {
             "/nonexistent/firmware.elf",
             None,
             EspResetBefore::Auto,
+            &EspFlashLayout::default(),
         )
         .await
         .unwrap_err();
@@ -747,6 +843,7 @@ mod tests {
             file.to_str().unwrap(),
             None,
             EspResetBefore::Auto,
+            &EspFlashLayout::default(),
         )
         .await
         .unwrap_err();
@@ -955,5 +1052,249 @@ mod tests {
         let without = Watch::of(&listed, "/dev/cu.usbmodem2101");
         assert!(without.listed);
         assert_eq!(without.identity, None);
+    }
+
+    // ---------------------------------------------------------------- layout
+
+    /// The partition table of a 32 MiB board with two OTA slots.
+    const TWO_SLOT_TABLE: &str = "\
+nvs,       data, nvs,      0x9000,    0x6000,
+nvs_key,   data, nvs_keys, 0xf000,    0x1000,
+otadata,   data, ota,      0x10000,   0x2000,
+phy_init,  data, phy,      0x12000,   0x1000,
+ota_0,     app,  ota_0,    0x20000,   0x800000,
+ota_1,     app,  ota_1,    0x820000,  0x800000,
+storage,   data, fat,      0x1020000, 0xfe0000,
+";
+
+    /// The smallest ELF `espflash` builds an image from for an ESP32-P4: one
+    /// loadable section at a flash address, and the section names.
+    fn p4_elf() -> Vec<u8> {
+        const CODE: [u8; 16] = [0x13; 16];
+        const NAMES: &[u8] = b"\0.text\0.shstrtab\0";
+        let (code_at, names_at) = (52_u32, 68_u32);
+        let sections_at = names_at + 20;
+        let mut elf = Vec::new();
+        elf.extend_from_slice(b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0");
+        elf.extend_from_slice(&2_u16.to_le_bytes()); // executable
+        elf.extend_from_slice(&243_u16.to_le_bytes()); // RISC-V
+        elf.extend_from_slice(&1_u32.to_le_bytes());
+        elf.extend_from_slice(&0x4001_0020_u32.to_le_bytes()); // entry
+        elf.extend_from_slice(&0_u32.to_le_bytes()); // no program headers
+        elf.extend_from_slice(&sections_at.to_le_bytes());
+        elf.extend_from_slice(&0_u32.to_le_bytes()); // flags
+        elf.extend_from_slice(&52_u16.to_le_bytes());
+        elf.extend_from_slice(&0_u16.to_le_bytes());
+        elf.extend_from_slice(&0_u16.to_le_bytes());
+        elf.extend_from_slice(&40_u16.to_le_bytes());
+        elf.extend_from_slice(&3_u16.to_le_bytes()); // sections
+        elf.extend_from_slice(&2_u16.to_le_bytes()); // names are the last
+        assert_eq!(elf.len(), 52);
+        elf.extend_from_slice(&CODE);
+        elf.extend_from_slice(NAMES);
+        elf.resize(sections_at as usize, 0);
+        let section = |name: u32, kind: u32, flags: u32, addr: u32, at: u32, size: u32| {
+            let mut header = Vec::new();
+            for field in [name, kind, flags, addr, at, size, 0, 0, 4, 0] {
+                header.extend_from_slice(&field.to_le_bytes());
+            }
+            header
+        };
+        elf.extend_from_slice(&[0; 40]);
+        elf.extend_from_slice(&section(1, 1, 6, 0x4001_0020, code_at, 16));
+        elf.extend_from_slice(&section(7, 3, 0, 0, names_at, 17));
+        elf
+    }
+
+    /// Where `flash` would write the bootloader, the table and the
+    /// application, for the layout `files` and `layout` describe.
+    fn addresses(layout: &EspFlashLayout) -> Result<[u32; 3], String> {
+        let layout = Layout::resolve(layout)?;
+        let elf = p4_elf();
+        let image = build_image(
+            &elf,
+            Chip::Esp32p4,
+            XtalFrequency::_40Mhz,
+            FlashSize::_32Mb,
+            &layout,
+        )?;
+        let at: Vec<u32> = image.flash_segments().map(|segment| segment.addr).collect();
+        Ok([at[0], at[1], at[2]])
+    }
+
+    fn table_in(directory: &tempfile::TempDir) -> String {
+        let path = directory.path().join("partitions.csv");
+        std::fs::write(&path, TWO_SLOT_TABLE).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn without_a_layout_the_application_goes_where_espflash_puts_it() {
+        assert_eq!(
+            addresses(&EspFlashLayout::default()).unwrap(),
+            [0x2000, 0x8000, 0x10000]
+        );
+    }
+
+    #[test]
+    fn a_partition_table_decides_where_the_application_goes() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = EspFlashLayout {
+            partition_table: Some(table_in(&directory)),
+            ..EspFlashLayout::default()
+        };
+        // The first application partition of the table, and the table itself
+        // one page before its first partition.
+        let [_, table, application] = addresses(&layout).unwrap();
+        assert_eq!((table, application), (0x8000, 0x20000));
+    }
+
+    #[test]
+    fn a_target_partition_picks_the_other_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = EspFlashLayout {
+            partition_table: Some(table_in(&directory)),
+            target_app_partition: Some(" ota_1 ".into()),
+            ..EspFlashLayout::default()
+        };
+        let [_, _, application] = addresses(&layout).unwrap();
+        assert_eq!(application, 0x82_0000);
+    }
+
+    #[test]
+    fn a_table_offset_moves_the_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = EspFlashLayout {
+            partition_table: Some(table_in(&directory)),
+            partition_table_offset: Some("0x4000".into()),
+            ..EspFlashLayout::default()
+        };
+        let [_, table, application] = addresses(&layout).unwrap();
+        assert_eq!((table, application), (0x4000, 0x20000));
+    }
+
+    #[test]
+    fn a_target_partition_the_table_does_not_have_is_refused_before_a_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = EspFlashLayout {
+            partition_table: Some(table_in(&directory)),
+            target_app_partition: Some("ota_7".into()),
+            ..EspFlashLayout::default()
+        };
+        let error = addresses(&layout).unwrap_err();
+        assert!(error.contains("Nothing was written"), "{error}");
+    }
+
+    #[test]
+    fn a_layout_that_cannot_be_used_is_refused_before_the_chip_is_touched() {
+        let directory = tempfile::tempdir().unwrap();
+        let table = table_in(&directory);
+        let missing = directory
+            .path()
+            .join("missing.bin")
+            .to_string_lossy()
+            .into_owned();
+        let refused = |layout: EspFlashLayout| Layout::resolve(&layout).err().unwrap();
+
+        assert!(
+            refused(EspFlashLayout {
+                partition_table: Some(missing.clone()),
+                ..EspFlashLayout::default()
+            })
+            .contains("could not read the partition table")
+        );
+        assert!(
+            refused(EspFlashLayout {
+                bootloader: Some(missing),
+                ..EspFlashLayout::default()
+            })
+            .contains("could not read the bootloader")
+        );
+        assert!(
+            refused(EspFlashLayout {
+                partition_table: Some(table),
+                partition_table_offset: Some("eight thousand".into()),
+                ..EspFlashLayout::default()
+            })
+            .contains("is not a flash address")
+        );
+        assert!(
+            refused(EspFlashLayout {
+                target_app_partition: Some("  ".into()),
+                ..EspFlashLayout::default()
+            })
+            .contains("has no name")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_layout_is_refused_before_the_port_is_opened() {
+        let directory = tempfile::tempdir().unwrap();
+        let firmware = directory.path().join("app.elf");
+        std::fs::write(&firmware, p4_elf()).unwrap();
+        let flash_with = |layout: EspFlashLayout| {
+            let firmware = firmware.to_string_lossy().into_owned();
+            async move {
+                flash(
+                    "/dev/nonexistent_port_xyz",
+                    &firmware,
+                    None,
+                    EspResetBefore::Auto,
+                    &layout,
+                )
+                .await
+                .unwrap_err()
+            }
+        };
+
+        // Counter-probe: a layout that is fine gets as far as the port.
+        let fine = flash_with(EspFlashLayout {
+            partition_table: Some(table_in(&directory)),
+            ..EspFlashLayout::default()
+        })
+        .await;
+        assert!(fine.contains("could not open"), "{fine}");
+
+        // The same image with a table that is not there stops earlier.
+        let bad = flash_with(EspFlashLayout {
+            partition_table: Some(
+                directory
+                    .path()
+                    .join("gone.csv")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..EspFlashLayout::default()
+        })
+        .await;
+        assert!(bad.contains("could not read the partition table"), "{bad}");
+        assert!(!bad.contains("could not open"), "{bad}");
+    }
+
+    #[test]
+    fn a_layout_is_described_for_the_output() {
+        assert_eq!(
+            Layout::resolve(&EspFlashLayout::default())
+                .unwrap()
+                .describe(),
+            Vec::<String>::new()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let table = table_in(&directory);
+        let layout = Layout::resolve(&EspFlashLayout {
+            partition_table: Some(table.clone()),
+            partition_table_offset: Some("32768".into()),
+            target_app_partition: Some("ota_0".into()),
+            ..EspFlashLayout::default()
+        })
+        .unwrap();
+        assert_eq!(
+            layout.describe(),
+            [
+                format!("Partition table: {table}"),
+                "Partition table offset: 0x8000".to_owned(),
+                "Application partition: ota_0".to_owned(),
+            ]
+        );
     }
 }

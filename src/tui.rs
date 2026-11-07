@@ -218,6 +218,9 @@ struct AppState {
     /// How the ESP ROM loader is entered before a flash.
     #[cfg(feature = "esp")]
     flash_reset: crate::protocol::EspResetBefore,
+    /// The layout fields of the firmware prompt, and which one is being typed.
+    #[cfg(feature = "esp")]
+    flash_form: FlashForm,
     /// The format an export is written in.
     export_format: crate::export::ExportFormat,
     /// Whether an export covers the whole capture or only what is on screen.
@@ -321,6 +324,48 @@ impl RestField {
 /// three values and only one of them may be shown as typed. A blank field
 /// means the configured value. The token is never filled from the daemon and
 /// is cleared once a start succeeds or the screen closes.
+/// The fields of the firmware prompt. The image path itself is the prompt's
+/// own line, `AppState::input`, so the layout fields come after it.
+#[cfg(feature = "esp")]
+#[derive(Default)]
+struct FlashForm {
+    field: usize,
+    partition_table: String,
+    bootloader: String,
+    offset: String,
+    target: String,
+}
+
+#[cfg(feature = "esp")]
+impl FlashForm {
+    /// The prompt's lines in the order Tab visits them.
+    const LABELS: [&'static str; 5] = [
+        "Firmware: ",
+        "Partition table (empty: espflash's): ",
+        "Bootloader (empty: espflash's): ",
+        "Table offset (empty: from the table): ",
+        "App partition (empty: the first): ",
+    ];
+
+    const fn next(&mut self) {
+        self.field = (self.field + 1) % Self::LABELS.len();
+    }
+
+    const fn previous(&mut self) {
+        self.field = (self.field + Self::LABELS.len() - 1) % Self::LABELS.len();
+    }
+
+    /// The layout the four fields describe.
+    fn layout(&self) -> crate::protocol::EspFlashLayout {
+        crate::protocol::EspFlashLayout::from_text(
+            &self.partition_table,
+            &self.bootloader,
+            &self.offset,
+            &self.target,
+        )
+    }
+}
+
 #[cfg(feature = "rest")]
 #[derive(Default)]
 struct RestForm {
@@ -354,6 +399,30 @@ impl RestForm {
 }
 
 impl AppState {
+    /// The line of the firmware prompt that is being typed.
+    #[cfg(feature = "esp")]
+    const fn flash_text(&mut self) -> &mut String {
+        match self.flash_form.field {
+            0 => &mut self.input,
+            1 => &mut self.flash_form.partition_table,
+            2 => &mut self.flash_form.bootloader,
+            3 => &mut self.flash_form.offset,
+            _ => &mut self.flash_form.target,
+        }
+    }
+
+    /// What the line being typed says, for the prompt to show.
+    #[cfg(feature = "esp")]
+    fn flash_shown(&self) -> &str {
+        match self.flash_form.field {
+            0 => &self.input,
+            1 => &self.flash_form.partition_table,
+            2 => &self.flash_form.bootloader,
+            3 => &self.flash_form.offset,
+            _ => &self.flash_form.target,
+        }
+    }
+
     /// Put the agent skill offer up, when there is one (#124).
     fn offer_skill(&mut self, offer: Option<crate::agent_skill::Offer>) {
         if offer.is_some() {
@@ -792,6 +861,7 @@ impl AppState {
             flash_running: None,
             #[cfg(feature = "esp")]
             flash_reset: crate::protocol::EspResetBefore::Auto,
+            flash_form: FlashForm::default(),
             export_format: crate::export::ExportFormat::default(),
             export_all: true,
             line_ending: crate::serial_params::LineEnding::default(),
@@ -1410,9 +1480,11 @@ fn run_app(
                     KeyCode::Enter => start_flash(&mut state, runtime),
                     KeyCode::Up => state.flash_reset = state.flash_reset.previous(),
                     KeyCode::Down => state.flash_reset = state.flash_reset.next(),
-                    KeyCode::Char(c) => state.input.push(c),
+                    KeyCode::Tab => state.flash_form.next(),
+                    KeyCode::BackTab => state.flash_form.previous(),
+                    KeyCode::Char(c) => state.flash_text().push(c),
                     KeyCode::Backspace => {
-                        state.input.pop();
+                        state.flash_text().pop();
                     }
                     _ => {}
                 }
@@ -1578,9 +1650,11 @@ fn start_flash(state: &mut AppState, runtime: &tokio::runtime::Handle) {
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let port = state.port_name.clone();
     let reset = state.flash_reset;
+    let layout = state.flash_form.layout();
     runtime.spawn(async move {
         let result =
-            crate::esp::flash_with_progress(&port, &path, None, reset, Some(&line_tx)).await;
+            crate::esp::flash_with_progress(&port, &path, None, reset, &layout, Some(&line_tx))
+                .await;
         let _ = done_tx.send(result);
     });
 
@@ -1929,7 +2003,10 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         InputMode::DeleteLines => ("", " Delete lines ".to_string()),
         InputMode::SkillOffer => ("", " AI tools ".to_string()),
         #[cfg(feature = "esp")]
-        InputMode::Flash => ("Firmware: ", flash_title(state)),
+        InputMode::Flash => (
+            FlashForm::LABELS[state.flash_form.field],
+            flash_title(state),
+        ),
     };
 
     #[cfg(feature = "rest")]
@@ -1942,8 +2019,16 @@ fn render_prompt(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         return;
     }
 
+    #[cfg(feature = "esp")]
+    let typed = if state.input_mode == InputMode::Flash {
+        state.flash_shown()
+    } else {
+        state.input.as_str()
+    };
+    #[cfg(not(feature = "esp"))]
+    let typed = state.input.as_str();
     frame.render_widget(
-        Paragraph::new(format!("{prompt}{}", state.input))
+        Paragraph::new(format!("{prompt}{typed}"))
             .block(Block::default().borders(Borders::TOP).title(title)),
         area,
     );
@@ -1956,7 +2041,7 @@ fn flash_title(state: &AppState) -> String {
         " espflash is running \u{2014} the port comes back when it ends ".to_string()
     } else {
         format!(
-            " Firmware image — reset: {} (Up/Down changes, Enter flashes, Esc cancels) ",
+            " Firmware image — reset: {} (Tab next field, Up/Down reset, Enter flashes, Esc cancels) ",
             state.flash_reset
         )
     }
@@ -1992,11 +2077,27 @@ fn render_flash_popup(frame: &mut Frame, state: &AppState) {
             format!("Reset before connect: {}", state.flash_reset),
             Style::default().fg(Color::DarkGray),
         )),
-        Line::from(""),
     ];
+    let form = &state.flash_form;
+    let mut chosen = 0;
+    for (label, value) in [
+        ("Partition table", &form.partition_table),
+        ("Bootloader", &form.bootloader),
+        ("Table offset", &form.offset),
+        ("App partition", &form.target),
+    ] {
+        if !value.trim().is_empty() {
+            chosen += 1;
+            lines.push(Line::from(Span::styled(
+                format!("{label}: {}", value.trim()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
 
     // The tail is what is being read; the head of a long flash is not.
-    let visible = area.height.saturating_sub(9) as usize;
+    let visible = area.height.saturating_sub(9 + chosen) as usize;
     let skip = state.flash_log.len().saturating_sub(visible.max(1));
     for line in state.flash_log.iter().skip(skip) {
         lines.push(Line::from(Span::styled(

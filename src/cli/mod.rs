@@ -366,7 +366,7 @@ pub enum Command {
     Flash {
         /// Serial port path
         port: String,
-        /// Path to the firmware file (ELF or .bin)
+        /// Path to the firmware file (ELF)
         firmware: String,
         /// Baud rate for flashing
         #[arg(short, long)]
@@ -374,6 +374,8 @@ pub enum Command {
         /// Reset strategy before connecting to the ROM loader
         #[arg(long, value_enum, default_value_t = crate::protocol::EspResetBefore::Auto)]
         before: crate::protocol::EspResetBefore,
+        #[command(flatten)]
+        layout: crate::protocol::EspFlashLayout,
         /// Follow the serial output after flashing
         #[arg(short, long)]
         monitor: bool,

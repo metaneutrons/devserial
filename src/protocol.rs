@@ -88,6 +88,74 @@ impl fmt::Display for EspResetBefore {
     }
 }
 
+/// Where the pieces of a flashed ESP image go, when `espflash`'s defaults do
+/// not fit the board.
+///
+/// Every field is optional and left out means the default of the `espflash`
+/// command: its own bootloader and partition table, the table at the chip's
+/// usual offset, and the first application partition as the target. A board
+/// with its own layout (a 32 MiB ESP32-P4 with two OTA slots, say) names the
+/// partition table here, so the application lands in the partition the board
+/// boots from.
+#[cfg(feature = "esp")]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, clap::Args,
+)]
+pub struct EspFlashLayout {
+    /// Partition table, as a CSV file or a binary one, on the machine the
+    /// daemon runs on.
+    #[serde(default)]
+    #[arg(long, value_name = "FILE")]
+    pub partition_table: Option<String>,
+    /// Second stage bootloader image, on the machine the daemon runs on.
+    #[serde(default)]
+    #[arg(long, value_name = "FILE")]
+    pub bootloader: Option<String>,
+    /// Flash address of the partition table, such as `0x8000`.
+    #[serde(default)]
+    #[arg(long, value_name = "ADDRESS")]
+    pub partition_table_offset: Option<String>,
+    /// Name of the application partition that receives the image, such as
+    /// `ota_0`.
+    #[serde(default)]
+    #[arg(long, value_name = "NAME")]
+    pub target_app_partition: Option<String>,
+}
+
+#[cfg(feature = "esp")]
+impl EspFlashLayout {
+    /// The layout a window or a terminal form holds as four lines of text.
+    ///
+    /// A line that is empty or only spaces is a field left at its default.
+    #[must_use]
+    pub fn from_text(
+        partition_table: &str,
+        bootloader: &str,
+        partition_table_offset: &str,
+        target_app_partition: &str,
+    ) -> Self {
+        let field = |text: &str| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        };
+        Self {
+            partition_table: field(partition_table),
+            bootloader: field(bootloader),
+            partition_table_offset: field(partition_table_offset),
+            target_app_partition: field(target_app_partition),
+        }
+    }
+
+    /// Whether every field is at its default.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        self.partition_table.is_none()
+            && self.bootloader.is_none()
+            && self.partition_table_offset.is_none()
+            && self.target_app_partition.is_none()
+    }
+}
+
 /// Unique identifier for an RPC request/response pair.
 pub type RequestId = u64;
 
@@ -434,6 +502,8 @@ pub enum RequestPayload {
         baud: Option<u32>,
         #[serde(default)]
         reset: EspResetBefore,
+        #[serde(default)]
+        layout: EspFlashLayout,
     },
     /// Query ESP board info via espflash.
     #[cfg(feature = "esp")]
@@ -616,6 +686,39 @@ pub enum ResponsePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "esp")]
+    #[test]
+    fn a_flash_request_without_a_layout_still_reads() {
+        // A client older than the layout sends none, and gets the defaults.
+        let old = r#"{"action":"EspFlash","params":{"port":"p","firmware_path":"f","baud":null}}"#;
+        let RequestPayload::EspFlash { layout, reset, .. } = serde_json::from_str(old).unwrap()
+        else {
+            panic!("not a flash request");
+        };
+        assert!(layout.is_default());
+        assert_eq!(reset, EspResetBefore::Auto);
+
+        let new = r#"{"action":"EspFlash","params":{"port":"p","firmware_path":"f","baud":null,
+            "layout":{"partition_table":"t.csv","target_app_partition":"ota_0"}}}"#;
+        let RequestPayload::EspFlash { layout, .. } = serde_json::from_str(new).unwrap() else {
+            panic!("not a flash request");
+        };
+        assert_eq!(layout.partition_table.as_deref(), Some("t.csv"));
+        assert_eq!(layout.target_app_partition.as_deref(), Some("ota_0"));
+        assert!(!layout.is_default());
+    }
+
+    #[cfg(feature = "esp")]
+    #[test]
+    fn a_layout_typed_in_a_form_leaves_empty_lines_at_the_default() {
+        let layout = EspFlashLayout::from_text(" /tmp/p.csv ", "", "   ", "ota_1");
+        assert_eq!(layout.partition_table.as_deref(), Some("/tmp/p.csv"));
+        assert_eq!(layout.bootloader, None);
+        assert_eq!(layout.partition_table_offset, None);
+        assert_eq!(layout.target_app_partition.as_deref(), Some("ota_1"));
+        assert!(EspFlashLayout::from_text("", " ", "", "\t").is_default());
+    }
 
     #[test]
     fn test_rpc_request_serde_roundtrip() {
