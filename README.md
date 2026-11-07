@@ -395,6 +395,19 @@ native USB Serial/JTAG sequence, and `no-reset` consumes a ROM loader entered
 manually with BOOT plus RESET. `no-reset-no-sync` is reserved for an already
 synchronized loader session.
 
+Every ESP operation starts its output with a line `Reset before connect:`, which
+says what the choice came to for the USB identity it met. A connection that
+fails names the same reset in the error and says that nothing was erased or
+written; flashing starts only after the chip has answered. `flash` takes ELF
+images only and refuses anything else before it touches the chip. A raw or
+merged binary is written to a flash address with `serial_esp_write_bin` or
+`POST /v1/ports/{port}/esp/write-bin`, and an image merged from bootloader,
+partition table and application starts at address 0. A native USB chip comes
+back on the bus after an operation, sometimes under another path. devserial
+waits up to eight seconds for it, finds it again by its USB vendor, product and
+serial number when the path is gone, opens it there and says so. It does not
+guess when two devices carry the same identity.
+
 ### Searching and exporting
 
 ```bash

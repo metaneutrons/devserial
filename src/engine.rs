@@ -1192,17 +1192,13 @@ impl CommandEngine {
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
+        // Read the identity while the port is still there: a chip that
+        // restarts can come back on another path.
+        let watch = crate::esp::watch(port).await;
         let reopen = self.release_port(port).await;
         let mut result = op(port.to_string()).await;
-        if let Some(config) = reopen
-            && let Err(reason) = self.reopen_port(port, config).await
-        {
-            // The tool's own answer stays; the caller learns in addition
-            // that the port is closed now, which nothing else would tell it.
-            let note = format!(
-                "devserial could not open {port} again: {reason}. Connect it again to continue."
-            );
-            result = with_note(result, &note);
+        if let Some(config) = reopen {
+            result = self.reopen_after_esp(port, &watch, config, result).await;
         }
 
         if let Some(log) = log {
@@ -1214,6 +1210,48 @@ impl CommandEngine {
         result
             .map(ResponsePayload::EspSuccess)
             .map_err(EngineError::Tool)
+    }
+
+    /// Reopen the port an ESP operation released, where the device is now.
+    ///
+    /// The tool's own answer stays; the caller learns in addition what became
+    /// of the port, which nothing else would tell it.
+    #[cfg(feature = "esp")]
+    async fn reopen_after_esp(
+        &self,
+        port: &str,
+        watch: &crate::esp::Watch,
+        config: PortConfig,
+        result: Result<String, String>,
+    ) -> Result<String, String> {
+        let (target, moved) = match crate::esp::wait_for_port(port, watch).await {
+            crate::esp::Located::MovedTo(path) => (path.clone(), Some(path)),
+            crate::esp::Located::Ambiguous => {
+                let note = format!(
+                    "{port} is gone and more than one device carries its USB identity, so \
+                     devserial did not guess which one to open. Connect it again to continue."
+                );
+                return with_note(result, &note);
+            }
+            crate::esp::Located::Here | crate::esp::Located::Missing => (port.to_string(), None),
+        };
+        match self.reopen_port(&target, config).await {
+            Err(reason) => {
+                let note = format!(
+                    "devserial could not open {target} again: {reason}. Connect it again to continue."
+                );
+                with_note(result, &note)
+            }
+            Ok(()) => match moved {
+                Some(path) => with_note(
+                    result,
+                    &format!(
+                        "{port} is gone; the device now appears as {path}, and devserial opened it there."
+                    ),
+                ),
+                None => result,
+            },
+        }
     }
 
     /// Close a managed port so an external tool can use it.
