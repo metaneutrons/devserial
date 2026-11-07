@@ -4,6 +4,13 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.17](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.16...devserial-v0.2.17) (2026-11-07)
+
+
+### Bug Fixes
+
+* **esp:** expose native USB reset strategy ([#170](https://github.com/metaneutrons/devserial/issues/170)) ([d46b3c0](https://github.com/metaneutrons/devserial/commit/d46b3c098972bc7d096ae8562765df4b5c438f2c)), closes [#169](https://github.com/metaneutrons/devserial/issues/169)
+
 ## [0.2.16](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.15...devserial-v0.2.16) (2026-10-15)
 
 
