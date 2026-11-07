@@ -517,6 +517,24 @@ fn flash_blocking(
     Ok(report.into_output())
 }
 
+/// Let the chip leave the loader and run its application again.
+///
+/// The `espflash` library resets after a write on its own, but not after
+/// `info` or `erase`: its command line does that itself. Without it the chip
+/// stays in the ROM loader after an `info` and its application never runs
+/// again until something resets it. A failure is noted, not returned, because
+/// the answer the caller asked for is already in hand.
+fn restart(flasher: &mut Flasher, report: &mut Report) {
+    let chip = flasher.chip();
+    // `HardReset`, which is what `connect` asks for, does not look at the stub.
+    match flasher.connection().reset_after(true, chip) {
+        Ok(()) => report.line("Reset the chip, so that it runs its application again"),
+        Err(error) => report.line(format!(
+            "The chip could not be reset afterwards ({error}) and may still be in the loader"
+        )),
+    }
+}
+
 /// Get board and chip information.
 ///
 /// # Errors
@@ -527,6 +545,7 @@ pub async fn board_info(port: &str, reset: EspResetBefore) -> Result<String, Str
         let mut report = Report::new(None);
         let mut flasher = connect(&port, None, reset, &mut report)?;
         describe(&mut flasher, &mut report)?;
+        restart(&mut flasher, &mut report);
         Ok(report.into_output())
     })
     .await
@@ -559,6 +578,7 @@ pub async fn erase_flash_with_progress(
             .erase_flash()
             .map_err(|error| format!("erasing failed: {error}"))?;
         report.line("Flash has been erased");
+        restart(&mut flasher, &mut report);
         Ok(report.into_output())
     })
     .await

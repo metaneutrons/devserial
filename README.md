@@ -402,7 +402,9 @@ written; flashing starts only after the chip has answered. `flash` takes ELF
 images only and refuses anything else before it touches the chip. A raw or
 merged binary is written to a flash address with `serial_esp_write_bin` or
 `POST /v1/ports/{port}/esp/write-bin`, and an image merged from bootloader,
-partition table and application starts at address 0. A native USB chip comes
+partition table and application starts at address 0. After `info` and `erase`
+devserial resets the chip, as a write does, so that it runs its application
+again instead of staying in the loader. A native USB chip comes
 back on the bus after an operation, sometimes under another path. devserial
 waits up to eight seconds for it, finds it again by its USB vendor, product and
 serial number when the path is gone, opens it there and says so. It does not
