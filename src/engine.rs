@@ -117,7 +117,8 @@ fn remote_timeout(payload: &RequestPayload) -> std::time::Duration {
         RequestPayload::EspFlash { .. }
         | RequestPayload::EspInfo { .. }
         | RequestPayload::EspErase { .. }
-        | RequestPayload::EspWriteBin { .. } => LONG,
+        | RequestPayload::EspWriteBin { .. }
+        | RequestPayload::EspReadFlash { .. } => LONG,
         _ => crate::ipc::DEFAULT_REQUEST_TIMEOUT,
     }
 }
@@ -233,6 +234,7 @@ impl CommandEngine {
     ///
     /// # Errors
     /// Returns the operation's error.
+    #[allow(clippy::too_many_lines)] // one arm per request, each of them short
     pub async fn execute(&self, payload: RequestPayload) -> Result<ResponsePayload, EngineError> {
         if let Some(client) = &self.remote {
             let timeout = remote_timeout(&payload);
@@ -309,7 +311,8 @@ impl CommandEngine {
             payload @ (RequestPayload::EspFlash { .. }
             | RequestPayload::EspInfo { .. }
             | RequestPayload::EspErase { .. }
-            | RequestPayload::EspWriteBin { .. }) => self.execute_esp(payload).await,
+            | RequestPayload::EspWriteBin { .. }
+            | RequestPayload::EspReadFlash { .. }) => self.execute_esp(payload).await,
             #[cfg(feature = "rest")]
             payload @ (RequestPayload::RestStatus
             | RequestPayload::RestEnable { .. }
@@ -1139,6 +1142,28 @@ impl CommandEngine {
                 let log = format!("WRITE-BIN {file_path} @ {address}");
                 self.esp_operation(&port, Some(log), |port| async move {
                     crate::esp::write_bin(&port, &file_path, &address, reset).await
+                })
+                .await
+            }
+            RequestPayload::EspReadFlash {
+                port,
+                file_path,
+                address,
+                length,
+                baud,
+                reset,
+            } => {
+                let log = format!("READ-FLASH {file_path}");
+                self.esp_operation(&port, Some(log), |port| async move {
+                    crate::esp::read_flash(
+                        &port,
+                        &file_path,
+                        address.as_deref(),
+                        length.as_deref(),
+                        baud,
+                        reset,
+                    )
+                    .await
                 })
                 .await
             }

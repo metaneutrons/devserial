@@ -804,19 +804,281 @@ pub async fn write_bin(
     .await
 }
 
+/// A number as the tool takes it: decimal, or hexadecimal with `0x`.
+fn parse_number(text: &str) -> Option<u32> {
+    let text = text.trim();
+    text.strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .map_or_else(
+            || text.parse::<u32>().ok(),
+            |hex| u32::from_str_radix(hex, 16).ok(),
+        )
+}
+
 /// A flash address as the tool takes it: decimal, or hexadecimal with `0x`.
 fn parse_address(text: &str) -> Result<u32, String> {
-    let text = text.trim();
-    let parsed = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-        .map_or_else(|| text.parse::<u32>(), |hex| u32::from_str_radix(hex, 16));
-    parsed.map_err(|_| format!("`{text}` is not a flash address; use 0x10000 or 65536"))
+    parse_number(text).ok_or_else(|| {
+        format!(
+            "`{}` is not a flash address; use 0x10000 or 65536",
+            text.trim()
+        )
+    })
+}
+
+/// How much one read command asks of the chip. The library keeps a command's
+/// whole answer in memory, so a 32 MiB flash is read in pieces.
+const READ_PIECE: u32 = 0x40_0000;
+
+/// The block size and the number of blocks in flight of `espflash read-flash`.
+const READ_BLOCK: u32 = 0x1000;
+const READ_IN_FLIGHT: u32 = 64;
+
+/// Where a read starts and how long it is, for a flash of `flash` bytes.
+///
+/// Left out, the read starts at 0 and runs to the end of the flash.
+fn read_range(
+    address: Option<&str>,
+    length: Option<&str>,
+    flash: u32,
+) -> Result<(u32, u32), String> {
+    let start = address.map_or(Ok(0), parse_address)?;
+    let length = match length {
+        Some(text) => parse_number(text)
+            .ok_or_else(|| format!("`{}` is not a length; use 0x10000 or 65536", text.trim()))?,
+        None => flash.saturating_sub(start),
+    };
+    if length == 0 {
+        return Err(format!(
+            "there is nothing to read: the flash is {flash} bytes and the read would start at \
+             {start:#x} with a length of 0"
+        ));
+    }
+    if u64::from(start) + u64::from(length) > u64::from(flash) {
+        return Err(format!(
+            "reading {length} bytes from {start:#x} runs past the end of the flash, which is \
+             {flash} bytes ({flash:#x})"
+        ));
+    }
+    Ok((start, length))
+}
+
+/// The file a read writes to, as the temporary file beside it that is renamed
+/// into place when the read is complete.
+///
+/// A read never replaces a file: a backup is the last thing to overwrite by
+/// accident. The checks come before the chip is touched.
+fn read_target(file: &str) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let target = PathBuf::from(file);
+    if !target.is_absolute() {
+        return Err(format!(
+            "{file} is not an absolute path. The daemon writes the file, and its working \
+             directory is not yours"
+        ));
+    }
+    if target.exists() {
+        return Err(format!(
+            "{file} exists already, and a read does not overwrite a file. Name another file or \
+             remove this one"
+        ));
+    }
+    let name = target
+        .file_name()
+        .ok_or_else(|| format!("{file} names no file"))?
+        .to_string_lossy()
+        .into_owned();
+    let folder = target
+        .parent()
+        .filter(|folder| folder.is_dir())
+        .ok_or_else(|| format!("the folder of {file} does not exist"))?;
+    Ok((
+        target.clone(),
+        folder.join(format!("{name}.part")),
+        folder.join(format!("{name}.piece")),
+    ))
+}
+
+/// Read the flash into a file.
+///
+/// The read changes nothing on the chip, but the chip restarts afterwards like
+/// after `info`. `address` and `length` are decimal or `0x` hexadecimal and
+/// default to the whole flash. Every piece is checked against the checksum the
+/// chip computes for it, and the file appears under its name only when the
+/// whole read has succeeded.
+///
+/// # Errors
+/// Returns error if the file or the range is not usable, the chip cannot be
+/// reached or a read fails. Nothing is left behind except a file that already
+/// existed.
+pub async fn read_flash(
+    port: &str,
+    file_path: &str,
+    address: Option<&str>,
+    length: Option<&str>,
+    baud: Option<u32>,
+    reset: EspResetBefore,
+) -> Result<String, String> {
+    let (target, partial, piece) = read_target(file_path)?;
+    let (port, address, length) = (
+        port.to_owned(),
+        address.map(str::to_owned),
+        length.map(str::to_owned),
+    );
+    blocking(move || {
+        let mut report = Report::new(None);
+        let mut flasher = connect(&port, baud, reset, &mut report)?;
+        describe(&mut flasher, &mut report)?;
+        let size = flasher
+            .flash_detect()
+            .map_err(|error| format!("could not read the size of the flash: {error}"))?
+            .ok_or("the chip does not report the size of its flash")?
+            .size();
+        let (start, length) = read_range(address.as_deref(), length.as_deref(), size)?;
+        report.line(format!(
+            "Reading {length} bytes from {start:#x} to {}",
+            target.display()
+        ));
+        let result = read_pieces(
+            &mut flasher,
+            (start, length),
+            (&partial, &piece),
+            &mut report,
+        )
+        .and_then(|()| {
+            std::fs::rename(&partial, &target).map_err(|error| {
+                format!("could not move the result to {}: {error}", target.display())
+            })
+        });
+        // Whatever the outcome, no temporary file stays behind.
+        let _ = std::fs::remove_file(&piece);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        result?;
+        report.line(format!("Read {length} bytes into {}", target.display()));
+        restart(&mut flasher, &mut report);
+        Ok(report.into_output())
+    })
+    .await
+}
+
+/// Read `range` piece by piece and append each piece to `part`.
+fn read_pieces(
+    flasher: &mut Flasher,
+    (start, length): (u32, u32),
+    (part, piece): (&Path, &Path),
+    report: &mut Report,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut out = std::fs::File::create(part)
+        .map_err(|error| format!("could not create {}: {error}", part.display()))?;
+    let mut done = 0;
+    while done < length {
+        let now = (length - done).min(READ_PIECE);
+        flasher
+            .read_flash(
+                start + done,
+                now,
+                READ_BLOCK,
+                READ_IN_FLIGHT,
+                piece.to_path_buf(),
+            )
+            .map_err(|error| format!("reading at {:#x} failed: {error}", start + done))?;
+        let data = std::fs::read(piece)
+            .map_err(|error| format!("could not read back {}: {error}", piece.display()))?;
+        out.write_all(&data)
+            .map_err(|error| format!("could not write {}: {error}", part.display()))?;
+        done += now;
+        report.line(format!("  {done} of {length} bytes"));
+    }
+    out.sync_all()
+        .map_err(|error| format!("could not write {}: {error}", part.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_runs_to_the_end_of_the_flash_unless_told_otherwise() {
+        let mib = 0x10_0000;
+        assert_eq!(read_range(None, None, 4 * mib), Ok((0, 4 * mib)));
+        assert_eq!(
+            read_range(Some("0x10000"), None, 4 * mib),
+            Ok((0x10000, 4 * mib - 0x10000))
+        );
+        assert_eq!(
+            read_range(Some("0x8000"), Some("0x1000"), 4 * mib),
+            Ok((0x8000, 0x1000))
+        );
+        assert_eq!(
+            read_range(Some("0"), Some("4194304"), 4 * mib),
+            Ok((0, 4 * mib))
+        );
+        // Counter-probes: past the end, empty, and not a number are refused.
+        assert!(read_range(Some("0x3FFFFF"), Some("2"), 4 * mib).is_err());
+        assert!(read_range(Some("0x400000"), None, 4 * mib).is_err());
+        assert!(read_range(None, Some("0"), 4 * mib).is_err());
+        assert!(read_range(None, Some("lots"), 4 * mib).is_err());
+        assert!(read_range(Some("flash"), None, 4 * mib).is_err());
+        // The sum is made in 64 bits: it does not wrap past zero.
+        assert!(read_range(Some("0xFFFFFFF0"), Some("0x20"), u32::MAX).is_err());
+    }
+
+    #[test]
+    fn a_read_target_must_be_new_and_absolute_and_in_a_folder_that_exists() {
+        let folder = tempfile::tempdir().unwrap();
+        let new = folder.path().join("dump.bin");
+        let (target, part, piece) = read_target(new.to_str().unwrap()).unwrap();
+        assert_eq!(target, new);
+        assert_eq!(part, folder.path().join("dump.bin.part"));
+        assert_eq!(piece, folder.path().join("dump.bin.piece"));
+        // Counter-probes: relative, existing, and in a folder that is not there.
+        assert!(read_target("dump.bin").unwrap_err().contains("absolute"));
+        std::fs::write(&new, b"a backup").unwrap();
+        assert!(
+            read_target(new.to_str().unwrap())
+                .unwrap_err()
+                .contains("exists")
+        );
+        let missing = folder.path().join("nowhere").join("dump.bin");
+        assert!(
+            read_target(missing.to_str().unwrap())
+                .unwrap_err()
+                .contains("folder")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_leaves_no_file_and_does_not_touch_one_that_is_there() {
+        let folder = tempfile::tempdir().unwrap();
+        let new = folder.path().join("dump.bin");
+        let error = read_flash(
+            "/dev/nonexistent_port_xyz",
+            new.to_str().unwrap(),
+            None,
+            None,
+            None,
+            EspResetBefore::Auto,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("could not open"), "{error}");
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 0);
+
+        std::fs::write(&new, b"a backup").unwrap();
+        let error = read_flash(
+            "/dev/nonexistent_port_xyz",
+            new.to_str().unwrap(),
+            None,
+            None,
+            None,
+            EspResetBefore::Auto,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("exists already"), "{error}");
+        assert_eq!(std::fs::read(&new).unwrap(), b"a backup");
+    }
 
     #[test]
     fn addresses_are_read_in_decimal_and_hexadecimal() {

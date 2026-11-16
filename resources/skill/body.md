@@ -67,16 +67,28 @@ the reset it chose from the USB identity; `--before` (`reset` in MCP and HTTP)
 changes it. A chip that does not answer is put into download mode by hand,
 usually by holding BOOT and pressing RESET, and then reached with `no-reset`.
 
-Reading a flash back is not something devserial does. Before a flash replaces
-firmware that someone wants to keep, ask what is on the board, and take the
-backup with `espflash read-flash` over the whole partition that will be
+`devserial read-flash PORT FILE` (`serial_esp_read_flash`) reads the flash into
+a new file: all of it, or a range with `--address` and `--length` (`address` and
+`length` in MCP and HTTP, decimal or `0x` hexadecimal). Use it for the backup
+before a flash or an erase. Before a flash replaces firmware that someone wants
+to keep, ask what is on the board, and read the whole range that will be
 written, right before, because a board that is also updated by other means can
-have changed since an earlier backup.
+have changed since an earlier backup. The file is written by the daemon, so
+give an absolute path in a folder that exists; the CLI makes a relative path
+absolute. An existing file is never overwritten, so a second backup needs a
+new name, and a read that fails leaves no file. Each block is checked against
+the chip's checksum. The chip is not changed, but it restarts afterwards, like
+after `info`. Over a UART bridge the default 115200 baud takes close to an hour
+for 32 MiB; pass a higher `--baud` (`baud`) there. After the read, say what was
+backed up and where the file is, and keep it until the flash is known to work.
 
 ## Ask the user first
 
-- Flashing or erasing a chip (`devserial flash`, the `serial_esp_*` tools)
-  replaces its firmware.
+- Flashing or erasing a chip (`devserial flash`, `serial_esp_flash`,
+  `serial_esp_write_bin`, `serial_esp_erase`) replaces its firmware.
+- Reading a flash (`devserial read-flash`, `serial_esp_read_flash`) changes
+  nothing on the chip, but the chip restarts and its application is interrupted,
+  so ask first when it is running something that matters.
 - `devserial clear PORT` deletes the captured history; `--archive` keeps a copy.
 - `devserial delete PORT --above ID` or `--below ID` deletes the lines on one side of a line;
   a copy is kept unless `--no-archive` is given, and `--dry-run` only counts. Only when asked.
