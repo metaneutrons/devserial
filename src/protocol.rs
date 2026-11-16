@@ -558,6 +558,20 @@ pub enum RequestPayload {
         #[serde(default)]
         reset: EspResetBefore,
     },
+    /// Read ESP flash into a new file via espflash.
+    #[cfg(feature = "esp")]
+    EspReadFlash {
+        port: String,
+        /// Absolute path of the file to create, on the machine the daemon runs on.
+        file_path: String,
+        /// Where the read starts; the start of the flash when left out.
+        address: Option<String>,
+        /// How many bytes to read; to the end of the flash when left out.
+        length: Option<String>,
+        baud: Option<u32>,
+        #[serde(default)]
+        reset: EspResetBefore,
+    },
     /// State of the HTTP interface.
     #[cfg(feature = "rest")]
     RestStatus,
@@ -614,7 +628,8 @@ impl RequestPayload {
             Self::EspFlash { port, .. }
             | Self::EspInfo { port, .. }
             | Self::EspErase { port, .. }
-            | Self::EspWriteBin { port, .. } => Some(port),
+            | Self::EspWriteBin { port, .. }
+            | Self::EspReadFlash { port, .. } => Some(port),
             #[cfg(feature = "rest")]
             Self::RestStatus | Self::RestEnable { .. } | Self::RestDisable => None,
             Self::Ping

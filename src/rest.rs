@@ -60,6 +60,8 @@ pub const ROUTES: &[&str] = &[
     #[cfg(feature = "esp")]
     "POST /v1/ports/{port}/esp/write-bin",
     #[cfg(feature = "esp")]
+    "POST /v1/ports/{port}/esp/read-flash",
+    #[cfg(feature = "esp")]
     "GET /v1/jobs/{job}/stream",
     "GET /v1/openapi.json",
 ];
@@ -387,6 +389,7 @@ fn router(guards: &Guards) -> axum::Router {
         .route("/v1/ports/{port}/esp/flash", post(esp_flash))
         .route("/v1/ports/{port}/esp/erase", post(esp_erase))
         .route("/v1/ports/{port}/esp/write-bin", post(esp_write_bin))
+        .route("/v1/ports/{port}/esp/read-flash", post(esp_read_flash))
         .route("/v1/jobs/{job}/stream", get(job_stream));
 
     let guarded = guarded
@@ -980,7 +983,30 @@ async fn esp_write_bin(
     )
 }
 
-/// The tool's output, which is the same answer for all three of these.
+/// Read the flash into a new file.
+#[cfg(feature = "esp")]
+async fn esp_read_flash(
+    axum::extract::State(engine): Engine,
+    axum::extract::Path(port): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<EspReadFlashBody>,
+) -> Reply {
+    esp_answer(
+        run(
+            &engine,
+            crate::protocol::RequestPayload::EspReadFlash {
+                port,
+                file_path: body.path,
+                address: body.address,
+                length: body.length,
+                baud: body.baud,
+                reset: body.reset,
+            },
+        )
+        .await?,
+    )
+}
+
+/// The tool's output, which is the same answer for all four of these.
 #[cfg(feature = "esp")]
 fn esp_answer(answer: crate::protocol::ResponsePayload) -> Reply {
     let crate::protocol::ResponsePayload::EspSuccess(output) = answer else {
@@ -1349,6 +1375,10 @@ fn describe(route: &str) -> &'static str {
         #[cfg(feature = "esp")]
         "POST /v1/ports/{port}/esp/write-bin" => "Write a raw binary to an address in flash.",
         #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/read-flash" => {
+            "Read the flash, or a range of it, into a new file."
+        }
+        #[cfg(feature = "esp")]
         "GET /v1/jobs/{job}/stream" => "The output of a job, one event per line.",
         _ => "",
     }
@@ -1381,6 +1411,8 @@ fn shapes(route: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>)
         "POST /v1/ports/{port}/esp/erase" => body(schema_of::<EspResetBody>()),
         #[cfg(feature = "esp")]
         "POST /v1/ports/{port}/esp/write-bin" => body(schema_of::<EspWriteBinBody>()),
+        #[cfg(feature = "esp")]
+        "POST /v1/ports/{port}/esp/read-flash" => body(schema_of::<EspReadFlashBody>()),
         #[cfg(feature = "esp")]
         "GET /v1/jobs/{job}/stream" => query(schema_of::<JobQuery>()),
         _ => (None, None),
@@ -1573,7 +1605,8 @@ fn action_response_schema(route: &str) -> serde_json::Value {
         #[cfg(feature = "esp")]
         "GET /v1/ports/{port}/esp"
         | "POST /v1/ports/{port}/esp/erase"
-        | "POST /v1/ports/{port}/esp/write-bin" => {
+        | "POST /v1/ports/{port}/esp/write-bin"
+        | "POST /v1/ports/{port}/esp/read-flash" => {
             object_schema(json!({ "output": string() }), &["output"])
         }
         #[cfg(feature = "esp")]
@@ -1805,6 +1838,24 @@ struct EspWriteBinBody {
     path: String,
     /// Flash address, such as `0x1000`.
     address: String,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    reset: crate::protocol::EspResetBefore,
+}
+
+/// `POST /v1/ports/{port}/esp/read-flash`
+#[cfg(feature = "esp")]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EspReadFlashBody {
+    /// Absolute path of the file to create, on the machine the daemon runs on.
+    /// An existing file is never overwritten.
+    path: String,
+    /// Flash address to start at, such as `0x10000`. Default: 0.
+    address: Option<String>,
+    /// Number of bytes to read, such as `0x400000`. Default: to the end of the flash.
+    length: Option<String>,
+    /// Baud rate for the transfer. Default: 115200.
+    baud: Option<u32>,
     /// Reset strategy before synchronization.
     #[serde(default)]
     reset: crate::protocol::EspResetBefore,
@@ -2338,6 +2389,8 @@ mod tests {
             R::EspErase { .. } => Ok(&["POST /v1/ports/{port}/esp/erase"]),
             #[cfg(feature = "esp")]
             R::EspWriteBin { .. } => Ok(&["POST /v1/ports/{port}/esp/write-bin"]),
+            #[cfg(feature = "esp")]
+            R::EspReadFlash { .. } => Ok(&["POST /v1/ports/{port}/esp/read-flash"]),
 
             // Recorded exceptions, each with the reason it is one.
             R::RestStatus | R::RestEnable { .. } | R::RestDisable => {
@@ -2466,6 +2519,14 @@ mod tests {
                 port: port(),
                 file_path: "f".into(),
                 address: "0x0".into(),
+                reset: crate::protocol::EspResetBefore::Auto,
+            },
+            R::EspReadFlash {
+                port: port(),
+                file_path: "/f".into(),
+                address: None,
+                length: None,
+                baud: None,
                 reset: crate::protocol::EspResetBefore::Auto,
             },
         ]);
@@ -3321,6 +3382,30 @@ mod tests {
             seen.contains("could not read the partition table"),
             "the layout did not reach the flash: {seen}"
         );
+    }
+
+    /// The fields of a read travel from the request body to the read, so a path
+    /// that cannot be used is refused before anything happens to the chip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_read_flash_route_hands_its_path_on() {
+        let (_server, addr, _engine, dir, _storage) = listening_with_lines().await;
+
+        let relative = post(
+            addr,
+            "/v1/ports/mock_rest_port/esp/read-flash",
+            r#"{"path":"backup.bin"}"#,
+        );
+        assert!(relative.contains("not an absolute path"), "{relative}");
+
+        let kept = dir.path().join("backup.bin");
+        std::fs::write(&kept, b"a backup").unwrap();
+        let existing = post(
+            addr,
+            "/v1/ports/mock_rest_port/esp/read-flash",
+            &serde_json::json!({ "path": kept }).to_string(),
+        );
+        assert!(existing.contains("exists already"), "{existing}");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"a backup");
     }
 
     /// Every route the interface advertises is actually mounted.

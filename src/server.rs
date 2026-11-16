@@ -509,6 +509,40 @@ pub struct EspWriteBinParams {
     pub reset: crate::protocol::EspResetBefore,
 }
 
+/// Parameters for `serial_esp_read_flash`.
+#[cfg(feature = "esp")]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(description = "Read the flash of an ESP device into a new file")]
+pub struct EspReadFlashParams {
+    /// Serial port name.
+    #[schemars(description = "Serial port name (e.g. /dev/ttyUSB0)")]
+    pub port_name: String,
+    /// Absolute path of the file to create.
+    #[schemars(
+        description = "Absolute path of the file to create, on the machine the daemon runs on. An existing file is never overwritten"
+    )]
+    pub file_path: String,
+    /// Where the read starts.
+    #[schemars(
+        description = "Flash address to start at, in hex or decimal (e.g. 0x10000). Default: 0"
+    )]
+    pub address: Option<String>,
+    /// How many bytes to read.
+    #[schemars(
+        description = "Number of bytes to read, in hex or decimal (e.g. 0x400000). Default: to the end of the flash"
+    )]
+    pub length: Option<String>,
+    /// Baud rate for the transfer.
+    #[schemars(
+        description = "Baud rate for the transfer. Default: 115200; it makes no difference over native USB"
+    )]
+    pub baud: Option<u32>,
+    /// Reset strategy before synchronization.
+    #[serde(default)]
+    #[schemars(description = "Reset strategy: auto, usb-reset, no-reset, or no-reset-no-sync")]
+    pub reset: crate::protocol::EspResetBefore,
+}
+
 // ------------------------------------------------------------------ tools
 
 #[tool_router(router = core_tools, vis = "pub")]
@@ -1096,6 +1130,30 @@ impl DevSerialServer {
         })
         .await
     }
+
+    /// Read the flash of an ESP device into a new file.
+    #[tool(
+        description = "Read the flash of an ESP device, all of it or a range, into a new file on the machine the daemon runs on. Use it to back up a chip before flashing or erasing it. Nothing on the chip changes, but the chip restarts afterwards. Each block is verified against the chip's checksum, and an existing file is never overwritten.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn serial_esp_read_flash(
+        &self,
+        Parameters(params): Parameters<EspReadFlashParams>,
+    ) -> Result<String, ToolExecutionError> {
+        self.esp_output(RequestPayload::EspReadFlash {
+            port: params.port_name,
+            file_path: params.file_path,
+            address: params.address,
+            length: params.length,
+            baud: params.baud,
+            reset: params.reset,
+        })
+        .await
+    }
 }
 
 #[cfg(feature = "esp")]
@@ -1625,6 +1683,20 @@ mod tests {
                     .unwrap()
                     .read_only_hint,
                 Some(true)
+            );
+            let read = server.tool_router.get("serial_esp_read_flash").unwrap();
+            let schema = serde_json::to_value(&read.input_schema)
+                .unwrap()
+                .to_string();
+            assert!(
+                schema.contains("address")
+                    && schema.contains("length")
+                    && schema.contains("file_path"),
+                "the MCP read tool hides its range: {schema}"
+            );
+            assert_eq!(
+                read.annotations.as_ref().unwrap().destructive_hint,
+                Some(false)
             );
             assert_eq!(
                 server
