@@ -687,8 +687,7 @@ impl AppState {
             .lines
             .iter()
             .find(|line| line.id == Some(mark))
-            .map(|line| line.payload.clone())
-            .unwrap_or_default();
+            .map_or_default(|line| line.payload.clone());
         self.delete_question = Some(DeleteQuestion {
             side,
             through,
