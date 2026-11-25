@@ -400,6 +400,34 @@ pub fn run_remote(session: &Session, command: Command, color: bool) -> Result<()
             color,
         ),
 
+        #[cfg(feature = "esp")]
+        Command::ReadFlash {
+            port,
+            file,
+            address,
+            length,
+            baud,
+            before,
+        } => {
+            // The daemon writes the file, and its working directory is not
+            // this one, so the path goes over as an absolute one.
+            let path = std::path::absolute(&file)
+                .map_err(|error| CliError::msg(format!("invalid path '{file}': {error}")))?;
+            let response = session.request(RequestPayload::EspReadFlash {
+                port,
+                file_path: path.to_string_lossy().into_owned(),
+                address,
+                length,
+                baud,
+                reset: before,
+            })?;
+            let ResponsePayload::EspSuccess(output) = response else {
+                return Err(unexpected(&response));
+            };
+            println!("{output}");
+            Ok(())
+        }
+
         // Handled before reaching this router.
         Command::Mcp | Command::Daemon { .. } | Command::About | Command::Skill { .. } => {
             Err(CliError::msg("command is not a remote operation"))

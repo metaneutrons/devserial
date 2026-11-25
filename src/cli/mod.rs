@@ -381,6 +381,31 @@ pub enum Command {
         monitor: bool,
     },
 
+    /// Read the flash of an ESP device into a new file
+    ///
+    /// Reads all of the flash, or the range given, and checks every block
+    /// against the chip's checksum. An existing file is never overwritten.
+    /// The chip restarts afterwards.
+    #[cfg(feature = "esp")]
+    ReadFlash {
+        /// Serial port path
+        port: String,
+        /// File to create
+        file: String,
+        /// Flash address to start at, in hex or decimal (default: 0)
+        #[arg(short, long)]
+        address: Option<String>,
+        /// Number of bytes to read, in hex or decimal (default: to the end)
+        #[arg(short, long)]
+        length: Option<String>,
+        /// Baud rate for the transfer
+        #[arg(short, long)]
+        baud: Option<u32>,
+        /// Reset strategy before connecting to the ROM loader
+        #[arg(long, value_enum, default_value_t = crate::protocol::EspResetBefore::Auto)]
+        before: crate::protocol::EspResetBefore,
+    },
+
     /// Open the GUI port connection manager
     ///
     /// Starting `devserial` without arguments does the same, but only from a

@@ -323,6 +323,7 @@ Every command talks to the background daemon and starts it if it is not running.
 | `delete` | Delete the lines above or below one line, which stays. A copy of the buffer comes first unless `--no-archive` is given; `--dry-run` only counts |
 | `stats` | Connection state and buffer statistics |
 | `flash` | Flash an ESP device with the built-in `espflash` library |
+| `read-flash` | Read the flash of an ESP device, or a range of it, into a new file |
 | `rest` | Show or change the HTTP interface of the daemon |
 | `daemon` | Run, inspect, stop or restart the daemon, or change its idle period |
 | `monitor` / `tui` | Interactive monitors |
@@ -394,6 +395,22 @@ it `devserial flash PORT IMAGE --before usb-reset`; REST and MCP use the
 native USB Serial/JTAG sequence, and `no-reset` consumes a ROM loader entered
 manually with BOOT plus RESET. `no-reset-no-sync` is reserved for an already
 synchronized loader session.
+
+`devserial read-flash PORT FILE` reads the flash into a new file, as a backup
+before a flash or an erase. It reads all of the flash, or a range with
+`--address` and `--length` (decimal or `0x` hexadecimal; the start of the flash
+and the end of it when left out), and checks every block against the checksum
+the chip computes for it. MCP calls it `serial_esp_read_flash`, with the fields
+`file_path`, `address`, `length`, `baud` and `reset`, and REST
+`POST /v1/ports/{port}/esp/read-flash`, with `path` in place of `file_path`.
+The file is written by the daemon, so the path must be absolute (the CLI makes
+it so), its folder must exist, and an existing file is never overwritten: a
+backup is the last thing to replace by accident. The file appears under its
+name only when the whole read has succeeded, and a failed read leaves nothing
+behind. The chip is not changed, but it restarts afterwards, like after `info`.
+Over a UART bridge the read runs at the baud rate given with `--baud`, 115200
+by default, which takes close to an hour for 32 MiB; give the transfer a higher
+rate there. Over native USB the baud rate makes no difference.
 
 `flash` writes the bootloader, the partition table and the application with the
 defaults of the `espflash` command: its own bootloader and partition table, the
@@ -640,7 +657,7 @@ port    = 9600
 | `POST` | `/v1/ports/{port}/transfers` | Send or receive a file, `direction` in the body |
 | `GET` | `/v1/openapi.json` | The interface as OpenAPI 3.1 |
 
-With the `esp` feature, four more and the stream that follows a flash:
+With the `esp` feature, five more and the stream that follows a flash:
 
 | Method | Path | What it does |
 |---|---|---|
@@ -648,6 +665,7 @@ With the `esp` feature, four more and the stream that follows a flash:
 | `POST` | `/v1/ports/{port}/esp/flash` | Start a flash; answers `202` with a job id |
 | `POST` | `/v1/ports/{port}/esp/erase` | Erase the flash |
 | `POST` | `/v1/ports/{port}/esp/write-bin` | Write a raw binary to an address |
+| `POST` | `/v1/ports/{port}/esp/read-flash` | Read the flash, or a range of it, into a new file |
 | `GET` | `/v1/jobs/{job}/stream` | The tool's output, line by line, ending with the outcome |
 
 The port is percent-encoded in the path, because `/dev/cu.usbmodem1101` and
@@ -762,6 +780,7 @@ The configuration file lives at `~/Library/Application Support/Claude/claude_des
 | `serial_esp_info` | Chip type, flash size, MAC address |
 | `serial_esp_erase` | Erase the entire flash |
 | `serial_esp_write_bin` | Write a raw binary to a flash address |
+| `serial_esp_read_flash` | Read the flash, or a range of it, into a new file |
 
 Each port is also exposed as an MCP resource at `serial://PORT/status`.
 
