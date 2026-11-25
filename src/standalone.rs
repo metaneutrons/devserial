@@ -1076,9 +1076,8 @@ fn session_monitor(
     }
     monitor.capture = Some(capture_control(port, client, runtime));
     monitor.daemon = Some(daemon_control(client, runtime));
-    monitor.on_quit = crate::config::load_config(config_path)
-        .map(|loaded| loaded.daemon.on_quit)
-        .unwrap_or_default();
+    monitor.on_quit =
+        crate::config::load_config(config_path).map_or_default(|loaded| loaded.daemon.on_quit);
     monitor.config_file = crate::config::writable_config_path(config_path);
     monitor.build_warning = runtime.block_on(client.build_warning());
     monitor
@@ -1213,8 +1212,7 @@ fn run_tui_attached(
         capture: Some(capture_control(port, &parts.client, runtime)),
         daemon: Some(daemon_control(&parts.client, runtime)),
         on_quit: crate::config::load_config(config_path)
-            .map(|loaded| loaded.daemon.on_quit)
-            .unwrap_or_default(),
+            .map_or_default(|loaded| loaded.daemon.on_quit),
         config_file: crate::config::writable_config_path(config_path),
         skill_offer: crate::agent_skill::Offer::for_this_user(),
         build_warning: runtime.block_on(parts.client.build_warning()),
