@@ -8,11 +8,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Eine Ausnahme. Der bisherige Eintrag fuer RUSTSEC-2024-0436 (paste
+# Der bisherige Eintrag fuer RUSTSEC-2024-0436 (paste
 # unmaintained) nannte als Bedingung "entfernen sobald ratatui auf 0.30 oder
 # neuer steht"; ratatui 0.30 zieht paste nicht mehr, und die Abhaengigkeit ist
 # aus dem Baum verschwunden.
 ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is marked unmaintained, with no vulnerability reported by this advisory. Latest rmcp (3.11.0) still requires chrono. Remove when rmcp supports a maintained alternative and devserial has migrated its direct use." },
     # ruzstd 0.8.3 (Decompression Bomb, nur Denial of Service), gezogen ueber
     # espflash 4.6.0 -> object 0.39.1 (Standard-Feature "compression"). Die
     # Korrektur steht erst in ruzstd 0.9.1, und object 0.39 verlangt ruzstd 0.8,
