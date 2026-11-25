@@ -233,10 +233,7 @@ pub fn start_gui_socket_server(
 
                     let response = match serde_json::from_str::<GuiCommand>(&line) {
                         Ok(GuiCommand::Ping) => GuiResponse::Pong {
-                            open_ports: open_ports
-                                .lock()
-                                .map(|ports| ports.clone())
-                                .unwrap_or_default(),
+                            open_ports: open_ports.lock().map_or_default(|ports| ports.clone()),
                         },
                         Ok(command) => {
                             if tx.send(command).is_ok() {
