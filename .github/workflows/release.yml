@@ -572,7 +572,7 @@ jobs:
         with:
           name: macos-app
           path: payloads
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       # The action is used only to put syft on the runner. The documents
       # themselves are generated per payload below, so each one keeps the full
       # name of what it describes.
@@ -722,7 +722,7 @@ jobs:
         with:
           name: signed-payloads
           path: dist
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Generate the PKGBUILDs and the Homebrew formula
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -928,7 +928,7 @@ jobs:
       # signing key and R2 credentials remain in the archive repository.
       - name: Mint a token from the archive dispatch App
         id: archive-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
         with:
           client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
           private-key: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
@@ -1074,7 +1074,7 @@ jobs:
         with:
           name: candidate
           path: candidate
-      - uses: Homebrew/actions/setup-homebrew@4790763c0a3ba4036f72634dc079c4a7dfcd4878 # 2026.10.19.1
+      - uses: Homebrew/actions/setup-homebrew@ceec4e8419bb3c97ce96e9dda7738499ed5f869d # 2026.11.14.1
         with:
           core: false
           cask: false
@@ -1267,7 +1267,7 @@ jobs:
           (cd verify && sha256sum --check --strict SHA256SUMS)
           echo "the release carries exactly the candidate inventory"
 
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Verify signatures and attestations against the downloaded bytes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1629,7 +1629,7 @@ jobs:
 
       - name: Mint a token from the archive dispatch App
         id: archive-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
         with:
           client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
           private-key: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
