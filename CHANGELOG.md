@@ -4,6 +4,18 @@ The entries up to 0.1.13 were written in German and translated afterwards. The
 commits and pull requests they link to still carry their original subjects,
 which is why a link may lead somewhere that reads differently.
 
+## [0.2.19](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.18...devserial-v0.2.19) (2026-11-26)
+
+
+### Features
+
+* **esp:** read the flash into a file ([#181](https://github.com/metaneutrons/devserial/issues/181)) ([6b2eb87](https://github.com/metaneutrons/devserial/commit/6b2eb87f11b1dbb8965c91b993cdb54331dba9c8))
+
+
+### Bug Fixes
+
+* **deps:** update rmcp and rusqlite for two advisories ([#182](https://github.com/metaneutrons/devserial/issues/182)) ([f6e5451](https://github.com/metaneutrons/devserial/commit/f6e54513cd8ac6887c50cda4192b9dbe380e5049))
+
 ## [0.2.18](https://github.com/metaneutrons/devserial/compare/devserial-v0.2.17...devserial-v0.2.18) (2026-11-07)
 
 
